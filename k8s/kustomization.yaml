@@ -7,6 +7,7 @@ resources:
   - deployment.yaml
   - service.yaml
   - atlassian.yaml
+  - grafana.yaml
   # Secrets créés hors IaC (données sensibles) :
   #   kubectl create secret generic dynmcp-secrets \
   #     --from-literal=GRAFANA_SERVICE_ACCOUNT_TOKEN=<token>

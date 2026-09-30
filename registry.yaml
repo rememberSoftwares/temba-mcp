@@ -1,12 +1,13 @@
-# Registry local (dev). En k8s, voir k8s/configmap-registry.yaml (paths /app).
+# Registry local (dev). En k8s, voir k8s/configmap-registry.yaml.
+# Transport HTTP uniquement (stdio supprimé).
 servers:
-  - id: demo
-    transport: stdio
-    command: [.venv/bin/python, src/demo_mcp.py]
+  - id: deepwiki
+    transport: http
+    url: https://mcp.deepwiki.com/mcp
 
-  # Exemple MCP distant (streamable HTTP) :
-  # - id: acme
+  # Exemple : MCP distant déjà déployé par une équipe
+  # - id: atlassian
   #   transport: http
-  #   url: http://acme-mcp.tools.svc.cluster.local:8080/mcp
+  #   url: http://mcp-atlassian.default.svc.cluster.local:8000/mcp
   #   headers:
   #     Authorization: Bearer ${ACME_TOKEN}

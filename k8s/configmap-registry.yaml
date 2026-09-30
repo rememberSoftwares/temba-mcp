@@ -7,28 +7,21 @@ metadata:
 data:
   registry.yaml: |
     # Registry des MCP agrégés par le gateway (infra as code).
-    # Les ${VARS} sont interpolées depuis l'env du pod (voir deployment.yaml).
+    # Transport HTTP uniquement ; les ${VARS} sont interpolées depuis l'env du pod.
     servers:
       # Documentation technique (public, streamable HTTP)
       - id: deepwiki
         transport: http
         url: https://mcp.deepwiki.com/mcp
 
-      # Grafana MCP local, spawné via uvx dans le pod du gateway
-      # (-tls-skip-verify : CA interne numspot non trusté dans l'image slim)
+      # Grafana MCP déployé à côté (k8s/grafana.yaml), joint en HTTP avec bearer token
       - id: grafana
-        transport: stdio
-        command: [uvx, mcp-grafana, -tls-skip-verify]
-        env:
-          GRAFANA_URL: https://grafana.zex-preprod.eu-west-2.numspot.internal/
-          GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+        transport: http
+        url: http://mcp-grafana:8000/mcp
+        headers:
+          Authorization: Bearer ${GRAFANA_MCP_TOKEN}
 
       # Atlassian MCP déployé à côté (k8s/atlassian.yaml), joint en HTTP
       - id: atlassian
         transport: http
         url: http://mcp-atlassian:8000/mcp
-
-      # Exemple : MCP binaire stdio (le binaire doit être présent dans l'image/pod)
-      # - id: local-fs
-      #   transport: stdio
-      #   command: [npx, -y, "@modelcontextprotocol/server-filesystem", /data]

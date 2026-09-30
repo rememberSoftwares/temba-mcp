@@ -21,7 +21,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: [sh, -c]
           args:
-            - pip install --no-cache-dir "mcp>=2,<3" pyyaml uv && exec python /app/server.py
+            - pip install --no-cache-dir "mcp>=2,<3" pyyaml uv rank_bm25 snowballstemmer && exec python /app/server.py
           workingDir: /app
           env:
             - name: REGISTRY_PATH
@@ -36,6 +36,22 @@ spec:
                 secretKeyRef:
                   name: dynmcp-secrets
                   key: GRAFANA_SERVICE_ACCOUNT_TOKEN
+            - name: GRAFANA_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dynmcp-secrets
+                  key: GRAFANA_MCP_TOKEN
+            # Index sémantique optionnel : renseigner pour activer les embeddings
+            # (endpoint OpenAI-compatible). Sinon fallback BM25 local automatique.
+            # - name: EMBEDDINGS_BASE_URL
+            #   value: https://newapi.numspot.tech/v1
+            # - name: EMBEDDINGS_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: dynmcp-secrets
+            #       key: EMBEDDINGS_API_KEY
+            # - name: EMBEDDINGS_MODEL
+            #   value: text-embedding-3-small
           ports:
             - name: mcp
               containerPort: 8080

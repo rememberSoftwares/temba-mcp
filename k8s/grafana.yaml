@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-grafana
+  labels:
+    app: mcp-grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-grafana
+  template:
+    metadata:
+      labels:
+        app: mcp-grafana
+    spec:
+      containers:
+        - name: mcp-grafana
+          image: grafana/mcp-grafana:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - -transport
+            - streamable-http
+            - -address
+            - 0.0.0.0:8000
+            - -tls-skip-verify
+            - -allowed-hosts
+            - mcp-grafana:8000
+          ports:
+            - name: mcp
+              containerPort: 8000
+          env:
+            - name: GRAFANA_URL
+              value: https://grafana.zex-preprod.eu-west-2.numspot.internal/
+            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dynmcp-secrets
+                  key: GRAFANA_SERVICE_ACCOUNT_TOKEN
+            - name: MCP_GRAFANA_SERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dynmcp-secrets
+                  key: GRAFANA_MCP_TOKEN
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-grafana
+  labels:
+    app: mcp-grafana
+spec:
+  selector:
+    app: mcp-grafana
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp
