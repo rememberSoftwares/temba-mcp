@@ -156,6 +156,7 @@ class ServerState:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.id = cfg["id"]
+        self.timeout: float | None = cfg.get("timeout")  # secondes, optionnel
         self.status = "starting"
         self.error: str | None = None
         self.tools: dict[str, dict] = {}
@@ -233,6 +234,8 @@ class Gateway:
                 raise ValueError(f"registry[{s.get('id')}]: transport invalide (http uniquement)")
             if not s.get("url"):
                 raise ValueError(f"registry[{s['id']}]: 'url' requise")
+            if s.get("timeout") is not None and (not isinstance(s["timeout"], (int, float)) or s["timeout"] <= 0):
+                raise ValueError(f"registry[{s['id']}]: 'timeout' doit être un nombre de secondes > 0")
         return servers
 
     async def run(self) -> None:
@@ -265,7 +268,7 @@ class Gateway:
 
                     session = ClientSession(read, write, message_handler=on_message)
                     async with session:
-                        await asyncio.wait_for(session.initialize(), LIST_TIMEOUT)
+                        await asyncio.wait_for(session.initialize(), st.timeout or LIST_TIMEOUT)
                         st.session = session
                         await self._sync_tools(st)
                         while not self._stop.is_set():
@@ -287,7 +290,7 @@ class Gateway:
                 st.session = None
 
     async def _sync_tools(self, st: ServerState) -> None:
-        async with asyncio.timeout(LIST_TIMEOUT):
+        async with asyncio.timeout(st.timeout or LIST_TIMEOUT):
             res = await st.session.list_tools()
         st.tools = {
             t.name: {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
@@ -353,7 +356,7 @@ class Gateway:
                 "hint": "le serveur se reconnecte automatiquement, réessaie plus tard",
             }
         try:
-            async with asyncio.timeout(CALL_TIMEOUT):
+            async with asyncio.timeout(st.timeout or CALL_TIMEOUT):
                 res = await st.session.call_tool(tool_name, arguments or {})
             payload: dict[str, Any] = {
                 "tool_id": tool_id,
