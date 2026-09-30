@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynmcp
+  labels:
+    app: dynmcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dynmcp
+  template:
+    metadata:
+      labels:
+        app: dynmcp
+    spec:
+      containers:
+        - name: dynmcp
+          # Pas d'image custom : image générique + code monté depuis la ConfigMap.
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command: [sh, -c]
+          args:
+            - pip install --no-cache-dir "mcp>=2,<3" pyyaml uv && exec python /app/server.py
+          workingDir: /app
+          env:
+            - name: REGISTRY_PATH
+              value: /etc/dynmcp/registry.yaml
+            - name: PORT
+              value: "8080"
+            # Cold-start uvx (téléchargement mcp-grafana) => handshake long
+            - name: LIST_TIMEOUT
+              value: "90"
+            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dynmcp-secrets
+                  key: GRAFANA_SERVICE_ACCOUNT_TOKEN
+          ports:
+            - name: mcp
+              containerPort: 8080
+          # pip install au boot => démarrage lent, d'où la startupProbe généreuse.
+          startupProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 36   # 3 min max pour le pip install
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+            - name: registry
+              mountPath: /etc/dynmcp
+              readOnly: true
+            - name: uv-cache
+              mountPath: /root/.cache/uv
+      volumes:
+        - name: code
+          configMap:
+            name: dynmcp-code
+        - name: registry
+          configMap:
+            name: dynmcp-registry
+        - name: uv-cache
+          emptyDir: {}

@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-atlassian
+  labels:
+    app: mcp-atlassian
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-atlassian
+  template:
+    metadata:
+      labels:
+        app: mcp-atlassian
+    spec:
+      containers:
+        - name: mcp-atlassian
+          image: ghcr.io/sooperset/mcp-atlassian:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--transport", "streamable-http", "--port", "8000"]
+          ports:
+            - name: mcp
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: mcp-atlassian-env
+          # HTTP transport => le middleware exige une identité par requête ;
+          # on autorise la chute sur les creds globales du secret (mono-utilisateur).
+          env:
+            - name: ALLOW_GLOBAL_CRED_FALLBACK
+              value: "true"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-atlassian
+  labels:
+    app: mcp-atlassian
+spec:
+  selector:
+    app: mcp-atlassian
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp

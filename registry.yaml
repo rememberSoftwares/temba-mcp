@@ -1,0 +1,12 @@
+# Registry local (dev). En k8s, voir k8s/configmap-registry.yaml (paths /app).
+servers:
+  - id: demo
+    transport: stdio
+    command: [.venv/bin/python, src/demo_mcp.py]
+
+  # Exemple MCP distant (streamable HTTP) :
+  # - id: acme
+  #   transport: http
+  #   url: http://acme-mcp.tools.svc.cluster.local:8080/mcp
+  #   headers:
+  #     Authorization: Bearer ${ACME_TOKEN}

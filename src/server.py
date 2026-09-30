@@ -1,0 +1,323 @@
+"""dynmcp — agrégateur MCP : un seul point d'entrée MCP (tool_search + call_tool)
+qui agrège plusieurs MCP classiques (stdio ou HTTP) enregistrés dans un registry YAML.
+
+SDK mcp >= 2.x (MCPServer, snake_case, streamable_http_client).
+"""
+import asyncio
+import json
+import os
+import re
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx2
+import yaml
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolListChangedNotification
+
+TOOL_SEARCH_LIMIT = int(os.getenv("TOOL_SEARCH_LIMIT", "5"))
+CALL_TIMEOUT = float(os.getenv("CALL_TIMEOUT", "60"))
+LIST_TIMEOUT = float(os.getenv("LIST_TIMEOUT", "30"))
+HEALTH_INTERVAL = float(os.getenv("HEALTH_INTERVAL", "60"))
+RECONNECT_DELAY = float(os.getenv("RECONNECT_DELAY", "5"))
+
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand(value: Any) -> Any:
+    if isinstance(value, str):
+        def sub(match: re.Match) -> str:
+            var = match.group(1)
+            if var not in os.environ:
+                raise ValueError(f"variable d'environnement manquante: {var}")
+            return os.environ[var]
+        return _VAR_RE.sub(sub, value)
+    if isinstance(value, dict):
+        return {k: _expand(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand(v) for v in value]
+    return value
+
+
+_STOPWORDS = frozenset("""
+au aux ce dans de des du elle en et il je la le les ma mon ne nos notre nous
+on ou par pas pour qu que qui sa se ses son sur ta te tes ton tu un une vos
+votre vous the and for with from this that are was will can what how where
+""".split())
+
+
+def _tokenize(text: str) -> set[str]:
+    return {
+        tok
+        for tok in re.findall(r"[a-z0-9]+", text.lower())
+        if len(tok) >= 3 and tok not in _STOPWORDS
+    }
+
+
+class ServerState:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.id = cfg["id"]
+        self.status = "starting"
+        self.error: str | None = None
+        self.tools: dict[str, dict] = {}
+        self.session: ClientSession | None = None
+        self.wake = asyncio.Event()
+
+
+class Gateway:
+    def __init__(self, registry_path: str):
+        self.states: list[ServerState] = [ServerState(c) for c in self._load_registry(registry_path)]
+        self._stop = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
+
+    @staticmethod
+    def _load_registry(path: str) -> list[dict]:
+        with open(path) as f:
+            data = _expand(yaml.safe_load(f) or {})
+        servers = data.get("servers") or []
+        ids = [s.get("id") for s in servers]
+        if len(ids) != len(set(ids)):
+            raise ValueError("registry: ids de serveurs en doublon")
+        for s in servers:
+            if s.get("transport") not in ("stdio", "http"):
+                raise ValueError(f"registry[{s.get('id')}]: transport invalide (stdio|http)")
+            if s["transport"] == "stdio" and not s.get("command"):
+                raise ValueError(f"registry[{s['id']}]: 'command' requis pour stdio")
+            if s["transport"] == "http" and not s.get("url"):
+                raise ValueError(f"registry[{s['id']}]: 'url' requise pour http")
+        return servers
+
+    async def run(self) -> None:
+        self._tasks = [asyncio.create_task(self._serve(st), name=f"mcp:{st.id}") for st in self.states]
+        await self._stop.wait()
+
+    async def stop(self) -> None:
+        self._stop.set()
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    @asynccontextmanager
+    async def _open_transport(self, cfg: dict):
+        if cfg["transport"] == "stdio":
+            cmd = cfg["command"]
+            params = StdioServerParameters(
+                command=cmd[0],
+                args=list(cmd[1:]),
+                env=cfg.get("env"),
+                cwd=cfg.get("cwd"),
+            )
+            async with stdio_client(params) as (read, write):
+                yield read, write
+        else:
+            client = httpx2.AsyncClient(headers=cfg.get("headers") or None)
+            try:
+                async with streamable_http_client(cfg["url"], http_client=client) as (read, write):
+                    yield read, write
+            finally:
+                await client.aclose()
+
+    async def _serve(self, st: ServerState) -> None:
+        while not self._stop.is_set():
+            try:
+                async with self._open_transport(st.cfg) as (read, write):
+                    def on_message(message: Any, _st: ServerState = st) -> None:
+                        if isinstance(message, ToolListChangedNotification):
+                            _st.wake.set()
+
+                    session = ClientSession(read, write, message_handler=on_message)
+                    async with session:
+                        await asyncio.wait_for(session.initialize(), LIST_TIMEOUT)
+                        st.session = session
+                        await self._sync_tools(st)
+                        while not self._stop.is_set():
+                            try:
+                                await asyncio.wait_for(st.wake.wait(), timeout=HEALTH_INTERVAL)
+                            except TimeoutError:
+                                pass
+                            st.wake.clear()
+                            await self._sync_tools(st)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                st.status = "error"
+                st.error = f"{type(exc).__name__}: {exc}"
+                st.tools = {}
+                if not self._stop.is_set():
+                    await asyncio.sleep(RECONNECT_DELAY)
+            finally:
+                st.session = None
+
+    async def _sync_tools(self, st: ServerState) -> None:
+        async with asyncio.timeout(LIST_TIMEOUT):
+            res = await st.session.list_tools()
+        st.tools = {
+            t.name: {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
+            for t in res.tools
+        }
+        st.status = "ready"
+        st.error = None
+
+    def catalog(self) -> dict[str, list[str]]:
+        return {st.id: sorted(st.tools) for st in self.states}
+
+    def search(self, query: str) -> dict:
+        qtokens = _tokenize(query or "")
+        scored = []
+        for st in self.states:
+            for tool in st.tools.values():
+                score = self._score(qtokens, tool)
+                if score > 0:
+                    scored.append((score, st, tool))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = [self._format(st, tool, score) for score, st, tool in scored[:TOOL_SEARCH_LIMIT]]
+        payload: dict[str, Any] = {"query": query, "count": len(results), "results": results}
+        if not results:
+            payload["hint"] = "Aucun tool ne correspond. Utilise le champ 'catalog' pour voir les serveurs et leurs tools, puis reformule la recherche."
+            payload["catalog"] = self.catalog()
+        return payload
+
+    @staticmethod
+    def _score(qtokens: set[str], tool: dict) -> float:
+        name_toks = _tokenize(tool["name"])
+        desc_toks = _tokenize(tool["description"])
+        schema_toks = _tokenize(json.dumps(tool["input_schema"], default=str))
+        score = 0.0
+        for q in qtokens:
+            if q in name_toks:
+                score += 4.0
+            if q in desc_toks:
+                score += 2.0
+            if q in schema_toks:
+                score += 1.0
+            if len(q) >= 4:
+                for field_tokens, weight in ((name_toks, 2.0), (desc_toks, 1.0)):
+                    if any(tok.startswith(q) or q.startswith(tok) for tok in field_tokens if len(tok) >= 3):
+                        score += weight * 0.5
+        return score
+
+    @staticmethod
+    def _example_args(schema: dict) -> dict:
+        example = {}
+        for prop, spec in (schema or {}).get("properties", {}).items():
+            ptype = spec.get("type", "value") if isinstance(spec, dict) else "value"
+            example[prop] = f"<{ptype}>"
+        return example
+
+    def _format(self, st: ServerState, tool: dict, score: float) -> dict:
+        tool_id = f"{st.id}.{tool['name']}"
+        return {
+            "tool_id": tool_id,
+            "server": st.id,
+            "name": tool["name"],
+            "description": tool["description"],
+            "input_schema": tool["input_schema"],
+            "score": round(score, 2),
+            "next_step": f"call_tool(tool_id=\"{tool_id}\", arguments={self._example_args(tool['input_schema'])})",
+        }
+
+    async def call(self, tool_id: str, arguments: dict | None) -> dict:
+        if "." not in tool_id:
+            return {"tool_id": tool_id, "ok": False, "error": "format tool_id attendu: <server_id>.<tool_name>"}
+        server_id, tool_name = tool_id.split(".", 1)
+        st = next((s for s in self.states if s.id == server_id), None)
+        if st is None:
+            return {"tool_id": tool_id, "ok": False, "error": f"serveur inconnu '{server_id}'", "catalog": self.catalog()}
+        if tool_name not in st.tools:
+            return {"tool_id": tool_id, "ok": False, "error": f"tool inconnu sur '{server_id}'", "catalog": self.catalog()}
+        if st.session is None:
+            return {
+                "tool_id": tool_id,
+                "ok": False,
+                "error": f"serveur '{server_id}' indisponible ({st.error or st.status})",
+                "hint": "le serveur se reconnecte automatiquement, réessaie plus tard",
+            }
+        try:
+            async with asyncio.timeout(CALL_TIMEOUT):
+                res = await st.session.call_tool(tool_name, arguments or {})
+            payload: dict[str, Any] = {
+                "tool_id": tool_id,
+                "ok": not res.is_error,
+                "content": [b.model_dump(mode="json", by_alias=True, exclude_none=True) for b in res.content],
+            }
+            if getattr(res, "structured_content", None) is not None:
+                payload["structured_content"] = res.structured_content
+            return payload
+        except Exception as exc:
+            return {
+                "tool_id": tool_id,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "hint": "le serveur a peut-être été redémarré, relance tool_search puis réessaie",
+            }
+
+
+_gateway: Gateway | None = None
+
+
+@asynccontextmanager
+async def lifespan(_server):
+    global _gateway
+    _gateway = Gateway(os.getenv("REGISTRY_PATH", "registry.yaml"))
+    task = asyncio.create_task(_gateway.run())
+    try:
+        yield {"gateway": _gateway}
+    finally:
+        await _gateway.stop()
+        task.cancel()
+
+
+mcp = MCPServer(
+    "dynmcp",
+    instructions=(
+        "Ce serveur n'expose pas les tools métier directement. "
+        "Utilise tool_search pour décrire ce que tu veux faire, il renvoie les tools "
+        "pertinents avec leur schéma d'arguments ; puis exécute-les avec call_tool."
+    ),
+    lifespan=lifespan,
+)
+
+
+@mcp.tool()
+async def tool_search(query: str) -> str:
+    """Cherche dans le catalogue de tools disponibles tous les tools pertinents pour un besoin.
+
+    Args:
+        query: description en langage naturel de ce que tu veux faire
+            (ex: "météo à Paris", "envoyer une facture au client").
+
+    Returns:
+        JSON: liste de tools correspondants avec tool_id, description et
+        input_schema (JSON Schema des arguments). Pour exécuter un tool trouvé,
+        appelle ensuite call_tool avec son tool_id et ses arguments. Si aucun
+        résultat, la réponse contient 'catalog' (serveurs + leurs tools) pour
+        reformuler la recherche.
+    """
+    return json.dumps(_gateway.search(query), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def call_tool(tool_id: str, arguments: dict = {}) -> str:
+    """Exécute un tool trouvé via tool_search.
+
+    Args:
+        tool_id: identifiant reçu de tool_search, format "<server_id>.<tool_name>".
+        arguments: arguments du tool, conformes à son input_schema.
+
+    Returns:
+        JSON: {ok, content, structured_content?} — résultat de l'exécution.
+    """
+    return json.dumps(await _gateway.call(tool_id, arguments), ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    mcp.run(
+        "streamable-http",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8080")),
+        stateless_http=True,
+    )
