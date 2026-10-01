@@ -10,10 +10,19 @@ data:
     # Transport HTTP uniquement ; les ${VARS} sont interpolées depuis l'env du pod.
     servers:
       # Documentation technique (public, streamable HTTP)
-      - id: deepwiki
-        transport: http
-        url: https://mcp.deepwiki.com/mcp
-        timeout: 45   # démo hot-reload : change sans restart
+      #- id: deepwiki
+      #  transport: http
+      #  url: https://mcp.deepwiki.com/mcp
+      #  timeout: 45   # secondes, override LIST_TIMEOUT/CALL_TIMEOUT pour ce serveur
+
+      # Labels (optionnel) : le serveur n'est visible via tool_search/call_tool que
+      # pour les clients dont la conf déclare au moins un label correspondant dans
+      # le header X-Dynmcp-Labels (opencode: "headers": {"X-Dynmcp-Labels": "..."}).
+      # Sans labels => visible de tous.
+      # - id: grafana-prod
+      #   transport: http
+      #   url: http://mcp-grafana:8000/mcp
+      #   labels: [grafana, observabilite]
 
       # Grafana MCP déployé à côté (k8s/grafana.yaml), joint en HTTP avec bearer token
       - id: grafana
@@ -30,10 +39,10 @@ data:
       # Atlassian Remote MCP v2 (hébergé par Atlassian) — OAuth 2.1 dynamique.
       # ?tools=all : expose la liste plate complète au lieu de discovery/execute.
       # Pas de creds => 401 => flow OAuth (DCR) => /auth pour le login humain.
-      - id: atlassian-remote
-        transport: http
-        url: https://mcp.atlassian.com/v2/mcp?tools=all
-        oauth: {}
+      #- id: atlassian-remote
+      #  transport: http
+      #  url: https://mcp.atlassian.com/v2/mcp?tools=all
+      #  oauth: {}
 
       # Exemple : MCP distant protégé par OAuth (MCP auth spec : DCR + PKCE).
       # Au premier usage, le LLM signalera l'auth requise ; l'utilisateur devra

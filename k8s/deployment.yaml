@@ -14,6 +14,9 @@ spec:
       labels:
         app: dynmcp
     spec:
+      # Le gateway n'utilise jamais l'API k8s : on retire le token SA du pod
+      # pour réduire la surface si un SSRF passait la garde applicative.
+      automountServiceAccountToken: false
       containers:
         - name: dynmcp
           # Pas d'image custom : image générique + code monté depuis la ConfigMap.
@@ -47,10 +50,24 @@ spec:
             # - vrai déploiement  : https://dynmcp.mon-club.io
             - name: PUBLIC_BASE_URL
               value: http://localhost:18080
-            # Persistance des tokens OAuth (emptyDir => survit au crash du container,
-            # pas à la suppression du pod ; monter un PVC en production)
+            # Persistance des tokens OAuth + serveurs dynamiques (emptyDir =>
+            # survit au crash du container, pas à la suppression du pod ; un PVC
+            # en production)
             - name: TOKENS_PATH
               value: /data/tokens.json
+            - name: DYNAMIC_REGISTRY_PATH
+              value: /data/dynamic-servers.json
+            # API admin /servers (ajout/suppression/liste de MCP partagés) :
+            # token en bearer, distribué hors LLM. Vide = API désactivée.
+            - name: ADMIN_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dynmcp-secrets
+                  key: ADMIN_API_TOKEN
+            # Tool add_mcp (LLM auto-extension) : désactivé par défaut.
+            # Passer à "1" pour que le gateway expose add_mcp aux agents.
+            - name: ADD_MCP_ENABLED
+              value: "1"
             # Index sémantique optionnel : renseigner pour activer les embeddings
             # (endpoint OpenAI-compatible). Sinon fallback BM25 local automatique.
             # - name: EMBEDDINGS_BASE_URL

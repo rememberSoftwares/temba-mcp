@@ -25,9 +25,14 @@ secrets() {
   local gmcp
   gmcp=$(kubectl get secret dynmcp-secrets -o jsonpath='{.data.GRAFANA_MCP_TOKEN}' 2>/dev/null | base64 -d || true)
   [ -z "$gmcp" ] && gmcp=$(openssl rand -hex 24)
+  # ADMIN_API_TOKEN : idem (API /servers)
+  local atoken
+  atoken=$(kubectl get secret dynmcp-secrets -o jsonpath='{.data.ADMIN_API_TOKEN}' 2>/dev/null | base64 -d || true)
+  [ -z "$atoken" ] && atoken=$(openssl rand -hex 24)
   kubectl create secret generic dynmcp-secrets \
     --from-literal=GRAFANA_SERVICE_ACCOUNT_TOKEN="$gtoken" \
     --from-literal=GRAFANA_MCP_TOKEN="$gmcp" \
+    --from-literal=ADMIN_API_TOKEN="$atoken" \
     --dry-run=client -o yaml | kubectl apply -f -
 
   if [ -f "$JIRA_ENV" ]; then

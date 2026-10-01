@@ -9,15 +9,18 @@ SDK mcp >= 2.x (MCPServer, snake_case, streamable_http_client).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
 import os
 import re
 import secrets
+import socket
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx2
 import yaml
@@ -25,6 +28,7 @@ from mcp import ClientSession
 from mcp.client.auth import OAuthClientProvider
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.context import Context
 from mcp.shared.auth import (
     AuthorizationCodeResult,
     OAuthClientInformationFull,
@@ -55,6 +59,19 @@ TOKENS_PATH = os.getenv("TOKENS_PATH", "")
 # volant qui ne permet d'authentifier QUE le serveur concerné. Pas de page
 # d'admin partagée : chaque demande produit son propre lien.
 LOGIN_TICKET_TTL = float(os.getenv("LOGIN_TICKET_TTL", "900"))
+
+# API admin (/servers) : activation/désactivation de MCP à chaud, partagés à tous.
+# Vide = API désactivée. Token en bearer, distribué hors LLM.
+ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "")
+# MCP ajoutés par un LLM (add_mcp) : privés (id secret) + durée de vie limitée.
+PRIVATE_SERVER_TTL = float(os.getenv("PRIVATE_SERVER_TTL", "86400"))
+# Persistance des serveurs dynamiques (API admin + privés) ; vide = mémoire seule.
+DYNAMIC_REGISTRY_PATH = os.getenv("DYNAMIC_REGISTRY_PATH", "")
+# Dév uniquement : autoriser add_mcp vers des IP privées/loopback
+ALLOW_PRIVATE_MCP_HOSTS = os.getenv("ALLOW_PRIVATE_MCP_HOSTS", "") == "1"
+# Tool add_mcp : désactivé par défaut (sécurité) ; ADD_MCP_ENABLED=1 pour l'activer.
+ADD_MCP_ENABLED = os.getenv("ADD_MCP_ENABLED", "") == "1"
+LABELS_HEADER = "x-dynmcp-labels"
 
 # Index sémantique optionnel (format OpenAI /v1/embeddings)
 EMBEDDINGS_BASE_URL = os.getenv("EMBEDDINGS_BASE_URL", "").rstrip("/")
@@ -307,6 +324,9 @@ class ServerState:
         self.cfg = cfg
         self.id = cfg["id"]
         self.timeout: float | None = cfg.get("timeout")
+        self.labels: frozenset[str] = frozenset(str(l).lower() for l in (cfg.get("labels") or []))
+        self.private: bool = bool(cfg.get("private"))
+        self.expires_at: float | None = cfg.get("expires_at")
         self.status = "starting"
         self.error: str | None = None
         self.tools: dict[str, dict] = {}
@@ -326,10 +346,91 @@ class Gateway:
         self._index_lock = asyncio.Lock()
         self._embed_client = httpx2.AsyncClient(timeout=30)
         self.auth = AuthCoordinator()
+        self._load_dynamic()
+
+    def _load_dynamic(self) -> None:
+        """Serveurs dynamiques persistés (API admin + privés LLM)."""
+        if not DYNAMIC_REGISTRY_PATH:
+            return
+        try:
+            with open(DYNAMIC_REGISTRY_PATH) as f:
+                servers = (json.load(f) or {}).get("servers") or []
+        except FileNotFoundError:
+            return
+        except json.JSONDecodeError as exc:
+            log.error("registry dynamique illisible (%s) — ignoré", exc)
+            return
+        now = time.time()
+        known = {st.id for st in self.states}
+        for cfg in servers:
+            if cfg.get("expires_at") and cfg["expires_at"] <= now:
+                continue
+            if cfg.get("id") in known:
+                log.warning("registry dynamique: id '%s' en conflit avec le statique — ignoré", cfg.get("id"))
+                continue
+            self.states.append(ServerState(cfg))
+
+    def _persist_dynamic(self) -> None:
+        if not DYNAMIC_REGISTRY_PATH:
+            return
+        now = time.time()
+        dyn = [st.cfg for st in self.states if st.private or st.cfg.get("dynamic")]
+        dyn = [c for c in dyn if not (c.get("expires_at") and c["expires_at"] <= now)]
+        tmp = f"{DYNAMIC_REGISTRY_PATH}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"servers": dyn}, f, indent=1)
+        os.replace(tmp, DYNAMIC_REGISTRY_PATH)
+
+    async def add_server(self, cfg: dict) -> ServerState:
+        st = ServerState(cfg)
+        if any(s.id == st.id for s in self.states):
+            raise ValueError(f"id '{st.id}' déjà utilisé")
+        self.states.append(st)
+        self._tasks.append(asyncio.create_task(self._serve(st), name=f"mcp:{st.id}"))
+        if not st.private:
+            self._persist_dynamic()
+        return st
+
+    async def remove_server(self, server_id: str) -> bool:
+        st = next((s for s in self.states if s.id == server_id), None)
+        if st is None:
+            return False
+        self.auth.abort(server_id)
+        task = next((t for t in self._tasks if t.get_name() == f"mcp:{server_id}"), None)
+        if task is not None:
+            task.cancel()
+            self._tasks.remove(task)
+            await asyncio.gather(task, return_exceptions=True)
+        self.states = [s for s in self.states if s.id != server_id]
+        self._persist_dynamic()
+        await self._rebuild_index()
+        return True
+
+    async def _expire_loop(self) -> None:
+        """Nettoie les serveurs privés (add_mcp) arrivés à expiration."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(60)
+                now = time.time()
+                expired = [st.id for st in self.states if st.expires_at and st.expires_at <= now]
+                for sid in expired:
+                    log.info("serveur privé '%s' expiré — suppression", sid)
+                    await self.remove_server(sid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("expire loop: %s", exc)
+
+    def _visible(self, st: ServerState, client_labels: frozenset[str]) -> bool:
+        if st.private:
+            return False
+        return not st.labels or bool(st.labels & client_labels)
 
     async def _entries(self) -> list[dict]:
         entries = []
         for st in self.states:
+            if st.private:
+                continue
             for tool in st.tools.values():
                 entries.append({
                     "tool_id": f"{st.id}.{tool['name']}",
@@ -337,6 +438,7 @@ class Gateway:
                     "name": tool["name"],
                     "description": tool["description"],
                     "input_schema": tool["input_schema"],
+                    "labels": sorted(st.labels),
                 })
         return entries
 
@@ -375,7 +477,6 @@ class Gateway:
             log.info("index reconstruit: mode=%s tools=%d", index.name, len(entries))
 
     @staticmethod
-    @staticmethod
     def _load_registry(path: str) -> list[dict]:
         with open(path) as f:
             data = _expand(yaml.safe_load(f) or {})
@@ -393,10 +494,14 @@ class Gateway:
             oauth = s.get("oauth")
             if oauth is not None and not isinstance(oauth, dict):
                 raise ValueError(f"registry[{s['id']}]: 'oauth' doit être un objet (vide pour DCR auto)")
+            labels = s.get("labels")
+            if labels is not None and (not isinstance(labels, list) or not all(isinstance(l, str) for l in labels)):
+                raise ValueError(f"registry[{s['id']}]: 'labels' doit être une liste de chaînes")
         return servers
 
     async def run(self) -> None:
         self._tasks = [asyncio.create_task(self._serve(st), name=f"mcp:{st.id}") for st in self.states]
+        self._tasks.append(asyncio.create_task(self._expire_loop(), name="private-expiry"))
         await self._stop.wait()
 
     async def stop(self) -> None:
@@ -497,11 +602,13 @@ class Gateway:
         st.error = None
         await self._rebuild_index()
 
-    def catalog(self) -> dict[str, dict]:
-        """Catalogue lisible par le LLM : statut du serveur inclus, pour éviter
-        de confondre 'en attente d'auth/déconnexion' avec 'connecté mais vide'."""
+    def catalog(self, client_labels: frozenset[str] = frozenset()) -> dict[str, dict]:
+        """Catalogue lisible par le LLM : statut du serveur inclus, filtré par labels.
+        Les serveurs privés (add_mcp) n'y apparaissent jamais."""
         out: dict[str, dict] = {}
         for st in self.states:
+            if not self._visible(st, client_labels):
+                continue
             if st.status == "auth_required":
                 out[st.id] = {
                     "status": "auth_required",
@@ -516,11 +623,16 @@ class Gateway:
                 out[st.id] = {"status": "ready", "tools": sorted(st.tools)}
         return out
 
-    async def search(self, query: str) -> dict:
+    async def search(self, query: str, client_labels: frozenset[str] = frozenset()) -> dict:
         if self._index is None:
             await self._rebuild_index()
-        ranked = await self._index.search(query or "", TOOL_SEARCH_LIMIT)
-        results = [self._format(entry, score) for score, entry in ranked]
+        ranked = await self._index.search(query or "", TOOL_SEARCH_LIMIT * 4)
+        visible = [
+            (score, entry)
+            for score, entry in ranked
+            if not entry["labels"] or (set(entry["labels"]) & client_labels)
+        ][:TOOL_SEARCH_LIMIT]
+        results = [self._format(entry, score) for score, entry in visible]
         payload: dict[str, Any] = {
             "query": query,
             "index": self._index.name,
@@ -529,7 +641,7 @@ class Gateway:
         }
         if not results:
             payload["hint"] = "Aucun tool ne correspond. Utilise le champ 'catalog' pour voir les serveurs et leurs tools, puis reformule la recherche."
-            payload["catalog"] = self.catalog()
+            payload["catalog"] = self.catalog(client_labels)
         return payload
 
     @staticmethod
@@ -552,25 +664,43 @@ class Gateway:
             "next_step": f"call_tool(tool_id=\"{tool_id}\", arguments={self._example_args(entry['input_schema'])})",
         }
 
-    async def call(self, tool_id: str, arguments: dict | None) -> dict:
+    async def call(self, tool_id: str, arguments: dict | None, client_labels: frozenset[str] = frozenset()) -> dict:
         if "." not in tool_id:
             return {"tool_id": tool_id, "ok": False, "error": "format tool_id attendu: <server_id>.<tool_name>"}
         server_id, tool_name = tool_id.split(".", 1)
         st = next((s for s in self.states if s.id == server_id), None)
         if st is None:
-            return {"tool_id": tool_id, "ok": False, "error": f"serveur inconnu '{server_id}'", "catalog": self.catalog()}
-        if st.status == "auth_required":
-            auth_url = f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket}" if st.login_ticket else f"{PUBLIC_BASE_URL}/auth"
+            return {"tool_id": tool_id, "ok": False, "error": f"serveur inconnu '{server_id}'", "catalog": self.catalog(client_labels)}
+        # Les serveurs privés (add_mcp) ne sont pas soumis au filtre labels :
+        # leur seule protection est l'id secret que seul leur créateur connaît.
+        if not st.private and not self._visible(st, client_labels):
             return {
                 "tool_id": tool_id,
                 "ok": False,
-                "auth_required": True,
-                "error": f"authentification requise pour le serveur '{server_id}'",
-                "hint": f"demande à l'utilisateur d'ouvrir {auth_url} — lien personnel valable "
-                        f"{int(LOGIN_TICKET_TTL / 60)} min, ne concerne que ce serveur ; puis réessaie",
+                "error": f"tool non visible avec tes labels (serveur '{server_id}' réservé aux labels {sorted(st.labels)})",
             }
+        if st.status == "auth_required":
+            # Course normale : le callback OAuth vient de résoudre, l'échange
+            # code->token est en cours. On laisse le handshake finir au lieu de
+            # renvoyer auth_required à un LLM qui vient de faire authentifier.
+            fut = self.auth.futures.get(st.id)
+            if fut is not None and fut.done():
+                deadline = time.time() + 12
+                while time.time() < deadline and st.status == "auth_required":
+                    await asyncio.sleep(0.4)
+            if st.status == "auth_required":
+                auth_url = f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket}" if st.login_ticket else f"{PUBLIC_BASE_URL}/auth"
+                return {
+                    "tool_id": tool_id,
+                    "ok": False,
+                    "auth_required": True,
+                    "error": f"authentification requise pour le serveur '{server_id}'",
+                    "hint": f"demande à l'utilisateur d'ouvrir {auth_url} — lien personnel valable "
+                            f"{int(LOGIN_TICKET_TTL / 60)} min, ne concerne que ce serveur ; "
+                            f"une fois le login fait, réessaie call_tool à l'identique",
+                }
         if tool_name not in st.tools:
-            return {"tool_id": tool_id, "ok": False, "error": f"tool inconnu sur '{server_id}'", "catalog": self.catalog()}
+            return {"tool_id": tool_id, "ok": False, "error": f"tool inconnu sur '{server_id}'", "catalog": self.catalog(client_labels)}
         if st.session is None:
             return {
                 "tool_id": tool_id,
@@ -601,6 +731,12 @@ class Gateway:
 _gateway: Gateway | None = None
 
 
+def _client_labels(ctx) -> frozenset[str]:
+    """Labels du client, depuis le header X-Dynmcp-Labels (conf opencode)."""
+    raw = (ctx.headers or {}).get(LABELS_HEADER, "") if ctx else ""
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
 @asynccontextmanager
 async def lifespan(_server):
     global _gateway
@@ -626,14 +762,16 @@ mcp = MCPServer(
         "avec leur tool_id, leur description et leur input_schema ; "
         "2) call_tool(tool_id, arguments) en respectant l'input_schema reçue. "
         "Si tool_search renvoie 0 résultat, reformule avec des mots-clés plus génériques. "
-        "Les erreurs 429/rate-limit sont transitoires : réessaie ou passe au tool alternatif proposé."
+        + ("add_mcp(url) permet d'étendre tes capacités avec un MCP distant : il est privé "
+           "(server_key secret retourné) et expire automatiquement. " if ADD_MCP_ENABLED else "")
+        + "Les erreurs 429/rate-limit sont transitoires : réessaie ou passe au tool alternatif proposé."
     ),
     lifespan=lifespan,
 )
 
 
 @mcp.tool()
-async def tool_search(query: str) -> str:
+async def tool_search(query: str, ctx: Context) -> str:
     """Cherche dans le catalogue de tools disponibles tous les tools pertinents pour un besoin.
 
     Args:
@@ -647,11 +785,11 @@ async def tool_search(query: str) -> str:
         résultat, la réponse contient 'catalog' (serveurs + leurs tools) pour
         reformuler la recherche.
     """
-    return json.dumps(await _gateway.search(query), ensure_ascii=False, indent=2)
+    return json.dumps(await _gateway.search(query, _client_labels(ctx)), ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
-async def call_tool(tool_id: str, arguments: dict = {}) -> str:
+async def call_tool(tool_id: str, arguments: dict = {}, ctx: Context = None) -> str:
     """Exécute un tool trouvé via tool_search.
 
     Args:
@@ -661,7 +799,127 @@ async def call_tool(tool_id: str, arguments: dict = {}) -> str:
     Returns:
         JSON: {ok, content, structured_content?} — résultat de l'exécution.
     """
-    return json.dumps(await _gateway.call(tool_id, arguments), ensure_ascii=False, indent=2)
+    return json.dumps(await _gateway.call(tool_id, arguments, _client_labels(ctx)), ensure_ascii=False, indent=2)
+
+
+async def _assert_public_url(url: str) -> None:
+    """Garde anti-SSRF pour add_mcp : refuse IP privées/loopback/link-local."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("url invalide (http/https attendu)")
+    if ALLOW_PRIVATE_MCP_HOSTS:
+        return
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"hôte introuvable: {parsed.hostname} ({exc})")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"add_mcp refuse l'hôte {parsed.hostname} ({ip}) : adresse privée. "
+                "Pour un MCP interne, demande à un admin de l'ajouter via l'API."
+            )
+
+
+async def _wait_ready(st: ServerState, timeout: float = 30) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline and st.status in ("starting",):
+        await asyncio.sleep(0.3)
+
+
+async def _wait_ready(st: ServerState, timeout: float = 30) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline and st.status in ("starting",):
+        await asyncio.sleep(0.3)
+
+
+if ADD_MCP_ENABLED:
+
+    @mcp.tool()
+    async def add_mcp(url: str, name: str = "", headers: dict = {}) -> str:
+        """Ajoute un MCP distant (streamable HTTP) pour étendre tes propres capacités.
+
+        Le serveur est PRIVÉ : il n'apparaît pas dans le catalogue partagé, ses tools
+        ne sont utilisables que toi, via le server_key secret retourné (prefixe des
+        tool_id). Il expire automatiquement (24h) : si ta session dure plus longtemps,
+        ré-ajoute-le. Interdit aux adresses privées/internes. Si le MCP distant exige
+        une authentification OAuth, le lien de login est fourni dans la réponse.
+
+        Args:
+            url: URL du MCP distant (streamable HTTP), ex "https://mon-mcp.exemple.com/mcp".
+            name: optionnel, court préfixe lisible inclus dans le server_key.
+            headers: optionnel, headers HTTP à envoyer au MCP (ex: {"Authorization": "Bearer ..."}).
+
+        Returns:
+            JSON: {server_key, tools: [{tool_id, description, input_schema}], expires_at}
+            — appelle ces tools via call_tool avec leur tool_id.
+        """
+        url = url.strip()
+        try:
+            await _assert_public_url(url)
+        except ValueError as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+        # Dé-dup : un même URL ne s'enregistre qu'une fois — si le MCP exige une
+        # authentification, on ne recrée PAS un flow, on réutilise le serveur
+        # existant et son ticket de login en attente.
+        st = next(
+            (s for s in _gateway.states
+             if s.private and s.cfg.get("url") == url and not (s.expires_at and s.expires_at <= time.time())),
+            None,
+        )
+        already = st is not None
+        if st is None:
+            key = f"p-{secrets.token_urlsafe(16)}"
+            if name:
+                safe = re.sub(r"[^a-z0-9-]", "-", name.lower())[:20].strip("-")
+                key = f"p-{safe}-{secrets.token_urlsafe(12)}" if safe else key
+            cfg = {
+                "id": key,
+                "url": url,
+                "transport": "http",
+                "private": True,
+                # OAuth dynamique activé par défaut : no-op si le MCP n'en a pas besoin,
+                # déclenche le flow (DCR + ticket de login) s'il répond 401.
+                "oauth": {},
+                "expires_at": time.time() + PRIVATE_SERVER_TTL,
+            }
+            if headers:
+                cfg["headers"] = headers
+            st = await _gateway.add_server(cfg)
+        await _wait_ready(st)
+        out = {
+            "ok": st.status in ("ready", "auth_required"),
+            "server_key": st.id,
+            "status": st.status,
+            "already_registered": already,
+            "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.expires_at)),
+            "note": (
+                f"SERVEUR PRIVÉ ET ÉPHÉMÈRE (suppression auto dans {int(PRIVATE_SERVER_TTL / 3600)}h). "
+                "Il n'apparaît JAMAIS dans tool_search ni dans le catalog. "
+                "NE relance PAS add_mcp pour ce serveur : garde ce server_key et appelle ses tools "
+                "directement via call_tool avec les tool_id ci-dessous."
+            ),
+        }
+        if st.status == "ready":
+            out["tools"] = [
+                {"tool_id": f"{st.id}.{t['name']}", "description": t["description"], "input_schema": t["input_schema"]}
+                for t in st.tools.values()
+            ]
+            out["next_step"] = "call_tool(tool_id='<server_key>.<tool_name>', arguments=...)"
+        elif st.status == "auth_required":
+            out["auth_required"] = True
+            out["hint"] = (
+                f"le MCP ajouté exige une authentification: demande à l'utilisateur d'ouvrir "
+                f"{_auth_page_url(st)}. Une fois le login effectué, réessaie call_tool avec les "
+                f"tool_id <server_key>.<tool> — n'appelle PAS add_mcp à nouveau."
+            )
+        else:
+            out["error"] = f"connexion impossible: {st.error or st.status}"
+        return json.dumps(out, ensure_ascii=False, indent=2)
 
 
 def _server_by_id(server_id: str) -> ServerState | None:
@@ -673,6 +931,75 @@ def _auth_page_url(st: ServerState) -> str:
     if st.login_ticket:
         return f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket}"
     return f"{PUBLIC_BASE_URL}/auth"
+
+
+@mcp.custom_route("/servers", methods=["GET", "POST"])
+async def admin_servers(request: Request) -> JSONResponse:
+    """API admin : lister / ajouter des MCP au catalogue partagé (bearer token)."""
+    if not ADMIN_API_TOKEN or not secrets.compare_digest(
+        request.headers.get("authorization", ""), f"Bearer {ADMIN_API_TOKEN}"
+    ):
+        return JSONResponse({"error": "API admin désactivée ou token invalide"}, status_code=403)
+    if request.method == "GET":
+        return JSONResponse({"servers": [
+            {
+                "id": st.id,
+                "status": st.status,
+                "labels": sorted(st.labels),
+                "private": st.private,
+                "tools": len(st.tools),
+                "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.expires_at)) if st.expires_at else None,
+                "error": st.error,
+            }
+            for st in _gateway.states
+        ]})
+    body = await request.json()
+    cfg = {
+        "id": str(body.get("id", "")).strip(),
+        "url": str(body.get("url", "")).strip(),
+        "transport": "http",
+        "dynamic": True,
+    }
+    if not cfg["id"] or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,30}", cfg["id"]):
+        return JSONResponse({"error": "'id' requis (a-z0-9-, 2-31 chars)"}, status_code=400)
+    if not cfg["url"].startswith(("http://", "https://")):
+        return JSONResponse({"error": "'url' requise (http/https)"}, status_code=400)
+    if body.get("labels"):
+        if not isinstance(body["labels"], list) or not all(isinstance(l, str) for l in body["labels"]):
+            return JSONResponse({"error": "'labels' doit être une liste de chaînes"}, status_code=400)
+        cfg["labels"] = body["labels"]
+    if body.get("headers"):
+        if not isinstance(body["headers"], dict):
+            return JSONResponse({"error": "'headers' doit être un objet"}, status_code=400)
+        cfg["headers"] = body["headers"]
+    if body.get("timeout") is not None:
+        cfg["timeout"] = body["timeout"]
+    if body.get("oauth") is not None:
+        cfg["oauth"] = body["oauth"]
+    try:
+        st = await _gateway.add_server(cfg)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    await _wait_ready(st)
+    return JSONResponse({
+        "id": st.id,
+        "status": st.status,
+        "labels": sorted(st.labels),
+        "tools": sorted(st.tools),
+        "error": st.error,
+    }, status_code=201)
+
+
+@mcp.custom_route("/servers/{server_id}", methods=["DELETE"])
+async def admin_delete_server(request: Request) -> JSONResponse:
+    if not ADMIN_API_TOKEN or not secrets.compare_digest(
+        request.headers.get("authorization", ""), f"Bearer {ADMIN_API_TOKEN}"
+    ):
+        return JSONResponse({"error": "API admin désactivée ou token invalide"}, status_code=403)
+    deleted = await _gateway.remove_server(request.path_params["server_id"])
+    if not deleted:
+        return JSONResponse({"error": "serveur inconnu"}, status_code=404)
+    return JSONResponse({"deleted": request.path_params["server_id"]})
 
 
 @mcp.custom_route("/auth", methods=["GET"])
@@ -721,7 +1048,10 @@ async def oauth_callback(request: Request) -> HTMLResponse:
     state = request.query_params.get("state")
     if not code or not state or not _gateway.auth.complete(code, state):
         return HTMLResponse("<p>Callback OAuth invalide ou expiré.</p>", status_code=400)
-    return HTMLResponse("<p>Autorisation enregistrée. Tu peux fermer cette page — le serveur va se connecter.</p>")
+    return HTMLResponse(
+        "<p>Autorisation enregistrée — le gateway termine la connexion (quelques secondes). "
+        "Retourne dans ton agent et relance ton action, tu peux fermer cette page.</p>"
+    )
 
 
 if __name__ == "__main__":
