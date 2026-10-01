@@ -41,6 +41,16 @@ spec:
                 secretKeyRef:
                   name: dynmcp-secrets
                   key: GRAFANA_MCP_TOKEN
+            # OAuth dynamique : URL publique du gateway (callback /oauth/callback).
+            # Doit être joignable par le navigateur de l'utilisateur.
+            # - port-forward local : http://localhost:18080
+            # - vrai déploiement  : https://dynmcp.mon-club.io
+            - name: PUBLIC_BASE_URL
+              value: http://localhost:18080
+            # Persistance des tokens OAuth (emptyDir => survit au crash du container,
+            # pas à la suppression du pod ; monter un PVC en production)
+            - name: TOKENS_PATH
+              value: /data/tokens.json
             # Index sémantique optionnel : renseigner pour activer les embeddings
             # (endpoint OpenAI-compatible). Sinon fallback BM25 local automatique.
             # - name: EMBEDDINGS_BASE_URL
@@ -81,6 +91,8 @@ spec:
               readOnly: true
             - name: uv-cache
               mountPath: /root/.cache/uv
+            - name: oauth-tokens
+              mountPath: /data
       volumes:
         - name: code
           configMap:
@@ -89,4 +101,6 @@ spec:
           configMap:
             name: dynmcp-registry
         - name: uv-cache
+          emptyDir: {}
+        - name: oauth-tokens
           emptyDir: {}

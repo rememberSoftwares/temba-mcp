@@ -6,23 +6,36 @@ EMBEDDINGS_BASE_URL est défini) sinon fallback local BM25.
 
 SDK mcp >= 2.x (MCPServer, snake_case, streamable_http_client).
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import math
 import os
 import re
+import secrets
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx2
 import yaml
 from mcp import ClientSession
+from mcp.client.auth import OAuthClientProvider
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
+from mcp.shared.auth import (
+    AuthorizationCodeResult,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthToken,
+)
 from mcp.types import ToolListChangedNotification
 from rank_bm25 import BM25Plus
 import snowballstemmer
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 log = logging.getLogger("dynmcp")
 
@@ -31,6 +44,17 @@ CALL_TIMEOUT = float(os.getenv("CALL_TIMEOUT", "60"))
 LIST_TIMEOUT = float(os.getenv("LIST_TIMEOUT", "30"))
 HEALTH_INTERVAL = float(os.getenv("HEALTH_INTERVAL", "60"))
 RECONNECT_DELAY = float(os.getenv("RECONNECT_DELAY", "5"))
+PORT = int(os.getenv("PORT", "8080"))
+
+# OAuth dynamique (MCP auth spec) : DCR + PKCE, login humain via /auth
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", f"http://localhost:{PORT}").rstrip("/")
+AUTH_LOGIN_TIMEOUT = float(os.getenv("AUTH_LOGIN_TIMEOUT", "600"))
+TOKENS_PATH = os.getenv("TOKENS_PATH", "")
+
+# Tickets de login à usage limité : l'URL renvoyée au LLM contient un jeton
+# volant qui ne permet d'authentifier QUE le serveur concerné. Pas de page
+# d'admin partagée : chaque demande produit son propre lien.
+LOGIN_TICKET_TTL = float(os.getenv("LOGIN_TICKET_TTL", "900"))
 
 # Index sémantique optionnel (format OpenAI /v1/embeddings)
 EMBEDDINGS_BASE_URL = os.getenv("EMBEDDINGS_BASE_URL", "").rstrip("/")
@@ -152,16 +176,144 @@ class EmbeddingIndex:
         return [(round(s, 3), e) for s, e in scored[:limit] if s >= EMBED_MIN_SCORE]
 
 
+class TokenStore:
+    """TokenStorage SDK, persisté en JSON (mémoire si TOKENS_PATH vide)."""
+
+    def __init__(self, server_id: str):
+        self.server_id = server_id
+        self._data: dict = {}
+        self._loaded = False
+
+    def _load(self) -> None:
+        if self._loaded or not TOKENS_PATH:
+            return
+        self._loaded = True
+        try:
+            with open(TOKENS_PATH) as f:
+                self._data = (json.load(f) or {}).get(self.server_id, {})
+        except FileNotFoundError:
+            self._data = {}
+
+    def _save(self) -> None:
+        if not TOKENS_PATH:
+            return
+        try:
+            with open(TOKENS_PATH) as f:
+                all_data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            all_data = {}
+        all_data[self.server_id] = self._data
+        tmp = f"{TOKENS_PATH}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(all_data, f)
+        os.replace(tmp, TOKENS_PATH)
+
+    async def get_tokens(self) -> OAuthToken | None:
+        self._load()
+        t = self._data.get("tokens")
+        return OAuthToken.model_validate(t) if t else None
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        self._data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
+        self._save()
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        self._load()
+        c = self._data.get("client_info")
+        return OAuthClientInformationFull.model_validate(c) if c else None
+
+    async def set_client_info(self, info: OAuthClientInformationFull) -> None:
+        self._data["client_info"] = info.model_dump(mode="json", exclude_none=True)
+        self._save()
+
+
+class AuthCoordinator:
+    """Suit les flows OAuth en attente d'un login humain.
+
+    Chaque flow en attente émet un ticket volant (URL /auth?t=...) transmis via
+    le hint des tools : il ne permet d'authentifier que le serveur concerné,
+    expire, et meurt dès que le login aboutit ou que le flow est relancé.
+    """
+
+    def __init__(self):
+        self.by_state: dict[str, ServerState] = {}
+        self.futures: dict[str, asyncio.Future] = {}
+        self.tickets: dict[str, dict] = {}
+
+    def _prune(self) -> None:
+        now = time.time()
+        for t in [k for k, v in self.tickets.items() if v["exp"] < now]:
+            del self.tickets[t]
+
+    def issue_ticket(self, server_id: str) -> str:
+        self._prune()
+        code = secrets.token_urlsafe(24)
+        self.tickets[code] = {"server_id": server_id, "exp": time.time() + LOGIN_TICKET_TTL}
+        return code
+
+    def ticket_ok(self, ticket: str, server_id: str | None = None) -> bool:
+        self._prune()
+        entry = self.tickets.get(ticket)
+        return entry is not None and (server_id is None or entry["server_id"] == server_id)
+
+    def consume(self, server_id: str) -> None:
+        for t in [k for k, v in self.tickets.items() if v["server_id"] == server_id]:
+            del self.tickets[t]
+
+    def server_for_ticket(self, ticket: str) -> ServerState | None:
+        if not self.ticket_ok(ticket):
+            return None
+        return next((s for s in _gateway.states if s.id == self.tickets[ticket]["server_id"]), None)
+
+    def start(self, st: ServerState, authorize_url: str) -> asyncio.Future:
+        old = self.futures.get(st.id)
+        if old is not None and not old.done():
+            if st.auth_url == authorize_url:
+                return old
+            old.cancel()
+        fut = asyncio.get_running_loop().create_future()
+        self.futures[st.id] = fut
+        st.auth_url = authorize_url
+        st.status = "auth_required"
+        st.error = None
+        self.consume(st.id)
+        st.login_ticket = self.issue_ticket(st.id)
+        from urllib.parse import urlparse, parse_qs
+
+        state = parse_qs(urlparse(authorize_url).query).get("state", ["?"])[0]
+        self.by_state[state] = st
+        log.warning("AUTH REQUIS pour '%s' — ticket de login émis (%s/auth?t=...)", st.id, PUBLIC_BASE_URL)
+        return fut
+
+    def complete(self, code: str, state: str) -> bool:
+        st = self.by_state.pop(state, None)
+        if st is None:
+            return False
+        fut = self.futures.get(st.id)
+        if fut is not None and not fut.done():
+            fut.set_result((code, state))
+        self.consume(st.id)
+        return True
+
+    def abort(self, server_id: str) -> None:
+        fut = self.futures.pop(server_id, None)
+        if fut is not None and not fut.done():
+            fut.cancel()
+        self.consume(server_id)
+
+
 class ServerState:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.id = cfg["id"]
-        self.timeout: float | None = cfg.get("timeout")  # secondes, optionnel
+        self.timeout: float | None = cfg.get("timeout")
         self.status = "starting"
         self.error: str | None = None
         self.tools: dict[str, dict] = {}
         self.session: ClientSession | None = None
         self.wake = asyncio.Event()
+        self.auth_url: str | None = None
+        self.login_ticket: str | None = None
 
 
 class Gateway:
@@ -173,6 +325,7 @@ class Gateway:
         self._index_fp: str | None = None
         self._index_lock = asyncio.Lock()
         self._embed_client = httpx2.AsyncClient(timeout=30)
+        self.auth = AuthCoordinator()
 
     async def _entries(self) -> list[dict]:
         entries = []
@@ -222,6 +375,7 @@ class Gateway:
             log.info("index reconstruit: mode=%s tools=%d", index.name, len(entries))
 
     @staticmethod
+    @staticmethod
     def _load_registry(path: str) -> list[dict]:
         with open(path) as f:
             data = _expand(yaml.safe_load(f) or {})
@@ -236,6 +390,9 @@ class Gateway:
                 raise ValueError(f"registry[{s['id']}]: 'url' requise")
             if s.get("timeout") is not None and (not isinstance(s["timeout"], (int, float)) or s["timeout"] <= 0):
                 raise ValueError(f"registry[{s['id']}]: 'timeout' doit être un nombre de secondes > 0")
+            oauth = s.get("oauth")
+            if oauth is not None and not isinstance(oauth, dict):
+                raise ValueError(f"registry[{s['id']}]: 'oauth' doit être un objet (vide pour DCR auto)")
         return servers
 
     async def run(self) -> None:
@@ -249,9 +406,47 @@ class Gateway:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._embed_client.aclose()
 
+    def _auth_provider(self, st: ServerState) -> OAuthClientProvider:
+        cfg = st.cfg.get("oauth") or {}
+        redirect_uri = f"{PUBLIC_BASE_URL}/oauth/callback"
+        metadata = OAuthClientMetadata(
+            client_name="dynmcp",
+            redirect_uris=[redirect_uri],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            scope=cfg.get("scope"),
+        )
+        store = TokenStore(st.id)
+        return OAuthClientProvider(
+            st.cfg["url"],
+            client_metadata=metadata,
+            storage=store,
+            redirect_handler=self._make_redirect_handler(st),
+            callback_handler=self._make_callback_handler(st),
+        )
+
+    def _make_redirect_handler(self, st: ServerState):
+        async def redirect_handler(url: str) -> None:
+            self.auth.start(st, url)
+        return redirect_handler
+
+    def _make_callback_handler(self, st: ServerState):
+        async def callback_handler() -> AuthorizationCodeResult:
+            fut = self.auth.futures.get(st.id)
+            if fut is None:
+                raise RuntimeError("aucun flow OAuth en attente")
+            code, state = await asyncio.shield(fut)
+            return AuthorizationCodeResult(code=code, state=state)
+        return callback_handler
+
     @asynccontextmanager
-    async def _open_transport(self, cfg: dict):
-        client = httpx2.AsyncClient(headers=cfg.get("headers") or None)
+    async def _open_transport(self, st: ServerState):
+        cfg = st.cfg
+        client_kwargs: dict[str, Any] = {"headers": cfg.get("headers") or None}
+        if cfg.get("oauth") is not None:
+            client_kwargs["auth"] = self._auth_provider(st)
+        client = httpx2.AsyncClient(**client_kwargs)
         try:
             async with streamable_http_client(cfg["url"], http_client=client) as (read, write):
                 yield read, write
@@ -261,14 +456,15 @@ class Gateway:
     async def _serve(self, st: ServerState) -> None:
         while not self._stop.is_set():
             try:
-                async with self._open_transport(st.cfg) as (read, write):
+                async with self._open_transport(st) as (read, write):
                     def on_message(message: Any, _st: ServerState = st) -> None:
                         if isinstance(message, ToolListChangedNotification):
                             _st.wake.set()
 
                     session = ClientSession(read, write, message_handler=on_message)
                     async with session:
-                        await asyncio.wait_for(session.initialize(), st.timeout or LIST_TIMEOUT)
+                        init_timeout = st.timeout or (AUTH_LOGIN_TIMEOUT if st.cfg.get("oauth") is not None else LIST_TIMEOUT)
+                        await asyncio.wait_for(session.initialize(), init_timeout)
                         st.session = session
                         await self._sync_tools(st)
                         while not self._stop.is_set():
@@ -284,6 +480,7 @@ class Gateway:
                 st.status = "error"
                 st.error = f"{type(exc).__name__}: {exc}"
                 st.tools = {}
+                self.auth.abort(st.id)
                 if not self._stop.is_set():
                     await asyncio.sleep(RECONNECT_DELAY)
             finally:
@@ -300,8 +497,24 @@ class Gateway:
         st.error = None
         await self._rebuild_index()
 
-    def catalog(self) -> dict[str, list[str]]:
-        return {st.id: sorted(st.tools) for st in self.states}
+    def catalog(self) -> dict[str, dict]:
+        """Catalogue lisible par le LLM : statut du serveur inclus, pour éviter
+        de confondre 'en attente d'auth/déconnexion' avec 'connecté mais vide'."""
+        out: dict[str, dict] = {}
+        for st in self.states:
+            if st.status == "auth_required":
+                out[st.id] = {
+                    "status": "auth_required",
+                    "tools": [],
+                    "hint": f"Authentification requise: demande à l'utilisateur d'ouvrir "
+                            f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket} (lien personnel valable "
+                            f"{int(LOGIN_TICKET_TTL / 60)} min)",
+                }
+            elif st.status != "ready":
+                out[st.id] = {"status": st.status, "tools": sorted(st.tools), "error": st.error}
+            else:
+                out[st.id] = {"status": "ready", "tools": sorted(st.tools)}
+        return out
 
     async def search(self, query: str) -> dict:
         if self._index is None:
@@ -346,6 +559,16 @@ class Gateway:
         st = next((s for s in self.states if s.id == server_id), None)
         if st is None:
             return {"tool_id": tool_id, "ok": False, "error": f"serveur inconnu '{server_id}'", "catalog": self.catalog()}
+        if st.status == "auth_required":
+            auth_url = f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket}" if st.login_ticket else f"{PUBLIC_BASE_URL}/auth"
+            return {
+                "tool_id": tool_id,
+                "ok": False,
+                "auth_required": True,
+                "error": f"authentification requise pour le serveur '{server_id}'",
+                "hint": f"demande à l'utilisateur d'ouvrir {auth_url} — lien personnel valable "
+                        f"{int(LOGIN_TICKET_TTL / 60)} min, ne concerne que ce serveur ; puis réessaie",
+            }
         if tool_name not in st.tools:
             return {"tool_id": tool_id, "ok": False, "error": f"tool inconnu sur '{server_id}'", "catalog": self.catalog()}
         if st.session is None:
@@ -439,6 +662,66 @@ async def call_tool(tool_id: str, arguments: dict = {}) -> str:
         JSON: {ok, content, structured_content?} — résultat de l'exécution.
     """
     return json.dumps(await _gateway.call(tool_id, arguments), ensure_ascii=False, indent=2)
+
+
+def _server_by_id(server_id: str) -> ServerState | None:
+    return next((s for s in _gateway.states if s.id == server_id), None)
+
+
+def _auth_page_url(st: ServerState) -> str:
+    """URL personnelle de login pour ce flow (ticket volant, serveur unique)."""
+    if st.login_ticket:
+        return f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket}"
+    return f"{PUBLIC_BASE_URL}/auth"
+
+
+@mcp.custom_route("/auth", methods=["GET"])
+async def auth_page(request: Request) -> HTMLResponse:
+    """Page de login propre à une demande : accessible uniquement via le ticket
+    volant reçu dans le hint du LLM (?t=...). Sans ticket : refusé."""
+    ticket = request.query_params.get("t", "")
+    st = _gateway.auth.server_for_ticket(ticket) if ticket else None
+    if st is None:
+        return HTMLResponse(
+            "<html><head><meta charset='utf-8'><title>dynmcp auth</title></head><body>"
+            "<p>Lien invalide ou expiré. Demande un nouveau lien à ton agent "
+            "(relance l'action qui nécessite ce serveur).</p></body></html>",
+            status_code=401,
+        )
+    ttl_min = int(LOGIN_TICKET_TTL / 60)
+    if st.status == "auth_required" and st.auth_url:
+        body = (
+            f"<p>Serveur <b>{st.id}</b> en attente d'authentification.</p>"
+            f"<p><a href='/auth/{st.id}/login?t={ticket}'>S'authentifier maintenant</a></p>"
+            f"<p><small>Ce lien est personnel et valable {ttl_min} min. "
+            f"Le compte avec lequel tu te connectes sera celui utilisé par le gateway pour ce serveur.</small></p>"
+        )
+    else:
+        body = f"<p>Le serveur <b>{st.id}</b> n'attend plus d'authentification (statut: {st.status}). Tu peux fermer cette page.</p>"
+    return HTMLResponse(
+        "<html><head><meta charset='utf-8'><title>dynmcp auth</title></head><body>"
+        f"{body}</body></html>"
+    )
+
+
+@mcp.custom_route("/auth/{server_id}/login", methods=["GET"])
+async def auth_login(request: Request) -> HTMLResponse | RedirectResponse:
+    st = _server_by_id(request.path_params["server_id"])
+    if st is None or not st.auth_url:
+        return HTMLResponse("<p>Aucun flow OAuth en attente pour ce serveur.</p>", status_code=404)
+    ticket = request.query_params.get("t", "")
+    if not _gateway.auth.ticket_ok(ticket, st.id):
+        return HTMLResponse("<p>Lien invalide ou expiré. Demande un nouveau lien à ton agent.</p>", status_code=403)
+    return RedirectResponse(st.auth_url)
+
+
+@mcp.custom_route("/oauth/callback", methods=["GET"])
+async def oauth_callback(request: Request) -> HTMLResponse:
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    if not code or not state or not _gateway.auth.complete(code, state):
+        return HTMLResponse("<p>Callback OAuth invalide ou expiré.</p>", status_code=400)
+    return HTMLResponse("<p>Autorisation enregistrée. Tu peux fermer cette page — le serveur va se connecter.</p>")
 
 
 if __name__ == "__main__":

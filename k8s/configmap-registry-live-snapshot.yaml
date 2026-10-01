@@ -1,0 +1,41 @@
+# Registry des MCP agrégés par le gateway (infra as code).
+# Transport HTTP uniquement ; les ${VARS} sont interpolées depuis l'env du pod.
+servers:
+  # Documentation technique (public, streamable HTTP)
+  - id: deepwiki
+    transport: http
+    url: https://mcp.deepwiki.com/mcp
+    # timeout: 30   # secondes, optionnel — override LIST_TIMEOUT/CALL_TIMEOUT pour ce serveur
+
+  # Grafana MCP déployé à côté (k8s/grafana.yaml), joint en HTTP avec bearer token
+  - id: grafana
+    transport: http
+    url: http://mcp-grafana:8000/mcp
+    headers:
+      Authorization: Bearer ${GRAFANA_MCP_TOKEN}
+
+  # Atlassian MCP déployé à côté (k8s/atlassian.yaml), joint en HTTP
+  #- id: atlassian
+  #  transport: http
+  #  url: http://mcp-atlassian:8000/mcp
+
+  # Atlassian Remote MCP v2 (hébergé par Atlassian) — OAuth 2.1 dynamique.
+  # ?tools=all : expose la liste plate complète au lieu de discovery/execute.
+  # Pas de creds => 401 => flow OAuth (DCR) => /auth pour le login humain.
+  - id: atlassian-remote
+    transport: http
+    url: https://mcp.atlassian.com/v2/mcp?tools=all
+    oauth: {}
+
+  # Exemple : MCP distant protégé par OAuth (MCP auth spec : DCR + PKCE).
+  # Au premier usage, le LLM signalera l'auth requise ; l'utilisateur devra
+  # ouvrir ${PUBLIC_BASE_URL}/auth dans son navigateur pour se connecter.
+  # oauth: {}                       # Dynamic Client Registration
+  # oauth:                          # ou client pré-enregistré :
+  #   client_id: mon-id
+  #   client_secret: ${MON_SECRET}
+  #   scope: "tools:read tools:execute"
+  # - id: mon-oauth-mcp
+  #   transport: http
+  #   url: https://exemple.com/mcp
+  #   oauth: {}
