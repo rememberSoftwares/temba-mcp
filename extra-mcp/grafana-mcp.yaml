@@ -35,12 +35,12 @@ spec:
             - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: dynmcp-secrets
+                  name: temba-mcp-secrets
                   key: GRAFANA_SERVICE_ACCOUNT_TOKEN
             - name: MCP_GRAFANA_SERVER_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: dynmcp-secrets
+                  name: temba-mcp-secrets
                   key: GRAFANA_MCP_TOKEN
           resources:
             requests:

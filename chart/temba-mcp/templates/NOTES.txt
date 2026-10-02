@@ -1,12 +1,12 @@
-dynmcp est déployé (release {{ .Release.Name }}).
+temba-mcp est déployé (release {{ .Release.Name }}).
 
 1. Accès (dev) :
-   kubectl port-forward svc/{{ include "dynmcp.fullname" . }} 18080:8080
+   kubectl port-forward svc/{{ include "tembamcp.fullname" . }} 18080:8080
    → MCP pour les agents : http://localhost:18080/mcp
    → page d'auth OAuth  : http://localhost:18080/auth
 
-2. Token admin (Secret {{ include "dynmcp.adminSecretName" . }}) :
-   kubectl get secret {{ include "dynmcp.adminSecretName" . }} -o jsonpath='{.data.{{ include "dynmcp.adminTokenKey" . }}}' | base64 -d
+2. Token admin (Secret {{ include "tembamcp.adminSecretName" . }}) :
+   kubectl get secret {{ include "tembamcp.adminSecretName" . }} -o jsonpath='{.data.{{ include "tembamcp.adminTokenKey" . }}}' | base64 -d
    → bearer de l'API admin /servers (jamais envoyé au LLM).
 
 3. OAuth : au premier usage d'un serveur oauth: {} , le LLM renvoie un lien

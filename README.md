@@ -1,4 +1,4 @@
-# dynmcp
+# temba-mcp
 
 An MCP gateway that exposes only 2–3 tools (`tool_search`, `call_tool`,
 optional `add_mcp`) and aggregates a catalog of remote MCP servers (streamable
@@ -7,7 +7,7 @@ keywords, receive the matching tools along with their JSON Schema, and execute
 them through the gateway.
 
 ```
-opencode / agents ──HTTP──> dynmcp (2-3 tools) ──HTTP──> remote MCP servers
+opencode / agents ──HTTP──> temba-mcp (2-3 tools) ──HTTP──> remote MCP servers
                             │  tool_search → index (BM25 or embeddings)
                             │  call_tool   → tools/call routed to the source MCP
                             │  add_mcp     → private ephemeral server (24h)
@@ -19,7 +19,7 @@ opencode / agents ──HTTP──> dynmcp (2-3 tools) ──HTTP──> remote 
 ## Layout
 
 ```
-chart/dynmcp/
+chart/temba-mcp/
 ├── Chart.yaml
 ├── values.yaml                  # all configuration (catalog, redis, ingress, secrets…)
 ├── files/server.py              # gateway code — single source of truth (mounted as ConfigMap, no image)
@@ -33,8 +33,8 @@ test_client.py                    # MCP dev client (tool_search/call_tool/add_mc
 ## Deploying
 
 ```sh
-helm upgrade --install dynmcp ./chart/dynmcp
-kubectl port-forward svc/dynmcp 18080:8080
+helm upgrade --install temba-mcp ./chart/temba-mcp
+kubectl port-forward svc/temba-mcp 18080:8080
 # → MCP endpoint for agents: http://localhost:18080/mcp
 # → OAuth login page       : http://localhost:18080/auth
 ```
@@ -45,10 +45,10 @@ and mounted as a ConfigMap).
 opencode client workflow (in `~/.config/opencode/opencode.json`):
 
 ```json
-"dynmcp": {
+"temba-mcp": {
   "type": "remote",
   "url": "http://localhost:18080/mcp",
-  "headers": { "X-Dynmcp-Labels": "grafana,jira" }
+  "headers": { "X-Temba-Mcp-Labels": "grafana,jira" }
 }
 ```
 
@@ -82,7 +82,7 @@ otherwise local **BM25** fallback. The active mode is returned in the payload
 ### Labels
 
 A server with `labels` is only visible (tool_search **and** call_tool) to
-clients sending at least one matching label in the `X-Dynmcp-Labels` header
+clients sending at least one matching label in the `X-Temba-Mcp-Labels` header
 (opencode config). Servers without labels are visible to everyone.
 
 ### Dynamic OAuth (MCP auth spec)
@@ -111,10 +111,10 @@ in Redis (survive restarts, replicated across pods).
 The admin API token comes from a k8s Secret, configured under `adminApi` in
 values.yaml:
 
-- `adminApi.secretName` set (default `dynmcp-secrets`): the chart references a
+- `adminApi.secretName` set (default `temba-mcp-secrets`): the chart references a
   pre-existing Secret. Create it manually:
   ```sh
-  kubectl create secret generic dynmcp-secrets \
+  kubectl create secret generic temba-mcp-secrets \
     --from-literal=ADMIN_API_TOKEN=$(openssl rand -hex 24) \
     --from-literal=GRAFANA_MCP_TOKEN=$(openssl rand -hex 24)
   ```
@@ -131,7 +131,7 @@ env:
   - name: GRAFANA_MCP_TOKEN
     valueFrom:
       secretKeyRef:
-        name: dynmcp-secrets
+        name: temba-mcp-secrets
         key: GRAFANA_MCP_TOKEN
 
 catalog:
@@ -163,8 +163,8 @@ catalog:
 ## Multi-replica
 
 `replicaCount > 1` works: OAuth tokens and the dynamic registry live in Redis
-(`dynmcp:tokens:*`, hash `dynmcp:dynamic_servers`), replicated via pub/sub
-(`dynmcp:events`). Redis persistence uses emptyDir by default — enable
+(`temba-mcp:tokens:*`, hash `temba-mcp:dynamic_servers`), replicated via pub/sub
+(`temba-mcp:events`). Redis persistence uses emptyDir by default — enable
 `redis.persistence` (PVC) to survive pod deletion.
 
 ## Main environment variables
@@ -177,5 +177,6 @@ catalog:
 | `ADMIN_API_TOKEN` | empty = API disabled | bearer for `/servers` |
 | `TOOL_SEARCH_LIMIT` | `5` | top N tool_search results |
 | `PRIVATE_SERVER_TTL` | `86400` | lifetime of add_mcp servers (seconds) |
+| `TOKEN_RETENTION` | `2592000` (30 d) | sliding TTL of stored OAuth tokens; a server idle longer must re-authenticate |
 | `AUTH_LOGIN_TIMEOUT` | `600` | time granted to the human for the OAuth login |
 | `embeddings.*` (values.yaml) | empty | enables embeddings mode (`baseUrl`/`apiKey`/`secretRef`/`model`) |

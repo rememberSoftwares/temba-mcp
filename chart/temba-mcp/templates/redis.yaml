@@ -2,21 +2,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "dynmcp.fullname" . }}-redis
+  name: {{ include "tembamcp.fullname" . }}-redis
   labels:
-    {{- include "dynmcp.labels" . | nindent 4 }}
+    {{- include "tembamcp.labels" . | nindent 4 }}
     app.kubernetes.io/component: redis
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: dynmcp
+      app.kubernetes.io/name: temba-mcp
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: redis
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: dynmcp
+        app.kubernetes.io/name: temba-mcp
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: redis
     spec:
@@ -37,7 +37,7 @@ spec:
         - name: data
           {{- if .Values.redis.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "dynmcp.fullname" . }}-redis
+            claimName: {{ include "tembamcp.fullname" . }}-redis
           {{- else }}
           emptyDir: {}
           {{- end }}
@@ -45,13 +45,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "dynmcp.fullname" . }}-redis
+  name: {{ include "tembamcp.fullname" . }}-redis
   labels:
-    {{- include "dynmcp.labels" . | nindent 4 }}
+    {{- include "tembamcp.labels" . | nindent 4 }}
     app.kubernetes.io/component: redis
 spec:
   selector:
-    app.kubernetes.io/name: dynmcp
+    app.kubernetes.io/name: temba-mcp
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: redis
   ports:
@@ -63,9 +63,9 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "dynmcp.fullname" . }}-redis
+  name: {{ include "tembamcp.fullname" . }}-redis
   labels:
-    {{- include "dynmcp.labels" . | nindent 4 }}
+    {{- include "tembamcp.labels" . | nindent 4 }}
 spec:
   accessModes: [ReadWriteOnce]
   resources:

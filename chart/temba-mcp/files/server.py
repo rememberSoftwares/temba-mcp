@@ -1,4 +1,4 @@
-"""dynmcp — agrégateur MCP : un seul point d'entrée MCP (tool_search + call_tool)
+"""temba-mcp — agrégateur MCP : un seul point d'entrée MCP (tool_search + call_tool)
 qui agrège des MCP distants (streamable HTTP) enregistrés dans un registry YAML.
 
 Recherche de tools : sémantique (embeddings via endpoint OpenAI-compatible si
@@ -41,7 +41,7 @@ import snowballstemmer
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-log = logging.getLogger("dynmcp")
+log = logging.getLogger("temba-mcp")
 
 TOOL_SEARCH_LIMIT = int(os.getenv("TOOL_SEARCH_LIMIT", "5"))
 CALL_TIMEOUT = float(os.getenv("CALL_TIMEOUT", "60"))
@@ -77,13 +77,13 @@ ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "")
 PRIVATE_SERVER_TTL = float(os.getenv("PRIVATE_SERVER_TTL", "86400"))
 # Tool add_mcp : désactivé par défaut (sécurité) ; ADD_MCP_ENABLED=true pour l'activer.
 ADD_MCP_ENABLED = _env_bool("ADD_MCP_ENABLED")
-LABELS_HEADER = "x-dynmcp-labels"
+LABELS_HEADER = "x-temba-mcp-labels"
 
 # Redis (obligatoire en multi-réplicas) : état partagé (tokens OAuth + serveurs
 # dynamiques). Vide = mémoire process (dev mono-process).
 REDIS_URL = os.getenv("REDIS_URL", "")
-REDIS_KEY_SERVERS = "dynmcp:dynamic_servers"
-REDIS_CHANNEL = "dynmcp:events"
+REDIS_KEY_SERVERS = "temba-mcp:dynamic_servers"
+REDIS_CHANNEL = "temba-mcp:events"
 
 # Index sémantique optionnel (format OpenAI /v1/embeddings)
 EMBEDDINGS_BASE_URL = os.getenv("EMBEDDINGS_BASE_URL", "").rstrip("/")
@@ -217,7 +217,7 @@ def redis_client():
 
 
 def _token_key(server_id: str) -> str:
-    return f"dynmcp:tokens:{server_id}"
+    return f"temba-mcp:tokens:{server_id}"
 
 
 class TokenStore:
@@ -241,7 +241,8 @@ class TokenStore:
         if REDIS_URL:
             client = redis_client()
             try:
-                await client.set(_token_key(self.server_id), json.dumps(data))
+                # TTL glissant : re-armé à chaque écriture (refresh inclus)
+                await client.set(_token_key(self.server_id), json.dumps(data), ex=int(TOKEN_RETENTION))
             except Exception as exc:
                 log.warning("redis set tokens (%s): %s", self.server_id, exc)
             return
@@ -395,11 +396,20 @@ class Gateway:
             return False
         await self._detach(server_id)
         await self._dyn_del(server_id)
+        # purge immédiate des tokens du serveur supprimé
+        if REDIS_URL:
+            try:
+                await redis_client().delete(_token_key(server_id))
+            except Exception:
+                pass
+        else:
+            _TOKEN_MEMORY.pop(server_id, None)
         await self._rebuild_index()
         return True
 
     async def _expire_loop(self) -> None:
         """Nettoie les serveurs privés (add_mcp) arrivés à expiration."""
+        iterations = 0
         while not self._stop.is_set():
             try:
                 await asyncio.sleep(60)
@@ -408,10 +418,31 @@ class Gateway:
                 for sid in expired:
                     log.info("serveur privé '%s' expiré — suppression", sid)
                     await self.remove_server(sid)
+                # purge périodique des tokens orphelins (serveur supprimé du registry)
+                iterations += 1
+                if iterations % 15 == 0:
+                    await self._purge_orphan_tokens()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning("expire loop: %s", exc)
+
+    async def _purge_orphan_tokens(self) -> None:
+        """Supprime les tokens OAuth dont le serveur n'existe plus."""
+        known = {st.id for st in self.states}
+        if REDIS_URL:
+            client = redis_client()
+            removed = 0
+            async for key in client.scan_iter(match="temba-mcp:tokens:*"):
+                sid = key.removeprefix("temba-mcp:tokens:")
+                if sid and sid not in known:
+                    await client.delete(key)
+                    removed += 1
+            if removed:
+                log.info("purge de %d tokens orphelins", removed)
+        else:
+            for sid in [k for k in list(_TOKEN_MEMORY) if k not in known]:
+                _TOKEN_MEMORY.pop(sid, None)
 
     def _visible(self, st: ServerState, client_labels: frozenset[str]) -> bool:
         if st.private:
@@ -590,7 +621,7 @@ class Gateway:
         cfg = st.cfg.get("oauth") or {}
         redirect_uri = f"{PUBLIC_BASE_URL}/oauth/callback"
         metadata = OAuthClientMetadata(
-            client_name="dynmcp",
+            client_name="temba-mcp",
             redirect_uris=[redirect_uri],
             grant_types=["authorization_code", "refresh_token"],
             response_types=["code"],
@@ -807,7 +838,7 @@ _gateway: Gateway | None = None
 
 
 def _client_labels(ctx) -> frozenset[str]:
-    """Labels du client, depuis le header X-Dynmcp-Labels (conf opencode)."""
+    """Labels du client, depuis le header X-Temba-Mcp-Labels (conf opencode)."""
     raw = (ctx.headers or {}).get(LABELS_HEADER, "") if ctx else ""
     return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 
@@ -825,7 +856,7 @@ async def lifespan(_server):
 
 
 mcp = MCPServer(
-    "dynmcp",
+    "temba-mcp",
     instructions=(
         "Ce serveur est un portail vers un catalogue de tools découverts dynamiquement ; "
         "ces tools ne sont PAS chargés dans ta liste de tools. "
@@ -1078,7 +1109,7 @@ async def auth_page(request: Request) -> HTMLResponse:
     st = _gateway.auth.server_for_ticket(ticket) if ticket else None
     if st is None:
         return HTMLResponse(
-            "<html><head><meta charset='utf-8'><title>dynmcp auth</title></head><body>"
+            "<html><head><meta charset='utf-8'><title>temba-mcp auth</title></head><body>"
             "<p>Lien invalide ou expiré. Demande un nouveau lien à ton agent "
             "(relance l'action qui nécessite ce serveur).</p></body></html>",
             status_code=401,
@@ -1094,7 +1125,7 @@ async def auth_page(request: Request) -> HTMLResponse:
     else:
         body = f"<p>Le serveur <b>{st.id}</b> n'attend plus d'authentification (statut: {st.status}). Tu peux fermer cette page.</p>"
     return HTMLResponse(
-        "<html><head><meta charset='utf-8'><title>dynmcp auth</title></head><body>"
+        "<html><head><meta charset='utf-8'><title>temba-mcp auth</title></head><body>"
         f"{body}</body></html>"
     )
 

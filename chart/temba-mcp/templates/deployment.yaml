@@ -1,24 +1,24 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "dynmcp.fullname" . }}
+  name: {{ include "tembamcp.fullname" . }}
   labels:
-    {{- include "dynmcp.labels" . | nindent 4 }}
+    {{- include "tembamcp.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: dynmcp
+      app.kubernetes.io/name: temba-mcp
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        {{- include "dynmcp.labels" . | nindent 8 }}
+        {{- include "tembamcp.labels" . | nindent 8 }}
         app.kubernetes.io/component: gateway
     spec:
       automountServiceAccountToken: false
       containers:
-        - name: dynmcp
+        - name: temba-mcp
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [sh, -c]
@@ -27,22 +27,22 @@ spec:
           workingDir: /app
           env:
             - name: REGISTRY_PATH
-              value: /etc/dynmcp/registry.yaml
+              value: /etc/temba-mcp/registry.yaml
             - name: PORT
               value: "8080"
             - name: LIST_TIMEOUT
               value: "90"
             - name: PUBLIC_BASE_URL
-              value: {{ include "dynmcp.publicBaseUrl" . | quote }}
+              value: {{ include "tembamcp.publicBaseUrl" . | quote }}
             - name: ADD_MCP_ENABLED
               value: {{ .Values.allowNewMcpRegisteringByLlm | ternary "true" "false" | quote }}
             - name: ADMIN_API_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "dynmcp.adminSecretName" . }}
-                  key: {{ include "dynmcp.adminTokenKey" . }}
+                  name: {{ include "tembamcp.adminSecretName" . }}
+                  key: {{ include "tembamcp.adminTokenKey" . }}
             - name: REDIS_URL
-              value: {{ .Values.redis.url | default (printf "redis://%s-redis:6379/0" (include "dynmcp.fullname" .)) | quote }}
+              value: {{ .Values.redis.url | default (printf "redis://%s-redis:6379/0" (include "tembamcp.fullname" .)) | quote }}
             {{- with .Values.embeddings }}
             {{- if .baseUrl }}
             - name: EMBEDDINGS_BASE_URL
@@ -90,12 +90,12 @@ spec:
               mountPath: /app
               readOnly: true
             - name: registry
-              mountPath: /etc/dynmcp
+              mountPath: /etc/temba-mcp
               readOnly: true
       volumes:
         - name: code
           configMap:
-            name: {{ include "dynmcp.fullname" . }}-code
+            name: {{ include "tembamcp.fullname" . }}-code
         - name: registry
           configMap:
-            name: {{ include "dynmcp.fullname" . }}-registry
+            name: {{ include "tembamcp.fullname" . }}-registry

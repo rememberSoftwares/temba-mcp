@@ -1,4 +1,4 @@
-"""Client de test local du gateway dynmcp (streamable HTTP)."""
+"""Client de test local du gateway temba-mcp (streamable HTTP)."""
 import asyncio
 import json
 import os
@@ -9,7 +9,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 async def main() -> None:
-    url = os.getenv("DYNMCP_URL", "http://localhost:8080/mcp")
+    url = os.getenv("TEMBA_MCP_URL", "http://localhost:8080/mcp")
     query = " ".join(sys.argv[1:]) or "va t-il faire beau à paris aujourd'hui"
     async with streamable_http_client(url) as (read, write):
         async with ClientSession(read, write) as session:

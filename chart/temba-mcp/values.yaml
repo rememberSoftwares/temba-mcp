@@ -10,7 +10,7 @@ ingress:
   enabled: true
   className: ""
   host: ""
-  tls: [] # [{secretName: dynmcp-tls, hosts: [dynmcp.exemple.com]}]
+  tls: [] # [{secretName: temba-mcp-tls, hosts: [temba-mcp.exemple.com]}]
   annotations: {}
 
 
@@ -51,7 +51,7 @@ catalog:
 #  - name: GRAFANA_MCP_TOKEN # interpolate in the catalog like so: ${GRAFANA_MCP_TOKEN}
 #    valueFrom:
 #      secretKeyRef:
-#        name: dynmcp-secrets
+#        name: temba-mcp-secrets
 #        key: GRAFANA_MCP_TOKEN
 env: []
 

@@ -1,6 +1,6 @@
 apiVersion: v2
-name: dynmcp
+name: temba-mcp
 description: Gateway MCP — découverte de tools (tool_search/call_tool) + agrégation de MCP distants
 type: application
-version: 0.1.5
+version: 0.2.0
 appVersion: "0.1.0"
