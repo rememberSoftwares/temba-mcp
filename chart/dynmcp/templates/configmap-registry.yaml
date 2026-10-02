@@ -9,4 +9,4 @@ data:
     # Registry des MCP agrégés par le gateway (infra as code).
     # Transport HTTP uniquement ; les ${VARS} sont interpolées depuis l'env du pod.
     servers:
-{{ toYaml .Values.registry.servers | indent 6 }}
+{{ toYaml .Values.catalog.servers | indent 6 }}

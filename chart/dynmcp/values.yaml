@@ -10,7 +10,7 @@ ingress:
   enabled: true
   className: ""
   host: ""
-  tls: []           # [{secretName: dynmcp-tls, hosts: [dynmcp.exemple.com]}]
+  tls: [] # [{secretName: dynmcp-tls, hosts: [dynmcp.exemple.com]}]
   annotations: {}
 
 
@@ -22,43 +22,58 @@ publicBaseUrl: "" # Derived automatically from Ingress host. Overide only for ex
 allowNewMcpRegisteringByLlm: false
 
 
-# -------------------- MCP catalogue -------------------------------
-# The list of remote MCP servers to expose in the catalogue.
-# Interpolation from k8s secrets can be done using ${VAR}.
-registry:
+# -------------------- MCP catalog -------------------------------
+# The list of remote MCP servers to expose in the catalog.
+# Interpolation from k8s secrets can be done using ${VAR} and `env` section.
+catalog:
   servers:
-    ## Basic example
+    ## Basic example ##
     #- id: deepwiki
     #  url: https://mcp.deepwiki.com/mcp
 
-    ## OIDC example
+    ## OIDC example ##
     #- id: atlassian-remote
     #  url: https://mcp.atlassian.com/v2/mcp?tools=all
     #  oauth: {}
 
-    ## String interpolation example (cf secrets section)
+    ## String interpolation + label example (cf `env` section) ##
     # - id: grafana
     #   url: http://mcp-grafana:8000/mcp
     #   headers:
     #     Authorization: Bearer ${GRAFANA_MCP_TOKEN}
-    #   labels: [grafana]
+    #   labels: [grafana]  # <== Only clients sending this same label can see this the tool
 
 
-# -------------- Secrets ------------------
-# create=false : référencer des Secrets préexistants (voir existingSecret)
-# create=true  : la chart crée le secret ; valeurs vides => aléatoires (rotées à
-#                chaque upgrade, fixer les valeurs pour la stabilité)
-secrets:
-  create: false
-  name: dynmcp-secrets
-  grafanaServiceAccountToken: ""
-  grafanaMcpToken: ""
-  adminApiToken: ""
+# Extra pod env — standard k8s syntax (env[] / env[].valueFrom).
+# Values set here can be interpolated into catalog headers via ${VAR}
+# (pairs with the grafana catalog entry above).
+#env:
+#  - name: GRAFANA_MCP_TOKEN # interpolate in the catalog like so: ${GRAFANA_MCP_TOKEN}
+#    valueFrom:
+#      secretKeyRef:
+#        name: dynmcp-secrets
+#        key: GRAFANA_MCP_TOKEN
+env: []
 
 
+# The REST API allows you to add/delete/list MCP servers to the catalog. 
 adminApi:
-  existingSecret: dynmcp-secrets   # ignoré si secrets.create=true
-  tokenKey: ADMIN_API_TOKEN
+  # Name of a pre-existing k8s Secret holding the admin API bearer token.
+  # Empty (or the whole adminApi block omitted) => the chart creates `<release>-admin` with a generated token (kept across upgrades).
+  secretName: # Name of the secret containing your token
+  tokenKey:   # Nmae of the key holding your token
+
+
+# Semantic search (recommended) via an OpenAI-compatible /v1/embeddings endpoint.
+# Allows the LLM to search for tools inside the catalog.
+# Empty baseUrl => local BM25 fallback.
+embeddings:
+  baseUrl: ""                      # e.g. https://llm.example.com/v1
+  model: text-embedding-3-small
+  apiKey: ""                       # literal value, or leave empty and use secretRef
+  secretRef:                       # pre-existing Secret holding the API key (wins over apiKey)
+    name: ""
+    key: ""                        # e.g. EMBEDDINGS_API_KEY
 
 
 
@@ -95,5 +110,3 @@ resources:
   requests: { cpu: 100m, memory: 256Mi }
   limits: { memory: 1Gi }
 
-
-env: {}             # env extra (EMBEDDINGS_BASE_URL, EMBEDDINGS_MODEL...)

@@ -21,7 +21,7 @@ opencode / agents ──HTTP──> dynmcp (2-3 tools) ──HTTP──> remote 
 ```
 chart/dynmcp/
 ├── Chart.yaml
-├── values.yaml                  # all configuration (registry, redis, ingress, secrets…)
+├── values.yaml                  # all configuration (catalog, redis, ingress, secrets…)
 ├── files/server.py              # gateway code — single source of truth (mounted as ConfigMap, no image)
 └── templates/                   # deployment, service, redis, configmaps, secret, ingress, networkpolicy…
 extra-mcp/                        # companion MCP servers, applied manually if needed
@@ -52,13 +52,13 @@ opencode client workflow (in `~/.config/opencode/opencode.json`):
 }
 ```
 
-## Registry (infrastructure as code)
+## Catalog (infrastructure as code)
 
-The MCP catalog is declared in `values.yaml` (`registry.servers`). Supported
+The MCP catalog is declared in `values.yaml` (`catalog.servers`). Supported
 per-server options:
 
 ```yaml
-registry:
+catalog:
   servers:
     - id: deepwiki
       url: https://mcp.deepwiki.com/mcp
@@ -73,8 +73,9 @@ registry:
 
 Scoring runs over the tool `name` (weight 3) + `description` (2) +
 `input_schema` (1), with fr/en stemming. **Embeddings** (semantic search,
-recommended) if `env.EMBEDDINGS_BASE_URL` is set (OpenAI-compatible
-`/v1/embeddings` endpoint + `EMBEDDINGS_API_KEY` + `EMBEDDINGS_MODEL`);
+recommended) if `embeddings.baseUrl` is set in values.yaml
+(OpenAI-compatible `/v1/embeddings` endpoint + `embeddings.apiKey` or
+`embeddings.secretRef` + `embeddings.model`);
 otherwise local **BM25** fallback. The active mode is returned in the payload
 (`"index": ...`). Zero results → `catalog` of servers as a hint.
 
@@ -86,7 +87,7 @@ clients sending at least one matching label in the `X-Dynmcp-Labels` header
 
 ### Dynamic OAuth (MCP auth spec)
 
-`oauth: {}` on a registry entry → first request gets 401 → metadata discovery
+`oauth: {}` on a catalog entry → first request gets 401 → metadata discovery
 (RFC 9728/8414) → **Dynamic Client Registration** (RFC 7591) → the LLM receives
 a personal `/auth?t=<ticket>` link (single-use, 15 min) → the user logs in
 (redirect_uri = `publicBaseUrl`) → tokens stored in Redis with automatic
@@ -107,25 +108,44 @@ in Redis (survive restarts, replicated across pods).
 
 ## Secrets
 
-Two modes (`secrets` in values.yaml):
-- `create: false` (default): the chart references a pre-existing Secret
-  (`dynmcp-secrets`) containing at least `ADMIN_API_TOKEN`, plus the keys
-  referenced by `secretEnv` (e.g. `GRAFANA_MCP_TOKEN` if a registry entry uses
-  it). Manual creation:
+The admin API token comes from a k8s Secret, configured under `adminApi` in
+values.yaml:
+
+- `adminApi.secretName` set (default `dynmcp-secrets`): the chart references a
+  pre-existing Secret. Create it manually:
   ```sh
   kubectl create secret generic dynmcp-secrets \
     --from-literal=ADMIN_API_TOKEN=$(openssl rand -hex 24) \
-    --from-literal=GRAFANA_SERVICE_ACCOUNT_TOKEN=<grafana token> \
     --from-literal=GRAFANA_MCP_TOKEN=$(openssl rand -hex 24)
   ```
-- `create: true`: the chart writes the Secret from `secrets.*` (empty value =>
-  `randAlphaNum` rotated on every upgrade — pin the value for stability).
+- `adminApi.secretName: ""`: the chart creates `<release>-admin` with a random
+  `ADMIN_API_TOKEN`, kept across upgrades (that Secret holds the admin token
+  only — point extra `env` secretKeyRefs at your own Secrets).
+
+Other pod env vars come from the `env` key in values.yaml, using the standard
+k8s syntax; values pulled from Secrets can then be interpolated into catalog
+headers via `${VAR}`:
+
+```yaml
+env:
+  - name: GRAFANA_MCP_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: dynmcp-secrets
+        key: GRAFANA_MCP_TOKEN
+
+catalog:
+  servers:
+    - id: grafana
+      headers:
+        Authorization: Bearer ${GRAFANA_MCP_TOKEN}
+```
 
 | Secret key | Purpose |
 |---|---|
-| `ADMIN_API_TOKEN` | bearer for the `/servers` admin API (never sent to the LLM) |
-| `GRAFANA_MCP_TOKEN` | internal bearer gateway ↔ mcp-grafana (if extra-mcp applied) |
-| `GRAFANA_SERVICE_ACCOUNT_TOKEN` | credentials used by the mcp-grafana pod against your Grafana |
+| `ADMIN_API_TOKEN` (key `adminApi.tokenKey`) | bearer for the `/servers` admin API (never sent to the LLM) |
+| `GRAFANA_MCP_TOKEN` | internal bearer gateway ↔ mcp-grafana (via `env` secretKeyRef, if extra-mcp applied) |
+| `GRAFANA_SERVICE_ACCOUNT_TOKEN` | credentials used by the mcp-grafana pod against your Grafana (extra-mcp) |
 
 ## Network security
 
@@ -158,4 +178,4 @@ Two modes (`secrets` in values.yaml):
 | `TOOL_SEARCH_LIMIT` | `5` | top N tool_search results |
 | `PRIVATE_SERVER_TTL` | `86400` | lifetime of add_mcp servers (seconds) |
 | `AUTH_LOGIN_TIMEOUT` | `600` | time granted to the human for the OAuth login |
-| `EMBEDDINGS_BASE_URL` / `_API_KEY` / `_MODEL` | empty | enables embeddings mode |
+| `embeddings.*` (values.yaml) | empty | enables embeddings mode (`baseUrl`/`apiKey`/`secretRef`/`model`) |

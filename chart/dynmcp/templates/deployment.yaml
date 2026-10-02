@@ -39,20 +39,36 @@ spec:
             - name: ADMIN_API_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "dynmcp.secretName" . }}
-                  key: {{ .Values.adminApi.tokenKey }}
+                  name: {{ include "dynmcp.adminSecretName" . }}
+                  key: {{ include "dynmcp.adminTokenKey" . }}
             - name: REDIS_URL
               value: {{ .Values.redis.url | default (printf "redis://%s-redis:6379/0" (include "dynmcp.fullname" .)) | quote }}
-            {{- range .Values.secretEnv }}
-            - name: {{ .name }}
+            {{- with .Values.embeddings }}
+            {{- if .baseUrl }}
+            - name: EMBEDDINGS_BASE_URL
+              value: {{ .baseUrl | quote }}
+            {{- end }}
+            {{- if .model }}
+            - name: EMBEDDINGS_MODEL
+              value: {{ .model | quote }}
+            {{- end }}
+            {{- if .secretRef.name }}
+            - name: EMBEDDINGS_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "dynmcp.secretName" $ }}
-                  key: {{ .key }}
+                  name: {{ .secretRef.name }}
+                  key: {{ required "embeddings.secretRef.key is required with embeddings.secretRef.name" .secretRef.key }}
+            {{- else if .apiKey }}
+            - name: EMBEDDINGS_API_KEY
+              value: {{ .apiKey | quote }}
             {{- end }}
-            {{- range $k, $v := .Values.env }}
-            - name: {{ $k }}
-              value: {{ $v | quote }}
+            {{- end }}
+            {{- $reserved := list "PORT" "LIST_TIMEOUT" "REGISTRY_PATH" "PUBLIC_BASE_URL" "ADD_MCP_ENABLED" "ADMIN_API_TOKEN" "REDIS_URL" "EMBEDDINGS_BASE_URL" "EMBEDDINGS_MODEL" "EMBEDDINGS_API_KEY" }}
+            {{- range .Values.env }}
+            {{- if has .name $reserved }}
+            {{- fail (printf "env: %s is managed by the chart and cannot be overridden" .name) }}
+            {{- end }}
+            {{- toYaml (list .) | nindent 12 }}
             {{- end }}
           ports:
             - name: mcp
