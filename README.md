@@ -19,7 +19,7 @@ Your context window will stay light and fast to process. Admins can administer t
 * 🔌 Admins can dynamically add tools using the API
 * 🏷️ Admins can select what tools can be discovered to clients through labels (not a security feature though)
 
-## ▶️ How it works
+## ⚙️ How it works
 
 Temba exposes 3 tools (`tool_search`, `call_tool`, optional `add_mcp`) and aggregates a catalog of remote MCP servers (streamable HTTP) on demand.  
 
@@ -31,7 +31,7 @@ opencode / agents ──HTTP──> temba-mcp (2-3 tools) ──HTTP──> remo
                             
 ```
 
-## ▶️ Deploying on k8s
+## 🚀 Deploying on k8s
 
 ```sh
 # Clone the repo then:
@@ -56,7 +56,7 @@ Example opencode client MCP config (in `~/.config/opencode/opencode.json`):
 }
 ```
 
-## ▶️ Adding MCPs to the catalogue
+## 📚 Adding MCPs to the catalogue
 
 The catalog is where you'll add remote MCP URLs that will be proxified by Temba.  
 Each tool added to the catalog will be made available to any LLMs that look for it.  
@@ -129,7 +129,7 @@ curl -H "Authorization: Bearer $TOKEN" http://<temba-url>/servers
 status is one of `starting` | `ready` | `error` | `auth_required`.
 
 
-## ▶️ Adding Oauth MCPs to the catalog
+## 🔐 Adding Oauth MCPs to the catalog
 
 MCPs protected by OAuth 2.1 (MCP auth spec) are supported out of the box:  
 The gateway acts as the OAuth client and delegates the login to a human through a one-time link. No client secret to manage, no pre-registration required (**dynamic client registration**, RFC 7591).
@@ -176,7 +176,7 @@ a server idle for more than `TOKEN_RETENTION` (30 d, sliding TTL) must
 re-authenticate.
 
 
-## ▶️ Partitioning the catalog with labels
+## 🏷️ Partitioning the catalog with labels
 
 As an admin, all your users may not need the same tools in their catalog. Some will want powerpoint MCPs and others dev related MCPs...  
 To scope tools to different usecase, you can set labels on each one.  
@@ -229,7 +229,7 @@ Now, in your opencode config (or any MCP compatible client):
 :warning: This is not a security feature. Merely a way to organize things a bit.  
 
 
-## ▶️ How does tool search work ?
+## 🔎 How does tool search work ?
 
 Scoring runs over the tool `name` (weight 3) + `description` (2) + `input_schema` (1), with fr/en stemming.  
 
@@ -238,13 +238,13 @@ Scoring runs over the tool `name` (weight 3) + `description` (2) + `input_schema
 otherwise local **BM25** fallback. The active mode is returned in the payload (`"index": ...`). Zero results → `catalog` of servers as a hint.
 
 
-## ▶️ Network security
+## 🔒 Network security
 
 When using the `allowNewMcpRegisteringByLlm` option that let's an LLM add tools to its catalog, ALWAYS make sure that `networkPolicy.enabled` is true (default).  
 A prompt injection could force the LLM to register a component from your internal k8s network. Securities have been added at the application level.  
 But nothing beats an old school NetworkPolicy with default deny.
 
-## ▶️ License
+## 📄 License
 
 This project is licensed under the MIT License. See the LICENSE file for more details.
 
