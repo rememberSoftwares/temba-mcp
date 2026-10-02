@@ -1,0 +1,61 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dynmcp.fullname" . }}-egress
+  labels:
+    {{- include "dynmcp.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dynmcp
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Egress]
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Redis (état partagé)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: dynmcp
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: redis
+      ports:
+        - { protocol: TCP, port: 6379 }
+    # Internet public uniquement (sauf plages internes)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+    # MCP internes déclarés (pods) + CIDR internes explicites (VPN...)
+    {{- if .Values.networkPolicy.internalMcpPods }}
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: {{ toYaml .Values.networkPolicy.internalMcpPods }}
+      ports:
+        - { protocol: TCP, port: 8000 }
+    {{- end }}
+    {{- range .Values.networkPolicy.internalCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+    {{- end }}
+{{- end }}

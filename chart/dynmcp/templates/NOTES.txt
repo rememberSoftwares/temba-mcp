@@ -1,0 +1,16 @@
+dynmcp est déployé (release {{ .Release.Name }}).
+
+1. Accès (dev) :
+   kubectl port-forward svc/{{ include "dynmcp.fullname" . }} 18080:8080
+   → MCP pour les agents : http://localhost:18080/mcp
+   → page d'auth OAuth  : http://localhost:18080/auth
+
+2. Tokens (Secret {{ include "dynmcp.secretName" . }}) :
+   kubectl get secret {{ include "dynmcp.secretName" . }} -o jsonpath='{.data.ADMIN_API_TOKEN}' | base64 -d
+   → API admin /servers (bearer) et jeton de service mcp-grafana.
+
+3. OAuth : au premier usage d'un serveur oauth: {} , le LLM renvoie un lien
+   personnel /auth?t=... à ouvrir dans le navigateur (valable 15 min).
+
+4. Multi-réplicas : état partagé dans Redis (tokens OAuth + serveurs
+   dynamiques). Réplication par pub/sub entre réplicas.

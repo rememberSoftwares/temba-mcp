@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dynmcp.fullname" . }}
+  labels:
+    {{- include "dynmcp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dynmcp
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "dynmcp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: dynmcp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [sh, -c]
+          args:
+            - pip install --no-cache-dir "mcp>=2,<3" pyyaml uv rank_bm25 snowballstemmer redis && exec python /app/server.py
+          workingDir: /app
+          env:
+            - name: REGISTRY_PATH
+              value: /etc/dynmcp/registry.yaml
+            - name: PORT
+              value: "8080"
+            - name: LIST_TIMEOUT
+              value: "90"
+            - name: PUBLIC_BASE_URL
+              value: {{ include "dynmcp.publicBaseUrl" . | quote }}
+            - name: ADD_MCP_ENABLED
+              value: {{ .Values.allowNewMcpRegisteringByLlm | ternary "true" "false" | quote }}
+            - name: ADMIN_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dynmcp.secretName" . }}
+                  key: {{ .Values.adminApi.tokenKey }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | default (printf "redis://%s-redis:6379/0" (include "dynmcp.fullname" .)) | quote }}
+            {{- range .Values.secretEnv }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dynmcp.secretName" $ }}
+                  key: {{ .key }}
+            {{- end }}
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: mcp
+              containerPort: 8080
+          startupProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+            - name: registry
+              mountPath: /etc/dynmcp
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: {{ include "dynmcp.fullname" . }}-code
+        - name: registry
+          configMap:
+            name: {{ include "dynmcp.fullname" . }}-registry

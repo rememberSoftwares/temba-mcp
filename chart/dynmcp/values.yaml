@@ -1,0 +1,99 @@
+replicaCount: 2
+
+image:
+  repository: python
+  tag: "3.12-slim"
+  pullPolicy: IfNotPresent
+
+
+ingress:
+  enabled: true
+  className: ""
+  host: ""
+  tls: []           # [{secretName: dynmcp-tls, hosts: [dynmcp.exemple.com]}]
+  annotations: {}
+
+
+publicBaseUrl: "" # Derived automatically from Ingress host. Overide only for exotic usecases (ie: port-forward: 'localhost')
+
+
+# Adds a third tool allowing the LLM to add new MCPs to it's own catalog.
+# ie adding public Jira MCP to its capabilities even though it was not available initially.
+allowNewMcpRegisteringByLlm: false
+
+
+# -------------------- MCP catalogue -------------------------------
+# The list of remote MCP servers to expose in the catalogue.
+# Interpolation from k8s secrets can be done using ${VAR}.
+registry:
+  servers:
+    ## Basic example
+    #- id: deepwiki
+    #  url: https://mcp.deepwiki.com/mcp
+
+    ## OIDC example
+    #- id: atlassian-remote
+    #  url: https://mcp.atlassian.com/v2/mcp?tools=all
+    #  oauth: {}
+
+    ## String interpolation example (cf secrets section)
+    # - id: grafana
+    #   url: http://mcp-grafana:8000/mcp
+    #   headers:
+    #     Authorization: Bearer ${GRAFANA_MCP_TOKEN}
+    #   labels: [grafana]
+
+
+# -------------- Secrets ------------------
+# create=false : référencer des Secrets préexistants (voir existingSecret)
+# create=true  : la chart crée le secret ; valeurs vides => aléatoires (rotées à
+#                chaque upgrade, fixer les valeurs pour la stabilité)
+secrets:
+  create: false
+  name: dynmcp-secrets
+  grafanaServiceAccountToken: ""
+  grafanaMcpToken: ""
+  adminApiToken: ""
+
+
+adminApi:
+  existingSecret: dynmcp-secrets   # ignoré si secrets.create=true
+  tokenKey: ADMIN_API_TOKEN
+
+
+
+
+
+# ---------------------- Misc ---------------------------
+  
+
+# Politique réseau egress (opt-in) : nécessite un CNI qui applique les
+# NetworkPolicy (Calico/Cilium). Internet public uniquement + MCP internes
+# déclarés ci-dessous + CIDR internes explicites (VPN...).
+networkPolicy:
+  enabled: true # WARNING ! LEAVE THIS ENABLE when using `allowNewMcpRegisteringByLlm: true`
+  internalMcpPods: []   # ex: [mcp-grafana, mcp-atlassian] si extra-mcp/ appliqué
+  internalCidrs: []     # ex: 10.30.0.0/16 (VPN numspot pour grafana interne)
+
+
+redis:
+  url: "" # Leave empty for default: redis://<release>-redis:6379/0
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  persistence:
+    enabled: false   # PVC pour survivre à la suppression du pod redis
+    size: 1Gi
+
+
+service:
+  type: ClusterIP
+  port: 8080
+  nodePort: ""
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { memory: 1Gi }
+
+
+env: {}             # env extra (EMBEDDINGS_BASE_URL, EMBEDDINGS_MODEL...)

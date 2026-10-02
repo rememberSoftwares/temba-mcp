@@ -53,25 +53,37 @@ PORT = int(os.getenv("PORT", "8080"))
 # OAuth dynamique (MCP auth spec) : DCR + PKCE, login humain via /auth
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", f"http://localhost:{PORT}").rstrip("/")
 AUTH_LOGIN_TIMEOUT = float(os.getenv("AUTH_LOGIN_TIMEOUT", "600"))
-TOKENS_PATH = os.getenv("TOKENS_PATH", "")
 
 # Tickets de login à usage limité : l'URL renvoyée au LLM contient un jeton
 # volant qui ne permet d'authentifier QUE le serveur concerné. Pas de page
 # d'admin partagée : chaque demande produit son propre lien.
 LOGIN_TICKET_TTL = float(os.getenv("LOGIN_TICKET_TTL", "900"))
 
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Env booléen tolérant : 1/true/yes/on (casse indifférente)."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # API admin (/servers) : activation/désactivation de MCP à chaud, partagés à tous.
 # Vide = API désactivée. Token en bearer, distribué hors LLM.
 ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "")
 # MCP ajoutés par un LLM (add_mcp) : privés (id secret) + durée de vie limitée.
 PRIVATE_SERVER_TTL = float(os.getenv("PRIVATE_SERVER_TTL", "86400"))
-# Persistance des serveurs dynamiques (API admin + privés) ; vide = mémoire seule.
-DYNAMIC_REGISTRY_PATH = os.getenv("DYNAMIC_REGISTRY_PATH", "")
-# Dév uniquement : autoriser add_mcp vers des IP privées/loopback
-ALLOW_PRIVATE_MCP_HOSTS = os.getenv("ALLOW_PRIVATE_MCP_HOSTS", "") == "1"
-# Tool add_mcp : désactivé par défaut (sécurité) ; ADD_MCP_ENABLED=1 pour l'activer.
-ADD_MCP_ENABLED = os.getenv("ADD_MCP_ENABLED", "") == "1"
+# Tool add_mcp : désactivé par défaut (sécurité) ; ADD_MCP_ENABLED=true pour l'activer.
+ADD_MCP_ENABLED = _env_bool("ADD_MCP_ENABLED")
 LABELS_HEADER = "x-dynmcp-labels"
+
+# Redis (obligatoire en multi-réplicas) : état partagé (tokens OAuth + serveurs
+# dynamiques). Vide = mémoire process (dev mono-process).
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_KEY_SERVERS = "dynmcp:dynamic_servers"
+REDIS_CHANNEL = "dynmcp:events"
 
 # Index sémantique optionnel (format OpenAI /v1/embeddings)
 EMBEDDINGS_BASE_URL = os.getenv("EMBEDDINGS_BASE_URL", "").rstrip("/")
@@ -79,8 +91,6 @@ EMBEDDINGS_API_KEY = os.getenv("EMBEDDINGS_API_KEY", "")
 EMBEDDINGS_MODEL = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small")
 EMBED_BATCH = int(os.getenv("EMBED_BATCH", "64"))
 EMBED_MIN_SCORE = float(os.getenv("EMBED_MIN_SCORE", "0.25"))
-
-_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _expand(value: Any) -> Any:
@@ -193,55 +203,69 @@ class EmbeddingIndex:
         return [(round(s, 3), e) for s, e in scored[:limit] if s >= EMBED_MIN_SCORE]
 
 
+_redis: Any = None
+
+
+def redis_client():
+    """Client Redis partagé (None si REDIS_URL non défini)."""
+    global _redis
+    if REDIS_URL and _redis is None:
+        import redis.asyncio as aioredis
+
+        _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    return _redis
+
+
+def _token_key(server_id: str) -> str:
+    return f"dynmcp:tokens:{server_id}"
+
+
 class TokenStore:
-    """TokenStorage SDK, persisté en JSON (mémoire si TOKENS_PATH vide)."""
+    """TokenStorage SDK : Redis si REDIS_URL (partagé multi-réplicas), sinon mémoire."""
 
     def __init__(self, server_id: str):
         self.server_id = server_id
-        self._data: dict = {}
-        self._loaded = False
 
-    def _load(self) -> None:
-        if self._loaded or not TOKENS_PATH:
-            return
-        self._loaded = True
-        try:
-            with open(TOKENS_PATH) as f:
-                self._data = (json.load(f) or {}).get(self.server_id, {})
-        except FileNotFoundError:
-            self._data = {}
+    async def _get(self) -> dict:
+        if REDIS_URL:
+            client = redis_client()
+            try:
+                raw = await client.get(_token_key(self.server_id))
+                return json.loads(raw) if raw else {}
+            except Exception as exc:
+                log.warning("redis get tokens (%s): %s", self.server_id, exc)
+                return {}
+        return _TOKEN_MEMORY.get(self.server_id, {})
 
-    def _save(self) -> None:
-        if not TOKENS_PATH:
+    async def _set(self, data: dict) -> None:
+        if REDIS_URL:
+            client = redis_client()
+            try:
+                await client.set(_token_key(self.server_id), json.dumps(data))
+            except Exception as exc:
+                log.warning("redis set tokens (%s): %s", self.server_id, exc)
             return
-        try:
-            with open(TOKENS_PATH) as f:
-                all_data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            all_data = {}
-        all_data[self.server_id] = self._data
-        tmp = f"{TOKENS_PATH}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(all_data, f)
-        os.replace(tmp, TOKENS_PATH)
+        _TOKEN_MEMORY[self.server_id] = data
 
     async def get_tokens(self) -> OAuthToken | None:
-        self._load()
-        t = self._data.get("tokens")
+        data = await self._get()
+        t = data.get("tokens")
         return OAuthToken.model_validate(t) if t else None
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        self._data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
-        self._save()
+        data = await self._get()
+        data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
+        await self._set(data)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
-        self._load()
-        c = self._data.get("client_info")
+        data = await self._get()
+        c = data.get("client_info")
         return OAuthClientInformationFull.model_validate(c) if c else None
 
     async def set_client_info(self, info: OAuthClientInformationFull) -> None:
-        self._data["client_info"] = info.model_dump(mode="json", exclude_none=True)
-        self._save()
+        data = await self._get()
+        data["client_info"] = info.model_dump(mode="json", exclude_none=True)
+        await self._set(data)
 
 
 class AuthCoordinator:
@@ -346,40 +370,6 @@ class Gateway:
         self._index_lock = asyncio.Lock()
         self._embed_client = httpx2.AsyncClient(timeout=30)
         self.auth = AuthCoordinator()
-        self._load_dynamic()
-
-    def _load_dynamic(self) -> None:
-        """Serveurs dynamiques persistés (API admin + privés LLM)."""
-        if not DYNAMIC_REGISTRY_PATH:
-            return
-        try:
-            with open(DYNAMIC_REGISTRY_PATH) as f:
-                servers = (json.load(f) or {}).get("servers") or []
-        except FileNotFoundError:
-            return
-        except json.JSONDecodeError as exc:
-            log.error("registry dynamique illisible (%s) — ignoré", exc)
-            return
-        now = time.time()
-        known = {st.id for st in self.states}
-        for cfg in servers:
-            if cfg.get("expires_at") and cfg["expires_at"] <= now:
-                continue
-            if cfg.get("id") in known:
-                log.warning("registry dynamique: id '%s' en conflit avec le statique — ignoré", cfg.get("id"))
-                continue
-            self.states.append(ServerState(cfg))
-
-    def _persist_dynamic(self) -> None:
-        if not DYNAMIC_REGISTRY_PATH:
-            return
-        now = time.time()
-        dyn = [st.cfg for st in self.states if st.private or st.cfg.get("dynamic")]
-        dyn = [c for c in dyn if not (c.get("expires_at") and c["expires_at"] <= now)]
-        tmp = f"{DYNAMIC_REGISTRY_PATH}.tmp"
-        with open(tmp, "w") as f:
-            json.dump({"servers": dyn}, f, indent=1)
-        os.replace(tmp, DYNAMIC_REGISTRY_PATH)
 
     async def add_server(self, cfg: dict) -> ServerState:
         st = ServerState(cfg)
@@ -387,14 +377,11 @@ class Gateway:
             raise ValueError(f"id '{st.id}' déjà utilisé")
         self.states.append(st)
         self._tasks.append(asyncio.create_task(self._serve(st), name=f"mcp:{st.id}"))
-        if not st.private:
-            self._persist_dynamic()
+        if st.private or st.cfg.get("dynamic"):
+            await self._dyn_put(st.cfg)
         return st
 
-    async def remove_server(self, server_id: str) -> bool:
-        st = next((s for s in self.states if s.id == server_id), None)
-        if st is None:
-            return False
+    async def _detach(self, server_id: str) -> None:
         self.auth.abort(server_id)
         task = next((t for t in self._tasks if t.get_name() == f"mcp:{server_id}"), None)
         if task is not None:
@@ -402,7 +389,12 @@ class Gateway:
             self._tasks.remove(task)
             await asyncio.gather(task, return_exceptions=True)
         self.states = [s for s in self.states if s.id != server_id]
-        self._persist_dynamic()
+
+    async def remove_server(self, server_id: str) -> bool:
+        if not any(s.id == server_id for s in self.states):
+            return False
+        await self._detach(server_id)
+        await self._dyn_del(server_id)
         await self._rebuild_index()
         return True
 
@@ -485,7 +477,7 @@ class Gateway:
         if len(ids) != len(set(ids)):
             raise ValueError("registry: ids de serveurs en doublon")
         for s in servers:
-            if s.get("transport") != "http":
+            if s.get("transport", "http") != "http":
                 raise ValueError(f"registry[{s.get('id')}]: transport invalide (http uniquement)")
             if not s.get("url"):
                 raise ValueError(f"registry[{s['id']}]: 'url' requise")
@@ -499,9 +491,86 @@ class Gateway:
                 raise ValueError(f"registry[{s['id']}]: 'labels' doit être une liste de chaînes")
         return servers
 
+    async def _dyn_all(self) -> list[dict]:
+        """Serveurs dynamiques (API admin + privés) : Redis si configuré, sinon mémoire."""
+        if REDIS_URL:
+            try:
+                raw = await redis_client().hgetall(REDIS_KEY_SERVERS)
+                return [json.loads(v) for v in raw.values()]
+            except Exception as exc:
+                log.error("redis illisible (%s) — registry dynamique vide", exc)
+                return []
+        return [dict(c) for c in _DYN_MEMORY.values()]
+
+    async def _dyn_put(self, cfg: dict) -> None:
+        if REDIS_URL:
+            try:
+                await redis_client().hset(REDIS_KEY_SERVERS, cfg["id"], json.dumps(cfg))
+                await self._dyn_publish()
+            except Exception as exc:
+                log.error("redis hset: %s", exc)
+            return
+        _DYN_MEMORY[cfg["id"]] = cfg
+
+    async def _dyn_del(self, server_id: str) -> None:
+        if REDIS_URL:
+            try:
+                await redis_client().hdel(REDIS_KEY_SERVERS, server_id)
+                await self._dyn_publish()
+            except Exception as exc:
+                log.error("redis hdel: %s", exc)
+            return
+        _DYN_MEMORY.pop(server_id, None)
+
+    async def _dyn_publish(self) -> None:
+        try:
+            await redis_client().publish(REDIS_CHANNEL, "registry_changed")
+        except Exception:
+            pass
+
+    async def _pubsub_loop(self) -> None:
+        """Réconcilie le registry local quand une autre réplique modifie l'état."""
+        client = redis_client()
+        while not self._stop.is_set():
+            try:
+                pubsub = client.pubsub()
+                await pubsub.subscribe(REDIS_CHANNEL)
+                async for message in pubsub.listen():
+                    if self._stop.is_set() or message.get("type") != "message":
+                        continue
+                    await self._dyn_reconcile()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("pubsub registry: %s — nouvelle tentative dans 5s", exc)
+                await asyncio.sleep(5)
+
+    async def _dyn_reconcile(self) -> None:
+        """Aligne les serveurs dynamiques locaux sur l'état partagé (Redis)."""
+        desired = {c["id"]: c for c in await self._dyn_all() if not (c.get("expires_at") and c["expires_at"] <= time.time())}
+        current = {st.id: st for st in self.states if st.private or st.cfg.get("dynamic")}
+        for sid in list(current):
+            if sid not in desired:
+                log.info("réplication registry: retrait de '%s'", sid)
+                await self._detach(sid)
+                await self._rebuild_index()
+        for sid, cfg in desired.items():
+            if not any(s.id == sid for s in self.states):
+                log.info("réplication registry: ajout de '%s'", sid)
+                self.states.append(ServerState(cfg))
+                self._tasks.append(asyncio.create_task(self._serve(self.states[-1]), name=f"mcp:{sid}"))
+                await self._rebuild_index()
+
     async def run(self) -> None:
+        # rattrape l'état partagé (Redis) ou le fichier local (mono-réplique)
+        try:
+            await self._dyn_reconcile()
+        except Exception as exc:
+            log.error("réplication initiale: %s", exc)
         self._tasks = [asyncio.create_task(self._serve(st), name=f"mcp:{st.id}") for st in self.states]
         self._tasks.append(asyncio.create_task(self._expire_loop(), name="private-expiry"))
+        if REDIS_URL:
+            self._tasks.append(asyncio.create_task(self._pubsub_loop(), name="redis-pubsub"))
         await self._stop.wait()
 
     async def stop(self) -> None:
@@ -510,6 +579,12 @@ class Gateway:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._embed_client.aclose()
+        client = redis_client()
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     def _auth_provider(self, st: ServerState) -> OAuthClientProvider:
         cfg = st.cfg.get("oauth") or {}
@@ -803,12 +878,11 @@ async def call_tool(tool_id: str, arguments: dict = {}, ctx: Context = None) -> 
 
 
 async def _assert_public_url(url: str) -> None:
-    """Garde anti-SSRF pour add_mcp : refuse IP privées/loopback/link-local."""
+    """Garde anti-SSRF pour add_mcp : refuse IP privées/loopback/link-local.
+    Strict, sans exception : add_mcp = internet public, rien d'autre."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("url invalide (http/https attendu)")
-    if ALLOW_PRIVATE_MCP_HOSTS:
-        return
     try:
         infos = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, None)
     except socket.gaierror as exc:
@@ -823,12 +897,6 @@ async def _assert_public_url(url: str) -> None:
                 f"add_mcp refuse l'hôte {parsed.hostname} ({ip}) : adresse privée. "
                 "Pour un MCP interne, demande à un admin de l'ajouter via l'API."
             )
-
-
-async def _wait_ready(st: ServerState, timeout: float = 30) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline and st.status in ("starting",):
-        await asyncio.sleep(0.3)
 
 
 async def _wait_ready(st: ServerState, timeout: float = 30) -> None:
