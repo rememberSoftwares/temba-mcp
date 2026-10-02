@@ -1,62 +1,71 @@
 # temba-mcp
 
-An MCP gateway that exposes only 2–3 tools (`tool_search`, `call_tool`,
-optional `add_mcp`) and aggregates a catalog of remote MCP servers (streamable
-HTTP) on demand. Agents no longer load 70 tools at boot: they search by
-keywords, receive the matching tools along with their JSON Schema, and execute
-them through the gateway.
+Temba is an MCP gateway that exposes a catalog of remote MCP servers for the LLM to discover.
+
+**Classic MCP pain points:**
+* Adding a single MCP server can easily cost more than 20.000 tokens each => Induces lag, expense, degraded answers
+* Adding/removing MCP servers is a manual process that requires upgrading config file each time => Painfull as an admin
+* Near futur will probably force us to deal with 40+ MCP servers on a daily basis hence making above pain points untolerable.
+
+**How temba saves the day ?** 🎉
+
+Temba provides a search tools capability so that the LLM loads only the tools it needs.  
+Agents no longer load 70 tools at boot: they search by keywords, receive the matching tools along with their JSON Schema, and execute them through the gateway.  
+Your context window will stay light and fast to process. Admins can administer the catalogue for the whole organisation with ease.  
+
+**Features list:**
+* LLM can search tools in a tool catalog
+* LLM can add new MCPs to it's own catalog on the go (optionnal feature flag)
+* Admins can dynamically add tools using the API
+* Admins can select what tools can be discovered to clients through labels (not a security feature though)
+
+## How it works
+
+Temba exposes 3 tools (`tool_search`, `call_tool`, optional `add_mcp`) and aggregates a catalog of remote MCP servers (streamable HTTP) on demand.  
 
 ```
 opencode / agents ──HTTP──> temba-mcp (2-3 tools) ──HTTP──> remote MCP servers
-                            │  tool_search → index (BM25 or embeddings)
-                            │  call_tool   → tools/call routed to the source MCP
-                            │  add_mcp     → private ephemeral server (24h)
-                            │  /servers    → admin API (bearer)
-                            │  /auth       → human OAuth login (single-use ticket)
-                            └── Redis: shared state across replicas
+                            │__tool_search → index (BM25 or embeddings)
+                            │__call_tool   → tools/call routed to the source MCP
+                            │__add_mcp     → private ephemeral server (24h)
+                            
 ```
 
-## Layout
-
-```
-chart/temba-mcp/
-├── Chart.yaml
-├── values.yaml                  # all configuration (catalog, redis, ingress, secrets…)
-├── files/server.py              # gateway code — single source of truth (mounted as ConfigMap, no image)
-└── templates/                   # deployment, service, redis, configmaps, secret, ingress, networkpolicy…
-extra-mcp/                        # companion MCP servers, applied manually if needed
-├── grafana-mcp.yaml             #   mcp-grafana (pod + service, internal bearer)
-└── atlassian-mcp.yaml           #   mcp-atlassian (pod + service, creds via secret)
-test_client.py                    # MCP dev client (tool_search/call_tool/add_mcp)
-```
-
-## Deploying
+## Deploying on k8s
 
 ```sh
+# Clone the repo then:
 helm upgrade --install temba-mcp ./chart/temba-mcp
-kubectl port-forward svc/temba-mcp 18080:8080
-# → MCP endpoint for agents: http://localhost:18080/mcp
-# → OAuth login page       : http://localhost:18080/auth
 ```
 
-After any code change: re-run `helm upgrade` (the code is embedded in the chart
-and mounted as a ConfigMap).
+* Dev ?
+```
+#port-forward (bypasses the Ingress entirely)
+kubectl port-forward svc/temba-mcp 18080:8080
+# → MCP endpoint for agents: http://localhost:18080/mcp
+```
 
-opencode client workflow (in `~/.config/opencode/opencode.json`):
+
+Example opencode client MCP config (in `~/.config/opencode/opencode.json`):
 
 ```json
 "temba-mcp": {
   "type": "remote",
-  "url": "http://localhost:18080/mcp",
-  "headers": { "X-Temba-Mcp-Labels": "grafana,jira" }
+  "url": "http(s)://<temba-url>/mcp",
+  "headers": { "X-Temba-Labels": "see-labels-section-bellow" }
 }
 ```
 
-## Catalog (infrastructure as code)
+## Adding MCPs to the catalogue
 
-The MCP catalog is declared in `values.yaml` (`catalog.servers`). Supported
-per-server options:
+The catalog is where you'll add remote MCP URLs that will be proxified by Temba.  
+Each tool added to the catalog will be made available to any LLMs that look for it.  
 
+### Catalog using infrastructure as code
+
+The IAC catalog is declared in `values.yaml` (`catalog.servers`).
+
+ie for DeepWiki:
 ```yaml
 catalog:
   servers:
@@ -65,118 +74,179 @@ catalog:
       timeout: 45                  # seconds, optional
       labels: [docs]               # optional: restricted visibility (see below)
       headers: {}                  # optional, ${VAR} interpolated from pod env
-      oauth: {}                    # optional: dynamic OAuth (DCR + PKCE)
-    # oauth: {client_id: ..., client_secret: ${SECRET}, scope: "..."}  # pre-registered client
+      oauth: {}                    # optional: dynamic OAuth (DCR + PKCE); {} = dynamic
 ```
 
-### Search
+### Catalog using REST API
 
-Scoring runs over the tool `name` (weight 3) + `description` (2) +
-`input_schema` (1), with fr/en stemming. **Embeddings** (semantic search,
-recommended) if `embeddings.baseUrl` is set in values.yaml
-(OpenAI-compatible `/v1/embeddings` endpoint + `embeddings.apiKey` or
-`embeddings.secretRef` + `embeddings.model`);
-otherwise local **BM25** fallback. The active mode is returned in the payload
-(`"index": ...`). Zero results → `catalog` of servers as a hint.
+The catalog can be managed by API so admins can programmatically list, add or remove tools on the fly.
 
-### Labels
+First you'll need the temba's API token (auto-generated by the chart as `<release>-admin` when `adminApi.secretName` is empty):
 
-A server with `labels` is only visible (tool_search **and** call_tool) to
-clients sending at least one matching label in the `X-Temba-Mcp-Labels` header
-(opencode config). Servers without labels are visible to everyone.
+```sh
+export TOKEN=$(kubectl get secret temba-mcp-admin -o jsonpath='{.data.ADMIN_API_TOKEN}' | base64 -d)
+```
 
-### Dynamic OAuth (MCP auth spec)
 
-`oauth: {}` on a catalog entry → first request gets 401 → metadata discovery
-(RFC 9728/8414) → **Dynamic Client Registration** (RFC 7591) → the LLM receives
-a personal `/auth?t=<ticket>` link (single-use, 15 min) → the user logs in
-(redirect_uri = `publicBaseUrl`) → tokens stored in Redis with automatic
-refresh afterwards. Once per server.
-
-## Admin API (`/servers`, bearer `ADMIN_API_TOKEN`)
+#### Add a new MCP to the catalog
 
 ```sh
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"id": "my-team", "url": "https://…/mcp", "labels": ["team-x"], "headers": {"Authorization": "Bearer ${…}"}}' \
-  http://…/servers
-curl -H "Authorization: Bearer $TOKEN" http://…/servers
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://…/servers/my-team
+  -d '{"id": "mcp-name-or-whatever", "url": "https://…/mcp", "labels": ["team-x"], "headers": {"Authorization": "Bearer ${…}"}}' \
+  http://<temba-url>/servers
+```
+:information_source: Added servers join the catalog shared by **all** LLM clients
+
+
+#### Delete an MCP server
+
+```sh
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://<temba-url>/servers/<mcp-name-used-during-registration>
 ```
 
-These servers join the catalog shared by **all** LLM clients, with persistence
-in Redis (survive restarts, replicated across pods).
+#### List current MCP servers
 
-## Secrets
+```sh
+curl -H "Authorization: Bearer $TOKEN" http://<temba-url>/servers
+```
 
-The admin API token comes from a k8s Secret, configured under `adminApi` in
-values.yaml:
+```json
+{
+  "servers": [
+    {
+      "id": "mcp-name-or-whatever",
+      "status": "ready",
+      "labels": ["team-x"],
+      "private": false,
+      "tools": 8,
+      "expires_at": null,
+      "error": null
+    }
+  ]
+}
+```
 
-- `adminApi.secretName` set (default `temba-mcp-secrets`): the chart references a
-  pre-existing Secret. Create it manually:
-  ```sh
-  kubectl create secret generic temba-mcp-secrets \
-    --from-literal=ADMIN_API_TOKEN=$(openssl rand -hex 24) \
-    --from-literal=GRAFANA_MCP_TOKEN=$(openssl rand -hex 24)
-  ```
-- `adminApi.secretName: ""`: the chart creates `<release>-admin` with a random
-  `ADMIN_API_TOKEN`, kept across upgrades (that Secret holds the admin token
-  only — point extra `env` secretKeyRefs at your own Secrets).
+status is one of `starting` | `ready` | `error` | `auth_required`.
 
-Other pod env vars come from the `env` key in values.yaml, using the standard
-k8s syntax; values pulled from Secrets can then be interpolated into catalog
-headers via `${VAR}`:
+
+## Adding Oauth MCPs to the catalog
+
+MCPs protected by OAuth 2.1 (MCP auth spec) are supported out of the box:  
+The gateway acts as the OAuth client and delegates the login to a human through a one-time link. No client secret to manage, no pre-registration required (**dynamic client registration**, RFC 7591).
+
+### Example 1 - IaC (values.yaml)
 
 ```yaml
-env:
-  - name: GRAFANA_MCP_TOKEN
-    valueFrom:
-      secretKeyRef:
-        name: temba-mcp-secrets
-        key: GRAFANA_MCP_TOKEN
-
 catalog:
   servers:
-    - id: grafana
-      headers:
-        Authorization: Bearer ${GRAFANA_MCP_TOKEN}
+    - id: jira
+      # Atlassian-hosted Jira MCP (?tools=all exposes the full flat tool list)
+      url: https://mcp.atlassian.com/v2/mcp?tools=all
+      oauth: {}       # dynamic client registration (DCR + PKCE) — no creds needed
+      # only optional key: oauth: {scope: "read:jira-work read:jira-user"}
 ```
 
-| Secret key | Purpose |
-|---|---|
-| `ADMIN_API_TOKEN` (key `adminApi.tokenKey`) | bearer for the `/servers` admin API (never sent to the LLM) |
-| `GRAFANA_MCP_TOKEN` | internal bearer gateway ↔ mcp-grafana (via `env` secretKeyRef, if extra-mcp applied) |
-| `GRAFANA_SERVICE_ACCOUNT_TOKEN` | credentials used by the mcp-grafana pod against your Grafana (extra-mcp) |
+Then `helm upgrade --install temba-mcp ./chart/temba-mcp`.
+
+### Example 2 - REST API
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"id": "jira", "url": "https://mcp.atlassian.com/v2/mcp?tools=all", "oauth": {}}' \
+  http://<temba-url>/servers
+```
+
+### Login flow (what happens on first use)
+
+1. First `call_tool` on a jira tool → the gateway receives a 401 from the MCP →
+   OAuth metadata discovery (RFC 9728/8414) → **dynamic client registration**
+   (RFC 7591, redirect_uri = `<publicBaseUrl>/oauth/callback`).
+2. Instead of an error, the LLM receives a **personal login link**:
+   `http(s)://<temba-url>/auth?t=<ticket>` — single-use, valid 15 min, and it
+   authenticates **this server only**. No secret ever flows through the LLM
+   context.
+3. Open the link in a browser and log in on the Jira provider; you land back
+   on the gateway.
+4. Tokens are stored in Redis and refreshed automatically: ask the agent to
+   retry the same `call_tool`, it now succeeds.
+
+While the login is pending, `tool_search`/catalog report the server as
+`auth_required` (the link is included in a hint the LLM sees). One login **per server**;
+a server idle for more than `TOKEN_RETENTION` (30 d, sliding TTL) must
+re-authenticate.
+
+
+## Partitioning the catalog with labels
+
+As an admin, all your users may not need the same tools in their catalog. Some will want powerpoint MCPs and others dev related MCPs...  
+To scope tools to different usecase, you can set labels on each one.  
+For a client to get a labeled tool, it has to provide the same label inside its client configuration.  
+
+For instance, if the catalog is configured like so:  
+
+```yaml
+catalog:
+  servers:
+
+    - id: deepwiki
+      url: https://mcp.deepwiki.com/mcp
+      timeout: 45
+      labels: [meant-for-devs]
+
+    - id: jira
+      url: https://mcp.atlassian.com/v2/mcp?tools=all
+      oauth: {}
+      labels: [meant-for-pm]
+```
+
+Now, in your opencode config (or any MCP compatible client):
+
+* If you're a dev:
+```jsonc
+"temba-mcp": {
+  "type": "remote",
+  "url": "http(s)://<temba-url>/mcp",
+  "headers": { "X-Temba-Labels": "meant-for-devs" } // Set catalog label here
+}
+```
+
+=> Tools list: deepwiki ✅ jira ❌
+
+
+* If you're a project manager:
+```jsonc
+"temba-mcp": {
+  "type": "remote",
+  "url": "http(s)://<temba-url>/mcp",
+  "headers": { "X-Temba-Labels": "meant-for-pm" } // Set catalog label here
+}
+```
+
+=> Tools list: deepwiki ❌ jira ✅
+
+
+:information_source: Servers without labels are visible to everyone.  
+:warning: This is not a security feature. Merely a way to organize things a bit.  
+
+
+## How does tool search work ?
+
+Scoring runs over the tool `name` (weight 3) + `description` (2) + `input_schema` (1), with fr/en stemming.  
+
+**Embeddings** (semantic search, recommended) if `embeddings.baseUrl` is set in values.yaml (OpenAI-compatible `/v1/embeddings` endpoint + `embeddings.apiKey` or`embeddings.secretRef` + `embeddings.model`);  
+
+otherwise local **BM25** fallback. The active mode is returned in the payload (`"index": ...`). Zero results → `catalog` of servers as a hint.
+
 
 ## Network security
 
-- `add_mcp` = public internet only, enforced strictly (SSRF guard resolves
-  DNS and rejects private/loopback/link-local/metadata addresses; internal MCPs
-  can only be registered by an admin through the API).
-- `automountServiceAccountToken: false`: no k8s API token in the pod.
-- **Egress NetworkPolicy** (opt-in, `networkPolicy.enabled`): the only strong
-  guarantee against DNS rebinding — public internet only, plus explicitly
-  declared internal MCPs and CIDRs. Requires a CNI that enforces NetworkPolicy
-  (Calico/Cilium); on minikube: `minikube start --cni=calico`.
-- The `/auth` page is only reachable through the one-time ticket sent in the
-  LLM hint; no secret ever flows through the LLM context.
+When using the `allowNewMcpRegisteringByLlm` option that let's an LLM add tools to its catalog, ALWAYS make sure that `networkPolicy.enabled` is true (default).  
+A prompt injection could force the LLM to register a component from your internal k8s network. Securities have been added at the application level.  
+But nothing beats an old school NetworkPolicy with default deny.
 
-## Multi-replica
+## License
 
-`replicaCount > 1` works: OAuth tokens and the dynamic registry live in Redis
-(`temba-mcp:tokens:*`, hash `temba-mcp:dynamic_servers`), replicated via pub/sub
-(`temba-mcp:events`). Redis persistence uses emptyDir by default — enable
-`redis.persistence` (PVC) to survive pod deletion.
+This project is licensed under the MIT License. See the LICENSE file for more details.
 
-## Main environment variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `PUBLIC_BASE_URL` | derived from Ingress | public URL (OAuth redirect_uri, /auth links) |
-| `ADD_MCP_ENABLED` | `false` | expose `add_mcp` to LLMs |
-| `REDIS_URL` | `redis://…-redis:6379/0` | shared state (tokens + dynamic servers) |
-| `ADMIN_API_TOKEN` | empty = API disabled | bearer for `/servers` |
-| `TOOL_SEARCH_LIMIT` | `5` | top N tool_search results |
-| `PRIVATE_SERVER_TTL` | `86400` | lifetime of add_mcp servers (seconds) |
-| `TOKEN_RETENTION` | `2592000` (30 d) | sliding TTL of stored OAuth tokens; a server idle longer must re-authenticate |
-| `AUTH_LOGIN_TIMEOUT` | `600` | time granted to the human for the OAuth login |
-| `embeddings.*` (values.yaml) | empty | enables embeddings mode (`baseUrl`/`apiKey`/`secretRef`/`model`) |
+HF  
+**Temba, his arms wide.**

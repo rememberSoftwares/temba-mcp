@@ -59,6 +59,10 @@ AUTH_LOGIN_TIMEOUT = float(os.getenv("AUTH_LOGIN_TIMEOUT", "600"))
 # d'admin partagée : chaque demande produit son propre lien.
 LOGIN_TICKET_TTL = float(os.getenv("LOGIN_TICKET_TTL", "900"))
 
+# TTL glissant des tokens OAuth stockés (re-armé à chaque écriture) : un serveur
+# non utilisé pendant cette durée devra se ré-authentifier.
+TOKEN_RETENTION = float(os.getenv("TOKEN_RETENTION", "2592000"))
+
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -77,7 +81,7 @@ ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "")
 PRIVATE_SERVER_TTL = float(os.getenv("PRIVATE_SERVER_TTL", "86400"))
 # Tool add_mcp : désactivé par défaut (sécurité) ; ADD_MCP_ENABLED=true pour l'activer.
 ADD_MCP_ENABLED = _env_bool("ADD_MCP_ENABLED")
-LABELS_HEADER = "x-temba-mcp-labels"
+LABELS_HEADER = "x-temba-labels"
 
 # Redis (obligatoire en multi-réplicas) : état partagé (tokens OAuth + serveurs
 # dynamiques). Vide = mémoire process (dev mono-process).
@@ -838,7 +842,7 @@ _gateway: Gateway | None = None
 
 
 def _client_labels(ctx) -> frozenset[str]:
-    """Labels du client, depuis le header X-Temba-Mcp-Labels (conf opencode)."""
+    """Labels du client, depuis le header X-Temba-Labels (conf opencode)."""
     raw = (ctx.headers or {}).get(LABELS_HEADER, "") if ctx else ""
     return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 

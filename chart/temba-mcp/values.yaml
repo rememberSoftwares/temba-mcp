@@ -31,10 +31,12 @@ catalog:
     #- id: deepwiki
     #  url: https://mcp.deepwiki.com/mcp
 
-    ## OIDC example ##
+    ## OIDC example (MCP auth spec: DCR + PKCE, human login via a /auth link) ##
     #- id: atlassian-remote
     #  url: https://mcp.atlassian.com/v2/mcp?tools=all
-    #  oauth: {}
+    #  oauth: {}                # {} = dynamic client registration, no creds needed (401 => DCR => /auth login)
+    ## oauth accepts one optional key:
+    #  oauth: {scope: "read:jira-work read:jira-user"}
 
     ## String interpolation + label example (cf `env` section) ##
     # - id: grafana
