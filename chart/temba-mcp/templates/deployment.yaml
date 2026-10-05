@@ -1,3 +1,9 @@
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "OAuth isolation currently requires replicaCount=1" }}
+{{- end }}
+{{- if and .Values.auth.enabled (not .Values.auth.issuer) }}
+{{- fail "auth.issuer is required when auth.enabled=true: set the Keycloak realm URL (https://<keycloak>/realms/<realm>)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +12,8 @@ metadata:
     {{- include "tembamcp.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: temba-mcp
@@ -23,9 +31,32 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [sh, -c]
           args:
-            - pip install --no-cache-dir "mcp>=2,<3" pyyaml uv rank_bm25 snowballstemmer redis && exec python /app/server.py
+            - pip install --no-cache-dir "mcp==2.2.0" "httpx2==2.13.1" "PyJWT[crypto]==2.15.1" "cryptography==50.0.1" pyyaml uv rank_bm25 snowballstemmer && exec python /app/server.py
           workingDir: /app
           env:
+            - name: AUTH_ENABLED
+              value: {{ .Values.auth.enabled | ternary "true" "false" | quote }}
+            - name: ALLOW_INSECURE_HTTP
+              value: {{ .Values.security.allowInsecureHttp | ternary "true" "false" | quote }}
+            - name: AUTH_ISSUER
+              value: {{ .Values.auth.issuer | quote }}
+            - name: AUTH_AUDIENCE
+              value: {{ .Values.auth.audience | quote }}
+            - name: AUTH_BROWSER_CLIENT_ID
+              value: {{ .Values.auth.browserClientId | quote }}
+            {{- if .Values.auth.browserClientSecretName }}
+            - name: AUTH_BROWSER_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.browserClientSecretName }}
+                  key: {{ .Values.auth.browserClientSecretKey }}
+            {{- end }}
+            - name: AUTH_SCOPES
+              value: {{ join " " .Values.auth.scopes | quote }}
+            - name: USER_IDLE_TTL
+              value: {{ .Values.security.userIdleTtl | quote }}
+            - name: MAX_USER_GATEWAYS
+              value: {{ .Values.security.maxUserGateways | quote }}
             - name: REGISTRY_PATH
               value: /etc/temba-mcp/registry.yaml
             - name: PORT
@@ -41,8 +72,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "tembamcp.adminSecretName" . }}
                   key: {{ include "tembamcp.adminTokenKey" . }}
-            - name: REDIS_URL
-              value: {{ .Values.redis.url | default (printf "redis://%s-redis:6379/0" (include "tembamcp.fullname" .)) | quote }}
             {{- with .Values.embeddings }}
             {{- if .baseUrl }}
             - name: EMBEDDINGS_BASE_URL
@@ -63,7 +92,7 @@ spec:
               value: {{ .apiKey | quote }}
             {{- end }}
             {{- end }}
-            {{- $reserved := list "PORT" "LIST_TIMEOUT" "REGISTRY_PATH" "PUBLIC_BASE_URL" "ADD_MCP_ENABLED" "ADMIN_API_TOKEN" "REDIS_URL" "EMBEDDINGS_BASE_URL" "EMBEDDINGS_MODEL" "EMBEDDINGS_API_KEY" }}
+            {{- $reserved := list "PORT" "LIST_TIMEOUT" "REGISTRY_PATH" "PUBLIC_BASE_URL" "ADD_MCP_ENABLED" "ADMIN_API_TOKEN" "EMBEDDINGS_BASE_URL" "EMBEDDINGS_MODEL" "EMBEDDINGS_API_KEY" "AUTH_ENABLED" "ALLOW_INSECURE_HTTP" "AUTH_ISSUER" "AUTH_AUDIENCE" "AUTH_SCOPES" "AUTH_BROWSER_CLIENT_ID" "AUTH_BROWSER_CLIENT_SECRET" "USER_IDLE_TTL" "MAX_USER_GATEWAYS" }}
             {{- range .Values.env }}
             {{- if has .name $reserved }}
             {{- fail (printf "env: %s is managed by the chart and cannot be overridden" .name) }}

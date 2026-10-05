@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import hashlib
+import html
 import json
 import logging
 import math
@@ -19,13 +21,17 @@ import secrets
 import socket
 import time
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import httpx2
 import yaml
 from mcp import ClientSession
 from mcp.client.auth import OAuthClientProvider
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.middleware.auth_context import get_access_token
+from security import BrowserLogin, KeycloakTokenVerifier, identity_key, require_https
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
@@ -43,11 +49,23 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 log = logging.getLogger("temba-mcp")
 
+
+class StatelessSessionLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # The SDK logs this for every stateless request; there is no session to identify.
+        return record.getMessage() != "Terminating session: None"
+
+
+logging.getLogger("mcp.server.streamable_http").addFilter(StatelessSessionLogFilter())
+
 TOOL_SEARCH_LIMIT = int(os.getenv("TOOL_SEARCH_LIMIT", "5"))
 CALL_TIMEOUT = float(os.getenv("CALL_TIMEOUT", "60"))
 LIST_TIMEOUT = float(os.getenv("LIST_TIMEOUT", "30"))
 HEALTH_INTERVAL = float(os.getenv("HEALTH_INTERVAL", "60"))
 RECONNECT_DELAY = float(os.getenv("RECONNECT_DELAY", "5"))
+CONNECTION_PROGRESS_INTERVAL = float(os.getenv("CONNECTION_PROGRESS_INTERVAL", "10"))
+if CONNECTION_PROGRESS_INTERVAL <= 0:
+    raise ValueError("CONNECTION_PROGRESS_INTERVAL must be positive")
 PORT = int(os.getenv("PORT", "8080"))
 
 # OAuth dynamique (MCP auth spec) : DCR + PKCE, login humain via /auth
@@ -59,8 +77,7 @@ AUTH_LOGIN_TIMEOUT = float(os.getenv("AUTH_LOGIN_TIMEOUT", "600"))
 # d'admin partagée : chaque demande produit son propre lien.
 LOGIN_TICKET_TTL = float(os.getenv("LOGIN_TICKET_TTL", "900"))
 
-# TTL glissant des tokens OAuth stockés (re-armé à chaque écriture) : un serveur
-# non utilisé pendant cette durée devra se ré-authentifier.
+# Rétention des tokens OAuth en mémoire, renouvelée à chaque écriture/refresh.
 TOKEN_RETENTION = float(os.getenv("TOKEN_RETENTION", "2592000"))
 
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -83,12 +100,20 @@ PRIVATE_SERVER_TTL = float(os.getenv("PRIVATE_SERVER_TTL", "86400"))
 ADD_MCP_ENABLED = _env_bool("ADD_MCP_ENABLED")
 LABELS_HEADER = "x-temba-labels"
 
-# Redis (obligatoire en multi-réplicas) : état partagé (tokens OAuth + serveurs
-# dynamiques). Vide = mémoire process (dev mono-process).
-REDIS_URL = os.getenv("REDIS_URL", "")
-REDIS_KEY_SERVERS = "temba-mcp:dynamic_servers"
-REDIS_CHANNEL = "temba-mcp:events"
-
+AUTH_ENABLED = _env_bool("AUTH_ENABLED", False)
+ALLOW_INSECURE_HTTP = _env_bool("ALLOW_INSECURE_HTTP", False)
+AUTH_COOKIE_SECURE = urlparse(PUBLIC_BASE_URL).scheme == "https"
+AUTH_ISSUER = os.getenv("AUTH_ISSUER", "")
+AUTH_AUDIENCE = os.getenv("AUTH_AUDIENCE", "")
+AUTH_BROWSER_CLIENT_ID = os.getenv("AUTH_BROWSER_CLIENT_ID", "temba-login")
+AUTH_SCOPES = os.getenv("AUTH_SCOPES", "temba:use").split()
+if ADD_MCP_ENABLED and not AUTH_ENABLED:
+    raise ValueError("add_mcp requires Temba authentication")
+USER_IDLE_TTL = float(os.getenv("USER_IDLE_TTL", "3600"))
+MAX_USER_GATEWAYS = int(os.getenv("MAX_USER_GATEWAYS", "128"))
+_TOKEN_MEMORY: dict[tuple[str, str, str], dict] = {}
+_TOKEN_MEMORY_EXPIRY: dict[tuple[str, str, str], float] = {}
+_DYN_MEMORY: dict[str, dict] = {}
 # Index sémantique optionnel (format OpenAI /v1/embeddings)
 EMBEDDINGS_BASE_URL = os.getenv("EMBEDDINGS_BASE_URL", "").rstrip("/")
 EMBEDDINGS_API_KEY = os.getenv("EMBEDDINGS_API_KEY", "")
@@ -207,70 +232,60 @@ class EmbeddingIndex:
         return [(round(s, 3), e) for s, e in scored[:limit] if s >= EMBED_MIN_SCORE]
 
 
-_redis: Any = None
+def _token_key(server_id: str, owner: str, url: str) -> tuple[str, str, str]:
+    return server_id, owner, url
 
 
-def redis_client():
-    """Client Redis partagé (None si REDIS_URL non défini)."""
-    global _redis
-    if REDIS_URL and _redis is None:
-        import redis.asyncio as aioredis
-
-        _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-    return _redis
-
-
-def _token_key(server_id: str) -> str:
-    return f"temba-mcp:tokens:{server_id}"
+def purge_tokens(*, server_id: str | None = None, owner: str | None = None,
+                 expired_only: bool = False) -> None:
+    now = time.time()
+    for key in list(_TOKEN_MEMORY):
+        if (server_id is not None and key[0] != server_id) or (owner is not None and key[1] != owner):
+            continue
+        if expired_only and _TOKEN_MEMORY_EXPIRY.get(key, 0) > now:
+            continue
+        _TOKEN_MEMORY.pop(key, None)
+        _TOKEN_MEMORY_EXPIRY.pop(key, None)
 
 
 class TokenStore:
-    """TokenStorage SDK : Redis si REDIS_URL (partagé multi-réplicas), sinon mémoire."""
+    """Process-local OAuth state, isolated by validated user and MCP endpoint."""
 
-    def __init__(self, server_id: str):
-        self.server_id = server_id
+    def __init__(self, server_id: str, owner: str, url: str):
+        if not owner:
+            raise ValueError("OAuth token storage requires an authenticated owner")
+        self.key = _token_key(server_id, owner, url)
+        self.lock = asyncio.Lock()
 
     async def _get(self) -> dict:
-        if REDIS_URL:
-            client = redis_client()
-            try:
-                raw = await client.get(_token_key(self.server_id))
-                return json.loads(raw) if raw else {}
-            except Exception as exc:
-                log.warning("redis get tokens (%s): %s", self.server_id, exc)
-                return {}
-        return _TOKEN_MEMORY.get(self.server_id, {})
+        if _TOKEN_MEMORY_EXPIRY.get(self.key, 0) <= time.time():
+            _TOKEN_MEMORY.pop(self.key, None)
+            _TOKEN_MEMORY_EXPIRY.pop(self.key, None)
+        return deepcopy(_TOKEN_MEMORY.get(self.key, {}))
 
     async def _set(self, data: dict) -> None:
-        if REDIS_URL:
-            client = redis_client()
-            try:
-                # TTL glissant : re-armé à chaque écriture (refresh inclus)
-                await client.set(_token_key(self.server_id), json.dumps(data), ex=int(TOKEN_RETENTION))
-            except Exception as exc:
-                log.warning("redis set tokens (%s): %s", self.server_id, exc)
-            return
-        _TOKEN_MEMORY[self.server_id] = data
+        _TOKEN_MEMORY[self.key] = deepcopy(data)
+        _TOKEN_MEMORY_EXPIRY[self.key] = time.time() + TOKEN_RETENTION
 
     async def get_tokens(self) -> OAuthToken | None:
         data = await self._get()
-        t = data.get("tokens")
-        return OAuthToken.model_validate(t) if t else None
+        return OAuthToken.model_validate(data["tokens"]) if data.get("tokens") else None
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        data = await self._get()
-        data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
-        await self._set(data)
+        async with self.lock:
+            data = await self._get()
+            data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
+            await self._set(data)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         data = await self._get()
-        c = data.get("client_info")
-        return OAuthClientInformationFull.model_validate(c) if c else None
+        return OAuthClientInformationFull.model_validate(data["client_info"]) if data.get("client_info") else None
 
     async def set_client_info(self, info: OAuthClientInformationFull) -> None:
-        data = await self._get()
-        data["client_info"] = info.model_dump(mode="json", exclude_none=True)
-        await self._set(data)
+        async with self.lock:
+            data = await self._get()
+            data["client_info"] = info.model_dump(mode="json", exclude_none=True)
+            await self._set(data)
 
 
 class AuthCoordinator:
@@ -281,15 +296,20 @@ class AuthCoordinator:
     expire, et meurt dès que le login aboutit ou que le flow est relancé.
     """
 
-    def __init__(self):
+    def __init__(self, gateway):
+        self.gateway = gateway
         self.by_state: dict[str, ServerState] = {}
         self.futures: dict[str, asyncio.Future] = {}
         self.tickets: dict[str, dict] = {}
+        self.browser_flows: dict[str, dict] = {}
 
     def _prune(self) -> None:
         now = time.time()
         for t in [k for k, v in self.tickets.items() if v["exp"] < now]:
             del self.tickets[t]
+        for state in [k for k, v in self.browser_flows.items() if v["exp"] < now]:
+            entry = self.browser_flows.pop(state)
+            self.abort(entry["server_id"])
 
     def issue_ticket(self, server_id: str) -> str:
         self._prune()
@@ -309,14 +329,14 @@ class AuthCoordinator:
     def server_for_ticket(self, ticket: str) -> ServerState | None:
         if not self.ticket_ok(ticket):
             return None
-        return next((s for s in _gateway.states if s.id == self.tickets[ticket]["server_id"]), None)
+        return next((s for s in self.gateway.states if s.id == self.tickets[ticket]["server_id"]), None)
 
     def start(self, st: ServerState, authorize_url: str) -> asyncio.Future:
         old = self.futures.get(st.id)
         if old is not None and not old.done():
             if st.auth_url == authorize_url:
                 return old
-            old.cancel()
+        self.abort(st.id)
         fut = asyncio.get_running_loop().create_future()
         self.futures[st.id] = fut
         st.auth_url = authorize_url
@@ -324,20 +344,45 @@ class AuthCoordinator:
         st.error = None
         self.consume(st.id)
         st.login_ticket = self.issue_ticket(st.id)
-        from urllib.parse import urlparse, parse_qs
-
-        state = parse_qs(urlparse(authorize_url).query).get("state", ["?"])[0]
+        require_https(authorize_url.split("?", 1)[0])
+        query = parse_qs(urlparse(authorize_url).query)
+        state = query.get("state", [""])[0]
+        if not state or state in self.by_state or query.get("code_challenge_method") != ["S256"]:
+            self.abort(st.id)
+            raise ValueError("OAuth requires a unique state and S256 PKCE")
         self.by_state[state] = st
+        self.browser_flows[state] = {"server_id": st.id, "exp": time.time() + min(LOGIN_TICKET_TTL, AUTH_LOGIN_TIMEOUT),
+                                     "browser": None}
         log.warning("AUTH REQUIS pour '%s' — ticket de login émis (%s/auth?t=...)", st.id, PUBLIC_BASE_URL)
         return fut
 
-    def complete(self, code: str, state: str) -> bool:
-        st = self.by_state.pop(state, None)
+    def begin_login(self, ticket: str) -> tuple[ServerState, str, str] | None:
+        st = self.server_for_ticket(ticket)
         if st is None:
+            return None
+        state = next((k for k, v in self.by_state.items() if v is st), None)
+        if state is None or state not in self.browser_flows:
+            return None
+        browser = secrets.token_urlsafe(32)
+        self.browser_flows[state]["browser"] = hashlib.sha256(browser.encode()).hexdigest()
+        self.consume(st.id)
+        st.login_ticket = None
+        return st, state, browser
+
+    def complete(self, code: str, state: str, browser: str, issuer: str | None = None) -> bool:
+        self._prune()
+        entry = self.browser_flows.get(state)
+        st = self.by_state.get(state)
+        if not entry or not st or not entry["browser"] or not browser:
+            return False
+        if not secrets.compare_digest(entry["browser"], hashlib.sha256(browser.encode()).hexdigest()):
             return False
         fut = self.futures.get(st.id)
-        if fut is not None and not fut.done():
-            fut.set_result((code, state))
+        if fut is None or fut.done():
+            return False
+        self.by_state.pop(state)
+        self.browser_flows.pop(state)
+        fut.set_result(AuthorizationCodeResult(code=code, state=state, iss=issuer))
         self.consume(st.id)
         return True
 
@@ -346,6 +391,17 @@ class AuthCoordinator:
         if fut is not None and not fut.done():
             fut.cancel()
         self.consume(server_id)
+        for state in [k for k, st in self.by_state.items() if st.id == server_id]:
+            self.by_state.pop(state)
+            self.browser_flows.pop(state, None)
+
+
+
+def public_server(cfg: dict) -> bool:
+    """Anonymous access never lends configured credentials or private resources."""
+    url = urlparse(cfg.get("url", ""))
+    return (cfg.get("oauth") is None and not cfg.get("headers") and not cfg.get("private")
+            and not url.username and not url.password and cfg.get("access") != "authenticated")
 
 
 class ServerState:
@@ -361,29 +417,60 @@ class ServerState:
         self.tools: dict[str, dict] = {}
         self.session: ClientSession | None = None
         self.wake = asyncio.Event()
+        self.call_lock = asyncio.Lock()
         self.auth_url: str | None = None
         self.login_ticket: str | None = None
 
 
 class Gateway:
-    def __init__(self, registry_path: str):
-        self.states: list[ServerState] = [ServerState(c) for c in self._load_registry(registry_path)]
+    def __init__(self, registry_path: str, owner: str | None = None, configs: list[dict] | None = None):
+        self.owner = owner
+        self.log_catalog = "public" if owner is None else "user-" + secrets.token_hex(4)
+        self.last_used = time.monotonic()
+        self.active_calls = 0
+        self.ready = asyncio.Event()
+        self.states: list[ServerState] = [ServerState(c) for c in (self._load_registry(registry_path) if configs is None else configs)]
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._index: BM25Index | EmbeddingIndex | None = None
         self._index_fp: str | None = None
         self._index_lock = asyncio.Lock()
+        self._mutation_lock = asyncio.Lock()
         self._embed_client = httpx2.AsyncClient(timeout=30)
-        self.auth = AuthCoordinator()
+        self.auth = AuthCoordinator(self)
+
+    def _connection_states(self) -> list[ServerState]:
+        return [st for st in self.states if self.owner is not None or public_server(st.cfg)]
+
+    def _log_progress(self, event: str, *, level: int = logging.INFO) -> None:
+        states = self._connection_states()
+        ready = sum(st.status == "ready" for st in states)
+        pending = ", ".join(st.id for st in states if st.status == "starting") or "aucun"
+        errors = ", ".join(st.id for st in states if st.status == "error") or "aucun"
+        login = ", ".join(st.id for st in states if st.status == "auth_required") or "aucun"
+        log.log(level, "%s — catalogue %s : %d/%d MCP prêts ; en attente: %s ; en erreur: %s ; login requis: %s",
+                event, self.log_catalog, ready, len(states), pending, errors, login)
+
+    async def _connection_progress_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), CONNECTION_PROGRESS_INTERVAL)
+            except TimeoutError:
+                if any(st.status != "ready" for st in self._connection_states()):
+                    self._log_progress("Connexions MCP incomplètes")
 
     async def add_server(self, cfg: dict) -> ServerState:
+        async with self._mutation_lock:
+            return await self._add_server(cfg)
+
+    async def _add_server(self, cfg: dict) -> ServerState:
         st = ServerState(cfg)
         if any(s.id == st.id for s in self.states):
             raise ValueError(f"id '{st.id}' déjà utilisé")
-        self.states.append(st)
-        self._tasks.append(asyncio.create_task(self._serve(st), name=f"mcp:{st.id}"))
         if st.private or st.cfg.get("dynamic"):
             await self._dyn_put(st.cfg)
+        self.states.append(st)
+        self._tasks.append(asyncio.create_task(self._serve(st), name=f"mcp:{st.id}"))
         return st
 
     async def _detach(self, server_id: str) -> None:
@@ -396,67 +483,54 @@ class Gateway:
         self.states = [s for s in self.states if s.id != server_id]
 
     async def remove_server(self, server_id: str) -> bool:
-        if not any(s.id == server_id for s in self.states):
+        if not any(s.id == server_id for s in self.states) and not any(
+                cfg["id"] == server_id for cfg in await self._dyn_all()):
             return False
-        await self._detach(server_id)
         await self._dyn_del(server_id)
-        # purge immédiate des tokens du serveur supprimé
-        if REDIS_URL:
-            try:
-                await redis_client().delete(_token_key(server_id))
-            except Exception:
-                pass
-        else:
-            _TOKEN_MEMORY.pop(server_id, None)
+        await self._detach(server_id)
+        for view in list(_user_gateways.values()):
+            await view._detach(server_id)
+            await view._rebuild_index()
+        purge_tokens(server_id=server_id)
         await self._rebuild_index()
         return True
 
     async def _expire_loop(self) -> None:
         """Nettoie les serveurs privés (add_mcp) arrivés à expiration."""
-        iterations = 0
         while not self._stop.is_set():
             try:
                 await asyncio.sleep(60)
                 now = time.time()
-                expired = [st.id for st in self.states if st.expires_at and st.expires_at <= now]
+                purge_tokens(expired_only=True)
+                await self._dyn_reconcile()
+                for view in list(_user_gateways.values()):
+                    await view._dyn_reconcile()
+                expired = [cfg["id"] for cfg in await self._dyn_all()
+                           if cfg.get("expires_at") and cfg["expires_at"] <= now]
                 for sid in expired:
                     log.info("serveur privé '%s' expiré — suppression", sid)
                     await self.remove_server(sid)
-                # purge périodique des tokens orphelins (serveur supprimé du registry)
-                iterations += 1
-                if iterations % 15 == 0:
-                    await self._purge_orphan_tokens()
+                async with _user_gateway_lock:
+                    for owner, view in list(_user_gateways.items()):
+                        if view.active_calls == 0 and time.monotonic() - view.last_used > USER_IDLE_TTL:
+                            _user_gateways.pop(owner, None)
+                            await view.stop()
+                            view.runner.cancel()
+                            await asyncio.gather(view.runner, return_exceptions=True)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                log.warning("expire loop: %s", exc)
-
-    async def _purge_orphan_tokens(self) -> None:
-        """Supprime les tokens OAuth dont le serveur n'existe plus."""
-        known = {st.id for st in self.states}
-        if REDIS_URL:
-            client = redis_client()
-            removed = 0
-            async for key in client.scan_iter(match="temba-mcp:tokens:*"):
-                sid = key.removeprefix("temba-mcp:tokens:")
-                if sid and sid not in known:
-                    await client.delete(key)
-                    removed += 1
-            if removed:
-                log.info("purge de %d tokens orphelins", removed)
-        else:
-            for sid in [k for k in list(_TOKEN_MEMORY) if k not in known]:
-                _TOKEN_MEMORY.pop(sid, None)
+            except Exception:
+                log.warning("expiry cleanup failed")
 
     def _visible(self, st: ServerState, client_labels: frozenset[str]) -> bool:
-        if st.private:
+        if st.private or (self.owner is None and not public_server(st.cfg)):
             return False
         return not st.labels or bool(st.labels & client_labels)
 
     async def _entries(self) -> list[dict]:
         entries = []
         for st in self.states:
-            if st.private:
+            if st.private or (self.owner is None and not public_server(st.cfg)):
                 continue
             for tool in st.tools.values():
                 entries.append({
@@ -512,6 +586,10 @@ class Gateway:
         if len(ids) != len(set(ids)):
             raise ValueError("registry: ids de serveurs en doublon")
         for s in servers:
+            if not isinstance(s.get("id"), str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,30}", s["id"]):
+                raise ValueError("registry: id must contain 2-31 lowercase alphanumeric or hyphen characters")
+            if s.get("access", "public") not in ("public", "authenticated"):
+                raise ValueError("registry: access must be public or authenticated")
             if s.get("transport", "http") != "http":
                 raise ValueError(f"registry[{s.get('id')}]: transport invalide (http uniquement)")
             if not s.get("url"):
@@ -527,62 +605,24 @@ class Gateway:
         return servers
 
     async def _dyn_all(self) -> list[dict]:
-        """Serveurs dynamiques (API admin + privés) : Redis si configuré, sinon mémoire."""
-        if REDIS_URL:
-            try:
-                raw = await redis_client().hgetall(REDIS_KEY_SERVERS)
-                return [json.loads(v) for v in raw.values()]
-            except Exception as exc:
-                log.error("redis illisible (%s) — registry dynamique vide", exc)
-                return []
-        return [dict(c) for c in _DYN_MEMORY.values()]
+        """Dynamic catalog shared by user views within this process only."""
+        return deepcopy(list(_DYN_MEMORY.values()))
 
     async def _dyn_put(self, cfg: dict) -> None:
-        if REDIS_URL:
-            try:
-                await redis_client().hset(REDIS_KEY_SERVERS, cfg["id"], json.dumps(cfg))
-                await self._dyn_publish()
-            except Exception as exc:
-                log.error("redis hset: %s", exc)
-            return
-        _DYN_MEMORY[cfg["id"]] = cfg
+        _DYN_MEMORY[cfg["id"]] = deepcopy(cfg)
 
     async def _dyn_del(self, server_id: str) -> None:
-        if REDIS_URL:
-            try:
-                await redis_client().hdel(REDIS_KEY_SERVERS, server_id)
-                await self._dyn_publish()
-            except Exception as exc:
-                log.error("redis hdel: %s", exc)
-            return
         _DYN_MEMORY.pop(server_id, None)
 
-    async def _dyn_publish(self) -> None:
-        try:
-            await redis_client().publish(REDIS_CHANNEL, "registry_changed")
-        except Exception:
-            pass
-
-    async def _pubsub_loop(self) -> None:
-        """Réconcilie le registry local quand une autre réplique modifie l'état."""
-        client = redis_client()
-        while not self._stop.is_set():
-            try:
-                pubsub = client.pubsub()
-                await pubsub.subscribe(REDIS_CHANNEL)
-                async for message in pubsub.listen():
-                    if self._stop.is_set() or message.get("type") != "message":
-                        continue
-                    await self._dyn_reconcile()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning("pubsub registry: %s — nouvelle tentative dans 5s", exc)
-                await asyncio.sleep(5)
-
     async def _dyn_reconcile(self) -> None:
-        """Aligne les serveurs dynamiques locaux sur l'état partagé (Redis)."""
-        desired = {c["id"]: c for c in await self._dyn_all() if not (c.get("expires_at") and c["expires_at"] <= time.time())}
+        async with self._mutation_lock:
+            await self._reconcile_locked()
+
+    async def _reconcile_locked(self) -> None:
+        """Aligne les connexions locales sur le catalogue dynamique en mémoire."""
+        desired = {c["id"]: c for c in await self._dyn_all()
+                   if not (c.get("expires_at") and c["expires_at"] <= time.time())
+                   and (not c.get("private") or self.owner is None or c.get("owner") == self.owner)}
         current = {st.id: st for st in self.states if st.private or st.cfg.get("dynamic")}
         for sid in list(current):
             if sid not in desired:
@@ -597,15 +637,17 @@ class Gateway:
                 await self._rebuild_index()
 
     async def run(self) -> None:
-        # rattrape l'état partagé (Redis) ou le fichier local (mono-réplique)
         try:
             await self._dyn_reconcile()
-        except Exception as exc:
-            log.error("réplication initiale: %s", exc)
-        self._tasks = [asyncio.create_task(self._serve(st), name=f"mcp:{st.id}") for st in self.states]
-        self._tasks.append(asyncio.create_task(self._expire_loop(), name="private-expiry"))
-        if REDIS_URL:
-            self._tasks.append(asyncio.create_task(self._pubsub_loop(), name="redis-pubsub"))
+            existing = {task.get_name() for task in self._tasks}
+            self._tasks.extend(asyncio.create_task(self._serve(st), name=f"mcp:{st.id}")
+                               for st in self.states if f"mcp:{st.id}" not in existing)
+        finally:
+            self.ready.set()
+        if self.owner is None:
+            self._tasks.append(asyncio.create_task(self._expire_loop(), name="private-expiry"))
+        self._log_progress("Démarrage des connexions MCP")
+        self._tasks.append(asyncio.create_task(self._connection_progress_loop(), name="connection-progress"))
         await self._stop.wait()
 
     async def stop(self) -> None:
@@ -614,12 +656,10 @@ class Gateway:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._embed_client.aclose()
-        client = redis_client()
-        if client is not None:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+        for st in self.states:
+            self.auth.abort(st.id)
+        if self.owner is not None:
+            purge_tokens(owner=self.owner)
 
     def _auth_provider(self, st: ServerState) -> OAuthClientProvider:
         cfg = st.cfg.get("oauth") or {}
@@ -632,7 +672,7 @@ class Gateway:
             token_endpoint_auth_method="none",
             scope=cfg.get("scope"),
         )
-        store = TokenStore(st.id)
+        store = TokenStore(st.id, self.owner, st.cfg["url"])
         return OAuthClientProvider(
             st.cfg["url"],
             client_metadata=metadata,
@@ -651,8 +691,12 @@ class Gateway:
             fut = self.auth.futures.get(st.id)
             if fut is None:
                 raise RuntimeError("aucun flow OAuth en attente")
-            code, state = await asyncio.shield(fut)
-            return AuthorizationCodeResult(code=code, state=state)
+            try:
+                return await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                if fut.cancelled() and not asyncio.current_task().cancelling():
+                    raise RuntimeError("OAuth flow expired or cancelled") from None
+                raise
         return callback_handler
 
     @asynccontextmanager
@@ -661,7 +705,31 @@ class Gateway:
         client_kwargs: dict[str, Any] = {"headers": cfg.get("headers") or None}
         if cfg.get("oauth") is not None:
             client_kwargs["auth"] = self._auth_provider(st)
-        client = httpx2.AsyncClient(**client_kwargs)
+        if cfg.get("oauth") is not None:
+            require_https(cfg["url"], allow_query=True)
+            allowed_origins = (cfg.get("oauth") or {}).get("allowedOrigins", [])
+            if not isinstance(allowed_origins, list):
+                raise ValueError("oauth.allowedOrigins must be a list of trusted HTTPS origins")
+            trusted = [] if st.private else [cfg["url"]]
+            for origin in allowed_origins:
+                require_https(origin)
+                if urlparse(origin).path not in ("", "/"):
+                    raise ValueError("oauth.allowedOrigins entries must not contain a path")
+                if not st.private:
+                    trusted.append(origin)
+
+            def origin_tuple(url):
+                parsed = urlparse(str(url))
+                return parsed.scheme, parsed.hostname, parsed.port or 443
+
+            trusted_origins = {origin_tuple(url) for url in trusted}
+            async def check_request(request):
+                if request.url.scheme != "https":
+                    raise ValueError("OAuth endpoints require HTTPS")
+                if origin_tuple(request.url) not in trusted_origins:
+                    await _assert_public_url(str(request.url))
+            client_kwargs["event_hooks"] = {"request": [check_request]}
+        client = httpx2.AsyncClient(trust_env=False, **client_kwargs)
         try:
             async with streamable_http_client(cfg["url"], http_client=client) as (read, write):
                 yield read, write
@@ -669,8 +737,17 @@ class Gateway:
             await client.aclose()
 
     async def _serve(self, st: ServerState) -> None:
+        # The admin catalog never authenticates a user's OAuth server.
+        if self.owner is None and not public_server(st.cfg):
+            st.status = "auth_required"
+            return
+        if not AUTH_ENABLED and st.cfg.get("oauth") is not None:
+            st.status, st.error = "error", "OAuth requires Temba authentication"
+            return
+        last_failure = None
         while not self._stop.is_set():
             try:
+                st.status = "starting"
                 async with self._open_transport(st) as (read, write):
                     def on_message(message: Any, _st: ServerState = st) -> None:
                         if isinstance(message, ToolListChangedNotification):
@@ -682,6 +759,7 @@ class Gateway:
                         await asyncio.wait_for(session.initialize(), init_timeout)
                         st.session = session
                         await self._sync_tools(st)
+                        last_failure = None
                         while not self._stop.is_set():
                             try:
                                 await asyncio.wait_for(st.wake.wait(), timeout=HEALTH_INTERVAL)
@@ -693,17 +771,26 @@ class Gateway:
                 raise
             except Exception as exc:
                 st.status = "error"
-                st.error = f"{type(exc).__name__}: {exc}"
+                st.error = f"{type(exc).__name__}: upstream connection failed"
                 st.tools = {}
                 self.auth.abort(st.id)
+                # Never log exception messages, URLs, headers or token response bodies.
+                def error_types(error):
+                    return [name for child in getattr(error, "exceptions", []) for name in error_types(child)] or [type(error).__name__]
+                failure = ", ".join(sorted(set(error_types(exc))))
+                if failure != last_failure:
+                    self._log_progress(f"MCP '{st.id}' indisponible ({failure})", level=logging.WARNING)
+                    last_failure = failure
                 if not self._stop.is_set():
                     await asyncio.sleep(RECONNECT_DELAY)
             finally:
                 st.session = None
 
     async def _sync_tools(self, st: ServerState) -> None:
+        was_ready = st.status == "ready"
         async with asyncio.timeout(st.timeout or LIST_TIMEOUT):
-            res = await st.session.list_tools()
+            async with st.call_lock:
+                res = await st.session.list_tools()
         st.tools = {
             t.name: {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
             for t in res.tools
@@ -711,6 +798,8 @@ class Gateway:
         st.status = "ready"
         st.error = None
         await self._rebuild_index()
+        if not was_ready:
+            self._log_progress(f"MCP '{st.id}' prêt ({len(st.tools)} outils)")
 
     def catalog(self, client_labels: frozenset[str] = frozenset()) -> dict[str, dict]:
         """Catalogue lisible par le LLM : statut du serveur inclus, filtré par labels.
@@ -724,8 +813,8 @@ class Gateway:
                     "status": "auth_required",
                     "tools": [],
                     "hint": f"Authentification requise: demande à l'utilisateur d'ouvrir "
-                            f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket} (lien personnel valable "
-                            f"{int(LOGIN_TICKET_TTL / 60)} min)",
+                            + (f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket} (lien à usage unique)"
+                               if st.login_ticket else "Connexion en cours dans le navigateur ; termine-la puis réessaie."),
                 }
             elif st.status != "ready":
                 out[st.id] = {"status": st.status, "tools": sorted(st.tools), "error": st.error}
@@ -781,8 +870,14 @@ class Gateway:
         st = next((s for s in self.states if s.id == server_id), None)
         if st is None:
             return {"tool_id": tool_id, "ok": False, "error": f"serveur inconnu '{server_id}'", "catalog": self.catalog(client_labels)}
-        # Les serveurs privés (add_mcp) ne sont pas soumis au filtre labels :
-        # leur seule protection est l'id secret que seul leur créateur connaît.
+        if st.expires_at and st.expires_at <= time.time():
+            return {"ok": False, "error": "server expired"}
+        if st.private and st.cfg.get("owner") != self.owner:
+            return {"ok": False, "error": "server unavailable"}
+        if self.owner is None and not public_server(st.cfg):
+            return {"tool_id": tool_id, "ok": False, "auth_required": True,
+                    "hint": "Ce serveur exige l'accès authentifié à Temba (/mcp)."}
+        # Private entries belong to the authenticated principal, regardless of labels.
         if not st.private and not self._visible(st, client_labels):
             return {
                 "tool_id": tool_id,
@@ -799,7 +894,10 @@ class Gateway:
                 while time.time() < deadline and st.status == "auth_required":
                     await asyncio.sleep(0.4)
             if st.status == "auth_required":
-                auth_url = f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket}" if st.login_ticket else f"{PUBLIC_BASE_URL}/auth"
+                if not st.login_ticket:
+                    return {"tool_id": tool_id, "ok": False, "auth_required": True,
+                            "hint": "Connexion en cours dans le navigateur ; termine-la puis réessaie."}
+                auth_url = f"{PUBLIC_BASE_URL}/auth?t={st.login_ticket}"
                 return {
                     "tool_id": tool_id,
                     "ok": False,
@@ -809,6 +907,11 @@ class Gateway:
                             f"{int(LOGIN_TICKET_TTL / 60)} min, ne concerne que ce serveur ; "
                             f"une fois le login fait, réessaie call_tool à l'identique",
                 }
+        if tool_name == "__temba_connect__":
+            return {"tool_id": tool_id, "ok": st.status == "ready", "status": st.status,
+                    "tools": [{"tool_id": f"{st.id}.{tool['name']}",
+                               "description": tool["description"], "input_schema": tool["input_schema"]}
+                              for tool in st.tools.values()]}
         if tool_name not in st.tools:
             return {"tool_id": tool_id, "ok": False, "error": f"tool inconnu sur '{server_id}'", "catalog": self.catalog(client_labels)}
         if st.session is None:
@@ -819,7 +922,8 @@ class Gateway:
                 "hint": "le serveur se reconnecte automatiquement, réessaie plus tard",
             }
         try:
-            async with asyncio.timeout(st.timeout or CALL_TIMEOUT):
+            # Serializing calls also prevents concurrent refresh-token rotation.
+            async with st.call_lock, asyncio.timeout(st.timeout or CALL_TIMEOUT):
                 res = await st.session.call_tool(tool_name, arguments or {})
             payload: dict[str, Any] = {
                 "tool_id": tool_id,
@@ -833,12 +937,67 @@ class Gateway:
             return {
                 "tool_id": tool_id,
                 "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": f"{type(exc).__name__}: upstream call failed",
                 "hint": "le serveur a peut-être été redémarré, relance tool_search puis réessaie",
             }
 
 
 _gateway: Gateway | None = None
+_user_gateways: dict[str, Gateway] = {}
+_user_gateway_lock = asyncio.Lock()
+_verifier = KeycloakTokenVerifier(AUTH_ISSUER, AUTH_AUDIENCE, PUBLIC_BASE_URL + "/mcp",
+                                allow_insecure_http=ALLOW_INSECURE_HTTP) if AUTH_ENABLED else None
+if AUTH_ENABLED and not AUTH_COOKIE_SECURE:
+    log.warning("Local HTTP development mode enabled: authentication traffic and cookies are not protected by TLS")
+_browser_login = BrowserLogin(_verifier, AUTH_BROWSER_CLIENT_ID, PUBLIC_BASE_URL + "/oidc/callback",
+                              os.getenv("AUTH_BROWSER_CLIENT_SECRET", "")) if AUTH_ENABLED else None
+_auth_settings = AuthSettings(issuer_url=AUTH_ISSUER, resource_server_url=PUBLIC_BASE_URL + "/mcp",
+                              required_scopes=AUTH_SCOPES, validate_token_resource=True) if AUTH_ENABLED else None
+
+
+@asynccontextmanager
+async def user_gateway():
+    if not AUTH_ENABLED:
+        yield _gateway
+        return
+    token = get_access_token()
+    if token is None or not token.subject or not token.claims or token.claims.get("iss") != AUTH_ISSUER:
+        raise PermissionError("An authenticated user is required")
+    owner = identity_key(AUTH_ISSUER, token.subject)
+    async with _user_gateway_lock:
+        view = _user_gateways.get(owner)
+        if view is None:
+            if len(_user_gateways) >= MAX_USER_GATEWAYS:
+                raise RuntimeError("Too many active users; retry later")
+            configs = [dict(st.cfg) for st in _gateway.states
+                       if not st.private or st.cfg.get("owner") == owner]
+            view = Gateway(os.getenv("REGISTRY_PATH", "registry.yaml"), owner, configs=configs)
+            _user_gateways[owner] = view
+            view.runner = asyncio.create_task(view.run(), name="user-gateway")
+        view.last_used = time.monotonic()
+        view.active_calls += 1
+    try:
+        await asyncio.wait_for(view.ready.wait(), 15)
+        if view.runner.done():
+            await view.runner
+        yield view
+    finally:
+        view.active_calls -= 1
+        view.last_used = time.monotonic()
+
+
+def auth_for_ticket(ticket: str):
+    for view in _user_gateways.values():
+        if view.auth.ticket_ok(ticket):
+            return view.auth
+    return None
+
+
+def auth_for_state(state: str):
+    for view in _user_gateways.values():
+        if state in view.auth.by_state:
+            return view.auth
+    return None
 
 
 def _client_labels(ctx) -> frozenset[str]:
@@ -853,10 +1012,26 @@ async def lifespan(_server):
     _gateway = Gateway(os.getenv("REGISTRY_PATH", "registry.yaml"))
     task = asyncio.create_task(_gateway.run())
     try:
+        await _gateway.ready.wait()
+        if task.done():
+            await task
         yield {"gateway": _gateway}
     finally:
+        for view in list(_user_gateways.values()):
+            await view.stop()
+            view.runner.cancel()
+            await asyncio.gather(view.runner, return_exceptions=True)
+        _user_gateways.clear()
+        if _browser_login:
+            _browser_login.pending.clear()
         await _gateway.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if _verifier:
+            await _verifier.client.aclose()
+        _TOKEN_MEMORY.clear()
+        _TOKEN_MEMORY_EXPIRY.clear()
+        _DYN_MEMORY.clear()
 
 
 mcp = MCPServer(
@@ -877,6 +1052,8 @@ mcp = MCPServer(
         + "Les erreurs 429/rate-limit sont transitoires : réessaie ou passe au tool alternatif proposé."
     ),
     lifespan=lifespan,
+    auth=_auth_settings,
+    token_verifier=_verifier,
 )
 
 
@@ -895,7 +1072,9 @@ async def tool_search(query: str, ctx: Context) -> str:
         résultat, la réponse contient 'catalog' (serveurs + leurs tools) pour
         reformuler la recherche.
     """
-    return json.dumps(await _gateway.search(query, _client_labels(ctx)), ensure_ascii=False, indent=2)
+    async with user_gateway() as view:
+        await _wait_catalog(view)
+        return json.dumps(await view.search(query, _client_labels(ctx)), ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -909,21 +1088,31 @@ async def call_tool(tool_id: str, arguments: dict = {}, ctx: Context = None) -> 
     Returns:
         JSON: {ok, content, structured_content?} — résultat de l'exécution.
     """
-    return json.dumps(await _gateway.call(tool_id, arguments, _client_labels(ctx)), ensure_ascii=False, indent=2)
+    async with user_gateway() as view:
+        if isinstance(tool_id, str) and tool_id.endswith(".__temba_connect__"):
+            st = next((st for st in view.states if st.id == tool_id.split(".", 1)[0]), None)
+            if st:
+                await _wait_ready(st, timeout=10)
+        return json.dumps(await view.call(tool_id, arguments, _client_labels(ctx)), ensure_ascii=False, indent=2)
 
 
 async def _assert_public_url(url: str) -> None:
     """Garde anti-SSRF pour add_mcp : refuse IP privées/loopback/link-local.
     Strict, sans exception : add_mcp = internet public, rien d'autre."""
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("url invalide (http/https attendu)")
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("url invalide (HTTPS sans credentials ni fragment attendu)")
     try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, None)
-    except socket.gaierror as exc:
-        raise ValueError(f"hôte introuvable: {parsed.hostname} ({exc})")
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+        addresses = [ipaddress.ip_address(parsed.hostname)]
+    except ValueError:
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, None)
+        except socket.gaierror as exc:
+            raise ValueError(f"hôte introuvable: {parsed.hostname}") from exc
+        addresses = [ipaddress.ip_address(info[4][0]) for info in infos]
+    if not addresses:
+        raise ValueError("hôte sans adresse")
+    for ip in addresses:
         if (
             ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified
@@ -940,14 +1129,20 @@ async def _wait_ready(st: ServerState, timeout: float = 30) -> None:
         await asyncio.sleep(0.3)
 
 
+async def _wait_catalog(view: Gateway) -> None:
+    deadline = time.monotonic() + 10
+    while any(st.status == "starting" for st in view.states) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+
+
 if ADD_MCP_ENABLED:
 
     @mcp.tool()
-    async def add_mcp(url: str, name: str = "", headers: dict = {}) -> str:
+    async def add_mcp(url: str, name: str = "", headers: dict = {}, ctx: Context = None) -> str:
         """Ajoute un MCP distant (streamable HTTP) pour étendre tes propres capacités.
 
         Le serveur est PRIVÉ : il n'apparaît pas dans le catalogue partagé, ses tools
-        ne sont utilisables que toi, via le server_key secret retourné (prefixe des
+        ne sont utilisables que par ton identité authentifiée, via le server_key (préfixe des
         tool_id). Il expire automatiquement (24h) : si ta session dure plus longtemps,
         ré-ajoute-le. Interdit aux adresses privées/internes. Si le MCP distant exige
         une authentification OAuth, le lien de login est fourni dans la réponse.
@@ -961,72 +1156,70 @@ if ADD_MCP_ENABLED:
             JSON: {server_key, tools: [{tool_id, description, input_schema}], expires_at}
             — appelle ces tools via call_tool avec leur tool_id.
         """
-        url = url.strip()
-        try:
-            await _assert_public_url(url)
-        except ValueError as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-        # Dé-dup : un même URL ne s'enregistre qu'une fois — si le MCP exige une
-        # authentification, on ne recrée PAS un flow, on réutilise le serveur
-        # existant et son ticket de login en attente.
-        st = next(
-            (s for s in _gateway.states
-             if s.private and s.cfg.get("url") == url and not (s.expires_at and s.expires_at <= time.time())),
-            None,
-        )
-        already = st is not None
-        if st is None:
-            key = f"p-{secrets.token_urlsafe(16)}"
-            if name:
-                safe = re.sub(r"[^a-z0-9-]", "-", name.lower())[:20].strip("-")
-                key = f"p-{safe}-{secrets.token_urlsafe(12)}" if safe else key
-            cfg = {
-                "id": key,
-                "url": url,
-                "transport": "http",
-                "private": True,
-                # OAuth dynamique activé par défaut : no-op si le MCP n'en a pas besoin,
-                # déclenche le flow (DCR + ticket de login) s'il répond 401.
-                "oauth": {},
-                "expires_at": time.time() + PRIVATE_SERVER_TTL,
-            }
-            if headers:
-                cfg["headers"] = headers
-            st = await _gateway.add_server(cfg)
-        await _wait_ready(st)
-        out = {
-            "ok": st.status in ("ready", "auth_required"),
-            "server_key": st.id,
-            "status": st.status,
-            "already_registered": already,
-            "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.expires_at)),
-            "note": (
-                f"SERVEUR PRIVÉ ET ÉPHÉMÈRE (suppression auto dans {int(PRIVATE_SERVER_TTL / 3600)}h). "
-                "Il n'apparaît JAMAIS dans tool_search ni dans le catalog. "
-                "NE relance PAS add_mcp pour ce serveur : garde ce server_key et appelle ses tools "
-                "directement via call_tool avec les tool_id ci-dessous."
-            ),
-        }
-        if st.status == "ready":
-            out["tools"] = [
-                {"tool_id": f"{st.id}.{t['name']}", "description": t["description"], "input_schema": t["input_schema"]}
-                for t in st.tools.values()
-            ]
-            out["next_step"] = "call_tool(tool_id='<server_key>.<tool_name>', arguments=...)"
-        elif st.status == "auth_required":
-            out["auth_required"] = True
-            out["hint"] = (
-                f"le MCP ajouté exige une authentification: demande à l'utilisateur d'ouvrir "
-                f"{_auth_page_url(st)}. Une fois le login effectué, réessaie call_tool avec les "
-                f"tool_id <server_key>.<tool> — n'appelle PAS add_mcp à nouveau."
+        async with user_gateway() as view:
+            url = url.strip()
+            try:
+                await _assert_public_url(url)
+            except ValueError as exc:
+                return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+            # Dé-dup : un même URL ne s'enregistre qu'une fois — si le MCP exige une
+            # authentification, on ne recrée PAS un flow, on réutilise le serveur
+            # existant et son ticket de login en attente.
+            st = next(
+                (s for s in view.states
+                 if s.private and s.cfg.get("owner") == view.owner and s.cfg.get("url") == url and not (s.expires_at and s.expires_at <= time.time())),
+                None,
             )
-        else:
-            out["error"] = f"connexion impossible: {st.error or st.status}"
-        return json.dumps(out, ensure_ascii=False, indent=2)
-
-
-def _server_by_id(server_id: str) -> ServerState | None:
-    return next((s for s in _gateway.states if s.id == server_id), None)
+            already = st is not None
+            if st is None:
+                key = f"p-{secrets.token_urlsafe(16)}"
+                if name:
+                    safe = re.sub(r"[^a-z0-9-]", "-", name.lower())[:20].strip("-")
+                    key = f"p-{safe}-{secrets.token_urlsafe(12)}" if safe else key
+                cfg = {
+                    "id": key,
+                    "url": url,
+                    "transport": "http",
+                    "private": True,
+                    "owner": view.owner,
+                    # OAuth dynamique activé par défaut : no-op si le MCP n'en a pas besoin,
+                    # déclenche le flow (DCR + ticket de login) s'il répond 401.
+                    "oauth": {},
+                    "expires_at": time.time() + PRIVATE_SERVER_TTL,
+                }
+                if headers:
+                    cfg["headers"] = headers
+                st = await view.add_server(cfg)
+            await _wait_ready(st)
+            out = {
+                "ok": st.status in ("ready", "auth_required"),
+                "server_key": st.id,
+                "status": st.status,
+                "already_registered": already,
+                "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.expires_at)),
+                "note": (
+                    f"SERVEUR PRIVÉ ET ÉPHÉMÈRE (suppression auto dans {int(PRIVATE_SERVER_TTL / 3600)}h). "
+                    "Il n'apparaît JAMAIS dans tool_search ni dans le catalog. "
+                    "NE relance PAS add_mcp pour ce serveur : garde ce server_key et appelle ses tools "
+                    "directement via call_tool avec les tool_id ci-dessous."
+                ),
+            }
+            if st.status == "ready":
+                out["tools"] = [
+                    {"tool_id": f"{st.id}.{t['name']}", "description": t["description"], "input_schema": t["input_schema"]}
+                    for t in st.tools.values()
+                ]
+                out["next_step"] = "call_tool(tool_id='<server_key>.<tool_name>', arguments=...)"
+            elif st.status == "auth_required":
+                out["auth_required"] = True
+                out["hint"] = (
+                    f"le MCP ajouté exige une authentification: demande à l'utilisateur d'ouvrir "
+                    f"{_auth_page_url(st)}. Une fois le login effectué, réessaie call_tool avec les "
+                    f"tool_id <server_key>.<tool> — n'appelle PAS add_mcp à nouveau."
+                )
+            else:
+                out["error"] = f"connexion impossible: {st.error or st.status}"
+            return json.dumps(out, ensure_ascii=False, indent=2)
 
 
 def _auth_page_url(st: ServerState) -> str:
@@ -1067,6 +1260,10 @@ async def admin_servers(request: Request) -> JSONResponse:
         return JSONResponse({"error": "'id' requis (a-z0-9-, 2-31 chars)"}, status_code=400)
     if not cfg["url"].startswith(("http://", "https://")):
         return JSONResponse({"error": "'url' requise (http/https)"}, status_code=400)
+    if body.get("access") is not None:
+        if body["access"] not in ("public", "authenticated"):
+            return JSONResponse({"error": "access must be public or authenticated"}, status_code=400)
+        cfg["access"] = body["access"]
     if body.get("labels"):
         if not isinstance(body["labels"], list) or not all(isinstance(l, str) for l in body["labels"]):
             return JSONResponse({"error": "'labels' doit être une liste de chaînes"}, status_code=400)
@@ -1105,63 +1302,191 @@ async def admin_delete_server(request: Request) -> JSONResponse:
     return JSONResponse({"deleted": request.path_params["server_id"]})
 
 
+AUTH_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                "X-Content-Type-Options": "nosniff"}
+
+
+def auth_html(body: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(body, status_code=status_code, headers=AUTH_HEADERS)
+
+
+def flow_cookie(state: str) -> str:
+    return "temba_oauth_" + hashlib.sha256(state.encode()).hexdigest()[:16]
+
+
 @mcp.custom_route("/auth", methods=["GET"])
 async def auth_page(request: Request) -> HTMLResponse:
-    """Page de login propre à une demande : accessible uniquement via le ticket
-    volant reçu dans le hint du LLM (?t=...). Sans ticket : refusé."""
     ticket = request.query_params.get("t", "")
-    st = _gateway.auth.server_for_ticket(ticket) if ticket else None
+    auth = auth_for_ticket(ticket)
+    st = auth.server_for_ticket(ticket) if auth else None
     if st is None:
-        return HTMLResponse(
-            "<html><head><meta charset='utf-8'><title>temba-mcp auth</title></head><body>"
-            "<p>Lien invalide ou expiré. Demande un nouveau lien à ton agent "
-            "(relance l'action qui nécessite ce serveur).</p></body></html>",
-            status_code=401,
-        )
-    ttl_min = int(LOGIN_TICKET_TTL / 60)
-    if st.status == "auth_required" and st.auth_url:
-        body = (
-            f"<p>Serveur <b>{st.id}</b> en attente d'authentification.</p>"
-            f"<p><a href='/auth/{st.id}/login?t={ticket}'>S'authentifier maintenant</a></p>"
-            f"<p><small>Ce lien est personnel et valable {ttl_min} min. "
-            f"Le compte avec lequel tu te connectes sera celui utilisé par le gateway pour ce serveur.</small></p>"
-        )
-    else:
-        body = f"<p>Le serveur <b>{st.id}</b> n'attend plus d'authentification (statut: {st.status}). Tu peux fermer cette page.</p>"
-    return HTMLResponse(
-        "<html><head><meta charset='utf-8'><title>temba-mcp auth</title></head><body>"
-        f"{body}</body></html>"
-    )
+        return auth_html("<p>Lien invalide ou expiré. Relance ton action dans l'agent.</p>", 401)
+    return auth_html(
+        f"<p>Connecter ton compte au serveur <b>{html.escape(st.id)}</b> "
+        f"({html.escape(urlparse(st.cfg['url']).netloc)}).</p>"
+        f"<p><a href='/auth/{html.escape(st.id, quote=True)}/login?t={html.escape(ticket, quote=True)}'>"
+        "S'authentifier maintenant</a></p>"
+        "<p>Ce compte sera utilisé pour tes appels uniquement. Ne partage pas ce lien.</p>")
 
 
 @mcp.custom_route("/auth/{server_id}/login", methods=["GET"])
 async def auth_login(request: Request) -> HTMLResponse | RedirectResponse:
-    st = _server_by_id(request.path_params["server_id"])
-    if st is None or not st.auth_url:
-        return HTMLResponse("<p>Aucun flow OAuth en attente pour ce serveur.</p>", status_code=404)
     ticket = request.query_params.get("t", "")
-    if not _gateway.auth.ticket_ok(ticket, st.id):
-        return HTMLResponse("<p>Lien invalide ou expiré. Demande un nouveau lien à ton agent.</p>", status_code=403)
-    return RedirectResponse(st.auth_url)
+    auth = auth_for_ticket(ticket)
+    if not auth or not auth.ticket_ok(ticket, request.path_params["server_id"]):
+        return auth_html("<p>Lien invalide ou expiré.</p>", 403)
+    result = auth.begin_login(ticket)
+    if not result:
+        return auth_html("<p>Lien invalide ou expiré.</p>", 403)
+    st, downstream_state, downstream_browser = result
+    try:
+        state, browser, url = await _browser_login.begin(auth.gateway.owner, auth, downstream_state, downstream_browser)
+    except Exception:
+        auth.abort(st.id)
+        return auth_html("<p>Connexion SSO indisponible. Relance ton action.</p>", 503)
+    response = RedirectResponse(url, headers=AUTH_HEADERS)
+    response.set_cookie(flow_cookie(state), browser, max_age=600,
+                        httponly=True, secure=AUTH_COOKIE_SECURE, samesite="lax", path="/oidc/callback")
+    return response
+
+
+@mcp.custom_route("/oidc/callback", methods=["GET"])
+async def oidc_callback(request: Request) -> HTMLResponse | RedirectResponse:
+    state = request.query_params.get("state", "")
+    code = request.query_params.get("code", "")
+    result = await _browser_login.complete(state, request.cookies.get(flow_cookie(state), ""), code,
+                                            request.query_params.get("iss")) if _browser_login and code else None
+    if not result:
+        return auth_html("<p>Connexion SSO invalide ou identité différente de celle de l'agent. Relance ton action.</p>", 403)
+    st, entry = result
+    response = RedirectResponse(st.auth_url, headers=AUTH_HEADERS)
+    response.set_cookie(flow_cookie(entry["downstream_state"]), entry["downstream_browser"],
+                        max_age=max(1, int(entry["exp"] - time.time())), httponly=True,
+                        secure=AUTH_COOKIE_SECURE, samesite="lax", path="/oauth/callback")
+    response.delete_cookie(flow_cookie(state), path="/oidc/callback", secure=AUTH_COOKIE_SECURE, httponly=True, samesite="lax")
+    return response
 
 
 @mcp.custom_route("/oauth/callback", methods=["GET"])
 async def oauth_callback(request: Request) -> HTMLResponse:
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    if not code or not state or not _gateway.auth.complete(code, state):
-        return HTMLResponse("<p>Callback OAuth invalide ou expiré.</p>", status_code=400)
-    return HTMLResponse(
-        "<p>Autorisation enregistrée — le gateway termine la connexion (quelques secondes). "
-        "Retourne dans ton agent et relance ton action, tu peux fermer cette page.</p>"
-    )
+    state = request.query_params.get("state", "")
+    code = request.query_params.get("code", "")
+    auth = auth_for_state(state)
+    browser = request.cookies.get(flow_cookie(state), "")
+    if not code or not auth or not auth.complete(code, state, browser, request.query_params.get("iss")):
+        return auth_html("<p>Callback OAuth invalide ou expiré.</p>", 400)
+    response = auth_html("<p>Le gateway termine la connexion. Retourne dans ton agent et relance ton action.</p>")
+    response.delete_cookie(flow_cookie(state), path="/oauth/callback", secure=AUTH_COOKIE_SECURE, httponly=True, samesite="lax")
+    return response
+
+
+public_mcp = MCPServer("temba-mcp-public", instructions=(
+    "Les outils publics sont accessibles immédiatement. tool_search peut aussi renvoyer protected_servers : "
+    "pour utiliser un de ces serveurs, suis son hint avec call_tool ; le client gère la connexion SSO. "
+    "Une fois connecté, recherche les outils du serveur et suis ses éventuelles instructions OAuth."))
+if ADD_MCP_ENABLED:
+    public_mcp.tool(name="add_mcp")(add_mcp)
+
+
+@public_mcp.tool(name="tool_search")
+async def public_tool_search(query: str, ctx: Context) -> str:
+    """Cherche les outils des MCP sans authentification."""
+    await _wait_catalog(_gateway)
+    payload = await _gateway.search(query, _client_labels(ctx))
+    protected = {st.id: {
+        "status": "temba_auth_required" if AUTH_ENABLED else "disabled",
+        "hint": (f"Pour utiliser ce serveur, appelle call_tool(tool_id='{st.id}.__temba_connect__'). "
+                 "Le client déclenchera la connexion SSO, puis tu pourras rechercher ses outils."
+                 if AUTH_ENABLED else "L'administrateur doit activer l'accès authentifié à Temba.")}
+        for st in _gateway.states if not st.private and not public_server(st.cfg)
+        and (not st.labels or bool(st.labels & _client_labels(ctx)))}
+    if protected:
+        payload["protected_servers"] = protected
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+@public_mcp.tool(name="call_tool")
+async def public_call_tool(tool_id: str, arguments: dict = {}, ctx: Context = None) -> str:
+    """Exécute uniquement un outil d'un MCP sans credentials."""
+    return json.dumps(await _gateway.call(tool_id, arguments, _client_labels(ctx)), ensure_ascii=False, indent=2)
+
+
+class CatalogRouter:
+    """Authenticate only requests that need a protected catalog entry.
+
+    Inspection never executes tools. Both paths retain the SDK's JSON-RPC validation;
+    protected requests retain its bearer/scope/resource validation and 401 challenge.
+    """
+    def __init__(self, public, protected, max_body_size: int):
+        self.public, self.protected, self.max_body_size = public, protected, max_body_size
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") != "/mcp":
+            return await self.protected(scope, receive, send)
+        if any(key.lower() == b"authorization" for key, _ in scope.get("headers", [])):
+            return await self.protected(scope, receive, send)
+        messages, body = [], bytearray()
+        if scope["method"] == "POST":
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                messages.append(message)
+                body.extend(message.get("body", b""))
+                if len(body) > self.max_body_size:
+                    return await JSONResponse({"error": "request too large"}, status_code=413)(scope, receive, send)
+                if not message.get("more_body", False):
+                    break
+        protected = False
+        try:
+            request = json.loads(body) if body else {}
+            if isinstance(request, dict) and request.get("method") == "tools/call":
+                params = request.get("params") or {}
+                if isinstance(params, dict):
+                    protected = params.get("name") == "add_mcp"
+                    arguments = params.get("arguments") or {}
+                    if params.get("name") == "call_tool" and isinstance(arguments, dict):
+                        tool_id = arguments.get("tool_id")
+                        if isinstance(tool_id, str):
+                            sid = tool_id.split(".", 1)[0]
+                            st = next((st for st in _gateway.states if st.id == sid), None)
+                            protected = st is not None and not public_server(st.cfg)
+        except (ValueError, TypeError):
+            pass  # SDK returns its normal validation error for malformed JSON.
+
+        async def replay():
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        if protected and not AUTH_ENABLED:
+            return await JSONResponse({"error": "Protected MCP access is not configured"}, status_code=403)(scope, replay, send)
+        return await (self.protected if protected else self.public)(scope, replay, send)
+
+
+def build_app(**transport_options):
+    """One client URL: /mcp. Keycloak is requested only for protected calls."""
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+    protected = mcp.streamable_http_app(stateless_http=True, **transport_options)
+    public = public_mcp.streamable_http_app(stateless_http=True, **transport_options)
+
+    @asynccontextmanager
+    async def combined_lifespan(app):
+        async with protected.router.lifespan_context(protected), public.router.lifespan_context(public):
+            yield
+
+    router = CatalogRouter(public, protected, transport_options.get("max_request_body_size", 1048576))
+    return Starlette(routes=[Mount("/", app=router)], lifespan=combined_lifespan)
 
 
 if __name__ == "__main__":
+    import uvicorn
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    mcp.run(
-        "streamable-http",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8080")),
-        stateless_http=True,
+    # OAuth codes and login tickets are in query strings. Do not log access URLs.
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    uvicorn.run(
+        build_app(host=os.getenv("HOST", "0.0.0.0")),
+        host=os.getenv("HOST", "0.0.0.0"), port=PORT, access_log=False,
     )

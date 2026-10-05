@@ -1,4 +1,27 @@
-replicaCount: 2
+# OAuth flows currently require one process. More replicas are rejected by the chart.
+replicaCount: 1
+
+auth:
+  enabled: false # Public MCPs work without Keycloak; enable to access credentialed MCPs
+  issuer: "" # Required: https://keycloak.example.com/realms/company
+  audience: "temba-mcp" # Keycloak audience mapper, NOT the OpenCode client ID
+  scopes: ["temba:use"]
+  browserClientId: temba-login # Keycloak public client; fixed /oidc/callback, S256 PKCE
+  browserClientSecretName: "" # Optional confidential client secret
+  browserClientSecretKey: client-secret
+
+security:
+  allowInsecureHttp: false # Dev only: permit Temba HTTP on localhost, 127.0.0.1 or ::1; Keycloak still requires TLS
+  userIdleTtl: 3600
+  maxUserGateways: 128
+
+  # Politique réseau egress : nécessite un CNI qui applique les
+  # NetworkPolicy (Calico/Cilium). Internet public uniquement + MCP internes
+  # déclarés ci-dessous + CIDR internes explicites (VPN...).
+  networkPolicy:
+    enabled: true # WARNING ! LEAVE THIS ENABLE when using `allowNewMcpRegisteringByLlm: true`
+    internalMcpPods: []   # ex: [mcp-grafana, mcp-atlassian] si extra-mcp/ appliqué
+    internalCidrs: []     # ex: 10.30.0.0/16 (VPN numspot pour grafana interne)
 
 image:
   repository: python
@@ -84,25 +107,6 @@ embeddings:
 # ---------------------- Misc ---------------------------
   
 
-# Politique réseau egress (opt-in) : nécessite un CNI qui applique les
-# NetworkPolicy (Calico/Cilium). Internet public uniquement + MCP internes
-# déclarés ci-dessous + CIDR internes explicites (VPN...).
-networkPolicy:
-  enabled: true # WARNING ! LEAVE THIS ENABLE when using `allowNewMcpRegisteringByLlm: true`
-  internalMcpPods: []   # ex: [mcp-grafana, mcp-atlassian] si extra-mcp/ appliqué
-  internalCidrs: []     # ex: 10.30.0.0/16 (VPN numspot pour grafana interne)
-
-
-redis:
-  url: "" # Leave empty for default: redis://<release>-redis:6379/0
-  resources:
-    requests: { cpu: 50m, memory: 64Mi }
-    limits: { memory: 256Mi }
-  persistence:
-    enabled: false   # PVC pour survivre à la suppression du pod redis
-    size: 1Gi
-
-
 service:
   type: ClusterIP
   port: 8080
@@ -111,4 +115,3 @@ service:
 resources:
   requests: { cpu: 100m, memory: 256Mi }
   limits: { memory: 1Gi }
-

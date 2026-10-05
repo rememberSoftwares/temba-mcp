@@ -12,5 +12,6 @@ temba-mcp est déployé (release {{ .Release.Name }}).
 3. OAuth : au premier usage d'un serveur oauth: {} , le LLM renvoie un lien
    personnel /auth?t=... à ouvrir dans le navigateur (valable 15 min).
 
-4. Multi-réplicas : état partagé dans Redis (tokens OAuth + serveurs
-   dynamiques). Réplication par pub/sub entre réplicas.
+4. Une seule réplique / un seul process : tokens OAuth et catalogue dynamique
+   uniquement en mémoire. Un redémarrage nécessite de reconnecter les MCP OAuth
+   et de recréer les entrées dynamiques. Le catalogue Helm reste disponible.

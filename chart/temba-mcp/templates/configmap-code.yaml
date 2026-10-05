@@ -7,3 +7,6 @@ metadata:
 data:
   server.py: |-
 {{ .Files.Get "files/server.py" | indent 4 }}
+
+  security.py: |-
+{{ .Files.Get "files/security.py" | indent 4 }}
