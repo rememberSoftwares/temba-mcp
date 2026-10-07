@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "temba-client"
+version = "1.0.1"
+description = "Local Rust MCP client with RAM-only OAuth sessions"
+requires-python = ">=3.9"
+readme = "README.md"
+license = "MIT"
+
+[tool.maturin]
+manifest-path = "crates/temba-client/Cargo.toml"
+bindings = "bin"
+strip = true

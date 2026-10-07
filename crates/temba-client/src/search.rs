@@ -1,0 +1,47 @@
+//! Small local BM25 index; no embedding service or remote search requests.
+use std::collections::HashMap;
+pub fn words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+pub fn scores(query: &str, documents: &[String]) -> Vec<f64> {
+    let q = words(query);
+    let docs: Vec<_> = documents.iter().map(|s| words(s)).collect();
+    let average =
+        (docs.iter().map(Vec::len).sum::<usize>() as f64 / docs.len().max(1) as f64).max(1.);
+    let mut df = HashMap::new();
+    for word in &q {
+        df.entry(word)
+            .or_insert_with(|| docs.iter().filter(|d| d.contains(word)).count() as f64);
+    }
+    docs.iter()
+        .map(|d| {
+            q.iter()
+                .map(|w| {
+                    let n = *df.get(w).unwrap();
+                    let tf = d.iter().filter(|v| *v == w).count() as f64;
+                    let idf = (1. + (docs.len() as f64 - n + 0.5) / (n + 0.5)).ln();
+                    idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * d.len() as f64 / average))
+                })
+                .sum()
+        })
+        .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ranks_relevant_tools() {
+        let s = scores(
+            "jira tickets",
+            &[
+                "jira search tickets issues".into(),
+                "grafana dashboards".into(),
+            ],
+        );
+        assert!(s[0] > s[1]);
+        assert_eq!(s[1], 0.);
+    }
+}

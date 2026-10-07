@@ -1,0 +1,27 @@
+{{- if .Values.security.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "temba.name" . }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "temba.selector" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    {{- if .Values.auth.enabled }}
+    - to:
+      {{- range .Values.security.networkPolicy.authCidrs }}
+        - ipBlock: {cidr: {{ . | quote }}}
+      {{- end }}
+      ports: [{protocol: TCP, port: 443}]
+    {{- end }}
+{{- end }}

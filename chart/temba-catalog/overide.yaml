@@ -1,0 +1,21 @@
+# Local migration: keep the existing Keycloak audience mapper; no custom scope.
+auth:
+  enabled: true
+  clientId: temba
+  audience: temba-mcp
+  issuer: https://auth.m.space-e2bd42e8.hcp.cloudgouv-eu-west-1.numspot.com/realms/master
+  jwksUri: https://auth.m.space-e2bd42e8.hcp.cloudgouv-eu-west-1.numspot.com/realms/master/protocol/openid-connect/certs
+  tokenEndpoint: https://auth.m.space-e2bd42e8.hcp.cloudgouv-eu-west-1.numspot.com/realms/master/protocol/openid-connect/token
+catalog:
+  servers:
+    - id: jira
+      name: Jira
+      description: Search Jira tickets and projects through the Atlassian remote MCP
+      url: https://mcp.atlassian.com/v2/mcp?tools=all
+      labels: [jira]
+      auth:
+        type: oauth
+        allowedOrigins: [https://auth.atlassian.com]
+      catalogAccess: public
+# Grafana is omitted until its HTTPS ingress is configured. Its token belongs in
+# a workstation environment variable, never in the catalog deployment.

@@ -1,495 +1,157 @@
-# Temba-mcp
+# Temba
 
-Temba is an MCP gateway that exposes a catalog of remote MCP servers for the LLM to discover.
+Temba est composé d’un **catalogue REST central** et d’un **MCP local en Rust**. Le catalogue fournit les adresses et les descriptions des MCP distants. Le client local recherche leurs outils et les appelle directement, via leurs ingress HTTPS.
 
-**Classic MCP pain points:**
-* Adding a single MCP server can easily cost more than 20.000 tokens each => Induces lag, expense, degraded answers
-* Adding/removing MCP servers is a manual process that requires upgrading config file each time => Painfull as an admin
-* Near futur will probably force us to deal with 40+ MCP servers on a daily basis hence making above pain points untolerable.
+Les tokens OAuth des MCP distants restent **uniquement en RAM sur le poste utilisateur**. Le catalogue ne les reçoit pas, ne les renouvelle pas et ne proxifie aucun appel métier. Fermer le processus local supprime ses sessions ; une nouvelle authentification sera nécessaire au prochain lancement.
 
-**How temba saves the day ?** 🎉
-
-Temba provides a search tools capability so that the LLM loads only the tools it needs.  
-Agents no longer load 70 tools at boot: they search by keywords, receive the matching tools along with their JSON Schema, and execute them through the gateway.  
-Your context window will stay light and fast to process. Admins can administer the catalogue for the whole organisation with ease.  
-
-**Features list:**
-* 🔍 LLM can search tools in a tool catalog
-* 🤖 LLM can add new MCPs to it's own catalog on the go (optionnal feature flag)
-* 🔌 Admins can dynamically add tools using the API
-* 🏷️ Admins can select what tools can be discovered to clients through labels (not a security feature though)
-
-## ⚙️ How it works
-
-Temba exposes 3 tools (`tool_search`, `call_tool`, optional `add_mcp`) and aggregates a catalog of remote MCP servers (streamable HTTP) on demand.  
-
-```
-opencode / agents ──HTTP──> temba-mcp (2-3 tools) ──HTTP──> remote MCP servers
-                            │__tool_search → index (BM25 or embeddings)
-                            │__call_tool   → tools/call routed to the source MCP
-                            │__add_mcp     → private ephemeral server (24h)
-                            
+```text
+OpenCode ── stdio ── temba-client ── HTTPS ── MCP Jira / Grafana / …
+                          │
+                          └── HTTPS ── temba-catalog (définitions uniquement)
 ```
 
-## 🚀 Deploying on k8s
+## Utilisation
 
-Public MCPs can run without Keycloak. By default, `auth.enabled: false` starts
-Temba in public-only mode. Only servers without configured headers, OAuth,
-embedded URL credentials or a private owner are accessible.
+Le client est distribué sous forme de wheels contenant un binaire Rust précompilé. L’utilisateur installe `uv`, qui fournit la commande `uvx` ; il n’a pas besoin de Rust, Cargo ou d’un compilateur. Python est provisionné par uv si nécessaire pour le lanceur du wheel.
 
-All clients configure **one URL: `/mcp`**. They do not choose an endpoint based on
-the upstream server's authentication mode. Temba routes each request internally.
-Anonymous initialization, discovery and calls to public servers do not contact
-Keycloak, even when the catalog also contains protected servers.
-
-## Catalog authentication modes
-
-| MCP type | Catalog configuration | What the user does | Account used upstream |
-| --- | --- | --- | --- |
-| No authentication | URL only; no OAuth or credential headers | Calls tools immediately, without SSO | No credentials |
-| Static token | Administrator sets that server's `headers`, using Secret references | Connects to Temba's SSO when this protected server is requested | Organization account associated with that server's token |
-| OAuth/OIDC provider | Administrator sets `oauth: {}` | Connects to Temba's SSO, then authorizes their own provider account through the login link | Personal provider account, isolated by Temba identity |
-
-The upstream authentication type and the user's identity at Temba are separate.
-A static catalog token authenticates Temba to Jira/GitLab; it does not identify the
-human using Temba. That is why credentialed servers require Temba SSO before their
-credentials can be used. **Personal static tokens passed from OpenCode through
-Temba are not supported yet.** A credentialless internal server may also be
-restricted explicitly with `access: authenticated`.
-
-Anonymous `tool_search` returns public tools and, subject to catalog labels, names
-of protected servers with a connection hint. When the agent requests one of those
-servers, the HTTP endpoint returns the standard MCP OAuth **401 challenge**. An
-OAuth-capable client handles the Temba login and retries with its access token.
-The user configures no extra URL, GUID or per-service token in the Temba connection.
-The reserved `call_tool` name `<server_id>.__temba_connect__` lets the agent start
-this transition before the provider's real tool names are available; it returns
-provider login instructions or the available tool schemas, without executing an
-upstream action. Actual client-side retry behavior is part of the pending
-OpenCode/Keycloak integration validation.
-
-If Keycloak is not configured, public servers keep working; attempts to use
-protected entries are refused. Supplying an invalid/expired bearer token never
-silently downgrades the request to anonymous access.
-
-## Enabling protected catalog access
-
-To enable credentialed MCPs, configure Keycloak and HTTPS first:
-
-```yaml
-publicBaseUrl: https://temba.example.com
-replicaCount: 1
-auth:
-  enabled: true
-  issuer: https://keycloak.example.com/realms/company
-  audience: temba-mcp
-  scopes: [temba:use]
-  browserClientId: temba-login
-```
+Le package n’est pas encore publié. Avec un wheel fourni par la CI ou construit localement :
 
 ```sh
-helm upgrade --install temba-mcp ./chart/temba-mcp -f production-values.yaml
+uvx --from /chemin/temba_client-1.0.1-…whl temba-client --config /chemin/temba.toml
 ```
 
-With `auth.enabled: true`, missing issuer/HTTPS configuration prevents startup
-(except for the explicit local HTTP development option below);
-protected calls never fall back to anonymous access. With authentication
-disabled, token-authenticated and OAuth servers stay inaccessible. You can also
-restrict a credentialless server with `access: authenticated`. Setting
-`access: public` does not override the protections on a credentialed server.
-
-For local development without an HTTPS reverse proxy, use:
-
-```yaml
-ingress:
-  enabled: false
-publicBaseUrl: http://localhost:8080
-security:
-  allowInsecureHttp: true
-auth:
-  enabled: true
-  issuer: https://keycloak.example.com/realms/company
-  audience: temba-mcp
-  scopes: [temba:use]
-  browserClientId: temba-login
-```
-
-Expose the gateway with `kubectl port-forward service/temba-mcp 8080:8080`
-(replace the service name with your Helm release name). Register exactly
-`http://localhost:8080/oidc/callback` as the `temba-login` client's valid redirect
-URI in Keycloak. Root URL, Home URL, post-logout redirect URIs and Web origins
-can remain empty. OpenCode's callback belongs to its separate client.
-
-Enabling `security.allowInsecureHttp` only permits Temba HTTP
-on `localhost`, `127.0.0.1` or `::1`. Use the same host and port in the client URL,
-`publicBaseUrl` and Keycloak redirect URI. In HTTP mode, login cookies retain
-HttpOnly and SameSite=Lax but omit Secure; bearer tokens and cookies travel without
-TLS. Use this only for local development. HTTPS URLs keep Secure cookies even
-when the option is enabled. Keycloak issuer/discovery endpoints, upstream OAuth
-requirements remain enforced.
-
-Only **one gateway replica/process** is supported in this version. The chart rejects
-other replica counts and uses `Recreate` to avoid concurrent OAuth owners during
-upgrades. All runtime state lives in memory: a restart requires restarting login
-flows, reconnecting personal OAuth providers and recreating dynamic catalog entries.
-The static catalog configured through Helm remains available.
-
-
-Example opencode client MCP config (in `~/.config/opencode/opencode.json`):
-
-```json
-"temba-mcp": {
-  "type": "remote",
-  "url": "http(s)://<temba-url>/mcp",
-  "headers": { "X-Temba-Labels": "see-labels-section-bellow" }
-}
-```
-
-## 📚 Adding MCPs to the catalogue
-
-The catalog is where you'll add remote MCP URLs that will be proxified by Temba.  
-Each tool added to the catalog will be made available to any LLMs that look for it.  
-
-### Catalog using infrastructure as code
-
-The IAC catalog is declared in `values.yaml` (`catalog.servers`).
-
-ie for DeepWiki:
-```yaml
-catalog:
-  servers:
-    - id: deepwiki
-      url: https://mcp.deepwiki.com/mcp
-      timeout: 45                  # seconds, optional
-      labels: [docs]               # optional: restricted visibility (see below)
-      headers: {}                  # optional, ${VAR} interpolated from pod env
-      oauth: {}                    # optional: dynamic OAuth (DCR + PKCE); {} = dynamic
-```
-
-### Catalog using REST API
-
-The catalog can be managed by API so admins can programmatically list, add or remove tools on the fly.
-
-First you'll need the temba's API token (auto-generated by the chart as `<release>-admin` when `adminApi.secretName` is empty):
+Après publication du package, la commande sera :
 
 ```sh
-export TOKEN=$(kubectl get secret temba-mcp-admin -o jsonpath='{.data.ADMIN_API_TOKEN}' | base64 -d)
+uvx --from temba-client==1.0.1 temba-client --config /chemin/temba.toml
 ```
 
-
-#### Add a new MCP to the catalog
-
-```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"id": "mcp-name-or-whatever", "url": "https://…/mcp", "labels": ["team-x"], "headers": {"Authorization": "Bearer ${…}"}}' \
-  http://<temba-url>/servers
-```
-:information_source: Added servers join the catalog shared by **all** authorized LLM clients
-
-
-#### Delete an MCP server
-
-```sh
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://<temba-url>/servers/<mcp-name-used-during-registration>
-```
-
-#### List current MCP servers
-
-```sh
-curl -H "Authorization: Bearer $TOKEN" http://<temba-url>/servers
-```
+Copier [temba.example.toml](temba.example.toml) et adapter `catalog_url`. Exemple de configuration OpenCode pour un wheel local :
 
 ```json
 {
-  "servers": [
-    {
-      "id": "mcp-name-or-whatever",
-      "status": "ready",
-      "labels": ["team-x"],
-      "private": false,
-      "tools": 8,
-      "expires_at": null,
-      "error": null
+  "mcp": {
+    "temba": {
+      "type": "local",
+      "command": ["uvx", "--from", "/chemin/temba_client-1.0.1-…whl", "temba-client", "--config", "/chemin/temba.toml"],
+      "enabled": true
     }
-  ]
+  }
 }
 ```
 
-status is one of `starting` | `ready` | `error` | `auth_required`.
+Utiliser des chemins absolus : le répertoire de travail d’OpenCode dépend du projet ouvert. Le client expose deux outils :
 
+- `tool_search` : recherche BM25 locale, schémas des outils et état de chaque connexion.
+- `call_tool` : exécute un `tool_id` retourné par la recherche.
 
-## 🔐 Adding Oauth MCPs to the catalog
+Chaque nouvelle livraison du client doit avoir une version et un nom de wheel distincts : remplacer un wheel au même chemin peut laisser `uvx` utiliser son ancien binaire en cache. Après une mise à jour, modifier le chemin dans OpenCode et relancer OpenCode pour recharger le processus MCP.
 
-MCPs protected by OAuth 2.1 (MCP auth spec) are supported out of the box:  
-The gateway acts as the provider's OAuth client and delegates login to the
-corresponding authenticated user through a one-time link. Provider client
-registration uses **dynamic client registration** (RFC 7591) where supported.
-Temba's own Keycloak authentication is configured separately below.
+Un serveur nécessitant une connexion propose `jira.__temba_connect__`. L’action ouvre le navigateur et renvoie rapidement `auth_in_progress` avec un lien local de secours. Terminer l’autorisation, puis relancer la recherche. Les callbacks écoutent uniquement sur `127.0.0.1` ; ils expirent après dix minutes et ne fonctionnent qu’une fois.
 
-### Example 1 - IaC (values.yaml)
+`jira.__temba_disconnect__` ferme cette connexion et supprime ses credentials OAuth. `__catalog__.__temba_disconnect__` ferme toutes les connexions et termine la session du catalogue. Les journaux vont sur stderr, avec le nom des MCP et une progression comme `MCP jira: ready (2/4)` ; stdout est réservé au protocole MCP.
+
+## Trois types de MCP
+
+| Type | Définition dans le catalogue | Comportement local |
+|---|---|---|
+| Sans authentification | `auth: {type: none}` | Connexion directe, sans Keycloak |
+| Token statique | `auth: {type: token}` | Token lu dans une variable d’environnement du poste, associée à une URL exacte |
+| OAuth / OIDC | `auth: {type: oauth}` | Connexion navigateur directe au fournisseur distant, PKCE S256, access et refresh tokens en RAM |
+
+Exemple de catalogue :
 
 ```yaml
-catalog:
-  servers:
-    - id: jira
-      # Atlassian-hosted Jira MCP (?tools=all exposes the full flat tool list)
-      url: https://mcp.atlassian.com/v2/mcp?tools=all
-      oauth: {}       # dynamic client registration (DCR + PKCE) — no creds needed
-      # only optional key: oauth: {scope: "read:jira-work read:jira-user"}
+schemaVersion: 1
+servers:
+  - id: docs
+    url: https://docs-mcp.example.com/mcp
+    auth: {type: none}
+  - id: grafana
+    url: https://grafana-mcp.example.com/mcp
+    labels: [observability]
+    auth: {type: token, headerName: Authorization, prefix: "Bearer "}
+  - id: jira
+    name: Jira
+    description: Search Jira tickets and projects
+    url: https://mcp.atlassian.com/v2/mcp?tools=all
+    labels: [jira]
+    auth: {type: oauth, allowedOrigins: ["https://auth.atlassian.com"]}
 ```
 
-Then `helm upgrade --install temba-mcp ./chart/temba-mcp`.
+Pour Grafana, ajouter dans **le fichier local** :
 
-### Example 2 - REST API
+```toml
+[credentials.grafana]
+token_env = "GRAFANA_MCP_TOKEN"
+expected_endpoint = "https://grafana-mcp.example.com/mcp"
+```
+
+La variable est fournie à l’environnement du processus local. Elle ne figure jamais dans le catalogue. Si l’URL change, le client refuse d’envoyer le token tant que l’URL approuvée n’a pas été modifiée localement. Un token Grafana n’est jamais ajouté aux requêtes Jira. Les redirections HTTP sont désactivées.
+
+Pour un fournisseur OAuth sans enregistrement dynamique de client (DCR), renseigner `auth.clientId` et `auth.callbackPort`, puis enregistrer la redirect URI `http://127.0.0.1:PORT/oauth/callback` chez ce fournisseur. `auth.scopes` permet de demander les permissions propres au MCP distant. Cela ne crée aucune contrainte de scope Temba.
+
+La découverte OAuth est limitée à l’origine du MCP. Si le serveur d’autorisation utilise une autre origine, l’administrateur doit l’ajouter explicitement dans `auth.allowedOrigins`, par exemple `["https://auth.example.com"]`. Toutes ces adresses doivent être en HTTPS. Les tokens sont rafraîchis à la demande, sous verrou par session, avec une marge adaptée à leur durée de vie.
+
+`labels` filtre localement les définitions, la recherche et les appels. Ce filtre facilite l’usage ; ce n’est pas une règle d’autorisation serveur.
+
+## Catalogue et Keycloak
+
+Le catalogue est public par défaut : **Keycloak est optionnel**, même pour une définition de MCP distant OAuth. L’authentification au catalogue et celle à Jira sont indépendantes.
+
+Pour protéger certaines définitions, activer `auth.enabled` dans la chart et marquer ces serveurs `catalogAccess: authenticated`. Les autres restent `public`. Le client local peut se connecter au catalogue via `__catalog__.__temba_connect__`.
+
+Configuration du client Keycloak :
+
+- Client public (`Client authentication: Off`), Standard flow activé, PKCE S256 requis.
+- Redirect URI exacte : `http://127.0.0.1:19877/oauth/callback` (port configurable dans la chart).
+- Audience des access tokens : celle de `auth.audience`, par défaut `temba-mcp`. Le mapper d’audience existant peut être conservé.
+- **Aucun scope personnalisé `temba:use` n’est requis ou vérifié.** Le login demande seulement le scope OIDC standard `openid`.
+
+Les anciens callbacks `/session/callback` et `/oidc/callback` ne sont plus utilisés. Root URL, Home URL, post-logout redirect URIs et Web origins ne sont pas nécessaires pour ce client natif. L’échange du code se fait localement avec PKCE, sans secret client.
+
+Le catalogue vérifie signature RS256, issuer, audience, expiration, `nbf`, sujet et type de token d’accès. Les overrides `auth.jwksUri` et `auth.tokenEndpoint` restent possibles si la découverte Keycloak annonce de mauvaises URLs : HTTPS et même origine que l’issuer sont obligatoires.
+
+## Déploiement du catalogue
 
 ```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"id": "jira", "url": "https://mcp.atlassian.com/v2/mcp?tools=all", "oauth": {}}' \
-  http://<temba-url>/servers
+nerdctl build -t temba-catalog:1.0.0 .
+minikube image load temba-catalog:1.0.0
+helm upgrade --install temba chart/temba-catalog -f chart/temba-catalog/overide.yaml --reset-values
+kubectl port-forward service/temba 18080:8080
 ```
 
-### Token-authenticated MCPs and header routing
+La surcharge fournie conserve l’issuer et le client Keycloak `temba` de l’environnement de développement. Elle publie Jira ; **Grafana devra être ajouté avec son ingress HTTPS**, car l’adresse Kubernetes `http://mcp-grafana:8000/mcp` n’est pas accessible depuis les postes.
 
-Incoming OpenCode headers are **not forwarded** to upstream MCPs. Each outbound
-connection receives only the headers declared in that server's own catalog entry:
+En développement, le fichier TOML peut utiliser `catalog_url = "http://127.0.0.1:18080"` et `allow_loopback_http = true`. En production, utiliser un ingress HTTPS pour le catalogue et chacun des MCP distants. `security.allowLoopbackHttp` dans la chart autorise uniquement des définitions HTTP de loopback pour les tests ; il n’autorise pas un serveur HTTP distant arbitraire. La terminaison TLS du catalogue est assurée par l’ingress.
 
-```yaml
-catalog:
-  servers:
-    - id: jira-token
-      url: https://jira-mcp.example.com/mcp
-      headers:
-        Authorization: Bearer ${JIRA_MCP_TOKEN}
-    - id: gitlab-token
-      url: https://gitlab-mcp.example.com/mcp
-      headers:
-        Authorization: Bearer ${GITLAB_MCP_TOKEN}
-```
+Endpoints :
 
-`JIRA_MCP_TOKEN` goes only to `jira-token`; `GITLAB_MCP_TOKEN` goes only to
-`gitlab-token`. Supply these environment variables via Kubernetes Secret references.
-Anonymous clients cannot use these servers. After authentication to Temba, such
-catalog credentials represent an **organization account shared by authorized users**;
-they are not personal credentials.
+| Route | Accès |
+|---|---|
+| `/healthz`, `/readyz` | Sondes |
+| `/v1/bootstrap` | Public, paramètres OAuth non secrets |
+| `/v1/catalog` | Définitions publiques, puis protégées si bearer valide ; ETag et cache privé |
+| `/v1/admin/servers` GET | Bearer administratif, liste des définitions |
+| `/v1/admin/servers` POST | Ajout temporaire si `adminApi.mutable: true` |
+| `/v1/admin/servers/{id}` DELETE | Suppression d’un ajout temporaire |
 
-An `Authorization` header in OpenCode's **Temba** connection authenticates that
-connection to Temba. A Jira token placed there will not authenticate Jira; on the
-authenticated request it fails Keycloak validation. Personal static-token routing from
-OpenCode through Temba is not implemented. Do not put several unrelated service
-tokens in global headers or tool arguments. Direct connections to individual MCPs
-should have their own per-server client configuration.
+L’API administrative est désactivée sans `adminApi.secretName`. Les mutations sont en RAM, perdues au redémarrage, et imposent un seul replica. Les définitions Helm restent la source durable et ne peuvent pas être remplacées par l’API. Le catalogue refuse les champs secrets et inconnus, notamment `headers`, les tokens et les secrets OAuth.
 
-### Temba authentication and personal provider connections
+Le client recharge le catalogue toutes les 60 secondes. Une modification de destination ou une suppression ferme la connexion et efface sa session. Une réponse invalide ne remplace pas le dernier catalogue valide.
 
-Temba is an OAuth resource server: it advertises Keycloak through MCP Protected
-Resource Metadata and validates the access token on **every bearer-authenticated**
-`/mcp` request. Anonymous calls can execute only public tools; a protected call
-requires the bearer token and configured scopes.
-Validation requires an RS256 signature from the realm JWKS, exact issuer,
-configured audience, expiration, subject, authorized client (`azp`), required
-scopes, and Keycloak's access-token `typ=Bearer`. ID tokens are not accepted as
-MCP access tokens. Identity is `(issuer, sub)`, never the token value or a
-client-supplied user ID. Provider tokens are never forwarded from incoming headers.
-
-Configure Keycloak with:
-
-- A public client for OpenCode, authorization code flow and **S256 PKCE**, restricted
-  to the client's actual loopback callback URI. Disable implicit and password grants.
-- An audience mapper adding `temba-mcp` to its access tokens and the `temba:use`
-  client scope, granted only to clients/users permitted to access Temba.
-- A browser client `temba-login`, authorization code flow, **S256 PKCE**, and one exact
-  redirect URI: `https://temba.example.com/oidc/callback`. Disable implicit/password
-  grants. A public client needs no client secret. A confidential client may use
-  `auth.browserClientSecretName`/`auth.browserClientSecretKey` for a Kubernetes Secret.
-
-OpenCode discovers the issuer from Temba's authentication challenge. URL-only
-configuration depends on Keycloak allowing appropriate dynamic client registration.
-If company policy disables DCR, supply a centrally managed, pre-registered **public
-client ID** via OpenCode's `oauth.clientId`. This is a shared application identifier,
-not a personal GUID or a secret. Actual OpenCode/Keycloak interoperability must be
-verified against the company's realm and installed OpenCode version.
-
-Personal Jira/provider login:
-
-1. An authenticated user's first search/call creates that user's own MCP connections.
-   An OAuth-protected provider returns a login hint. The admin catalog does not log in.
-2. The agent provides a one-time `/auth?t=...` link, valid for at most the pending flow
-   lifetime (default 10 minutes). Do not share this link.
-3. Temba first verifies the **same user's Keycloak identity in the browser**, using
-   state, nonce, S256 PKCE and an HttpOnly/Secure/SameSite cookie. A different identity
-   is refused, so a forwarded link cannot attach someone else's Jira account.
-4. Temba redirects to the provider. Its callback also requires the matching browser
-   cookie and a live, single-use state; the provider issuer is passed to the MCP SDK
-   for response validation.
-5. Provider tokens and client credentials are held only in process memory, per user/server/
-   endpoint. Another user gets a separate connection and cannot use these tokens.
-
-Private `add_mcp` entries also belong to the authenticated user. Knowing their
-`server_key` does not authorize another user. Provider calls and background tool
-refreshes are serialized per connection to avoid concurrent token refreshes.
-
-OAuth discovery/token/registration requests also require HTTPS. Destinations other
-than the configured MCP origin must resolve to public addresses. An administrator
-can explicitly allow a private identity-provider origin with
-`oauth: {allowedOrigins: ["https://sso.internal.example.com"]}`; this exception is
-never available to LLM-added servers. Network isolation remains necessary against
-DNS rebinding between validation and connection.
-
-Token retention defaults to 30 days, renewed on **writes**, including token refresh.
-It is not an inactivity timer refreshed on every tool call. Removing a server purges
-its stored tokens. Provider-side revocation remains a separate operation.
-
-### In-memory state
-
-OAuth provider tokens, client registration information, pending login flows and
-all dynamic catalog entries live only in the gateway process. There is no external
-state service, storage volume, token-encryption Secret or persistent token store.
-Static catalog entries remain in the Helm-managed registry ConfigMap; configured
-credentials should still come from Kubernetes Secrets.
-
-A gateway restart or deployment loses personal provider connections and entries
-created through the admin API or `add_mcp`. Users must reconnect their OAuth MCPs;
-admins must recreate dynamic entries or move durable definitions to the Helm
-catalog. These are expected lifecycle semantics, not a recoverable storage failure.
-
-Token records expire after `TOKEN_RETENTION` (30 days by default, renewed on
-writes). Expired records are swept periodically. When a user gateway is evicted
-for inactivity (`security.userIdleTtl`, default one hour), its provider token records
-are purged as well. Removing a server purges its tokens for every user; shutdown
-clears all runtime records. This drops Python references; it does not guarantee
-physical memory zeroization. A compromised gateway can still access active tokens.
-
-The application disables HTTP access logging to avoid recording login tickets and
-OAuth codes. Configure the ingress/proxy to omit or redact query strings for `/auth`,
-`/oidc/callback` and `/oauth/callback` as well.
-
-### Upgrading an existing deployment
-
-Stop the old gateway before starting this version. Existing shared provider tokens
-are not reused; revoke old grants and have users reconnect. Recreate required
-dynamic catalog entries from trusted definitions, or add them to the Helm catalog.
-
-The chart no longer creates Redis resources. Upgrading removes previously managed
-Redis resources, potentially including their PVC; preserve needed catalog definitions
-before upgrading. Old external Redis instances, retained volumes, credentials and
-backups are not erased by this code change and must be retired separately. The old
-migration script is no longer included.
-
-Security regression tests (mocked Keycloak/JWKS and MCP provider, plus Helm rendering):
+## Développement et distribution
 
 ```sh
-.venv/bin/python -m unittest discover -s tests -v
-helm lint ./chart/temba-mcp
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+uvx --from 'maturin>=1.9,<2' maturin build --release --locked --out dist
+helm lint chart/temba-catalog
 ```
 
+La CI construit des wheels Linux x86_64, macOS Apple Silicon / Intel et Windows x86_64, puis vérifie leur lancement avec `uvx`. Aucune compilation Rust n’est demandée aux utilisateurs. Les autres architectures nécessitent un wheel supplémentaire. La publication sur un registre est une étape distincte ; aucune publication automatique n’est configurée.
 
-## 🏷️ Partitioning the catalog with labels
+Cette V2 retire la gateway Python, les enveloppes de tokens, Redis, les anciennes routes MCP HTTP et la recherche par embeddings serveur. La recherche est locale. L’ajout de serveurs par le LLM est également retiré : les définitions viennent du catalogue administré. Il n’y a pas de couche de compatibilité V1.
 
-As an admin, all your users may not need the same tools in their catalog. Some will want powerpoint MCPs and others dev related MCPs...  
-To scope tools to different usecase, you can set labels on each one.  
-For a client to get a labeled tool, it has to provide the same label inside its client configuration.  
-
-For instance, if the catalog is configured like so:  
-
-```yaml
-catalog:
-  servers:
-
-    - id: deepwiki
-      url: https://mcp.deepwiki.com/mcp
-      timeout: 45
-      labels: [meant-for-devs]
-
-    - id: jira
-      url: https://mcp.atlassian.com/v2/mcp?tools=all
-      oauth: {}
-      labels: [meant-for-pm]
-```
-
-Now, in your opencode config (or any MCP compatible client):
-
-* If you're a dev:
-```jsonc
-"temba-mcp": {
-  "type": "remote",
-  "url": "http(s)://<temba-url>/mcp",
-  "headers": { "X-Temba-Labels": "meant-for-devs" } // Set catalog label here
-}
-```
-
-=> Tools list: deepwiki ✅ jira ❌
-
-
-* If you're a project manager:
-```jsonc
-"temba-mcp": {
-  "type": "remote",
-  "url": "http(s)://<temba-url>/mcp",
-  "headers": { "X-Temba-Labels": "meant-for-pm" } // Set catalog label here
-}
-```
-
-=> Tools list: deepwiki ❌ jira ✅
-
-
-:information_source: Servers without labels are discoverable by all clients; credentialed servers still require Temba authentication to execute their tools.
-:warning: This is not a security feature. Merely a way to organize things a bit.  
-
-
-## 🔎 How does tool search work ?
-
-Scoring runs over the tool `name` (weight 3) + `description` (2) + `input_schema` (1), with fr/en stemming.  
-
-**Embeddings** (semantic search, recommended) if `embeddings.baseUrl` is set in values.yaml (OpenAI-compatible `/v1/embeddings` endpoint + `embeddings.apiKey` or`embeddings.secretRef` + `embeddings.model`);  
-
-otherwise local **BM25** fallback. The active mode is returned in the payload (`"index": ...`). Zero results → `catalog` of servers as a hint.
-
-
-## 🔒 Network security
-
-Network settings are grouped under `security`:
-
-```yaml
-security:
-  networkPolicy:
-    enabled: true
-    internalMcpPods: [mcp-atlassian, mcp-grafana]
-    internalCidrs: []
-```
-
-`internalMcpPods` allows TCP port 8000 to pods with the matching `app` label in
-the gateway namespace. Without this allowance, the default egress policy blocks
-internal MCP services. Use `internalCidrs` for explicitly trusted internal networks.
-The former top-level `networkPolicy` field is rejected with a migration message;
-move it under `security` when upgrading.
-
-When using the `allowNewMcpRegisteringByLlm` option that let's an LLM add tools to its catalog, ALWAYS make sure that `security.networkPolicy.enabled` is true (default).
-A prompt injection could force the LLM to register a component from your internal k8s network. Securities have been added at the application level.  
-But nothing beats an old school NetworkPolicy with default deny.
-
-## Connection logs
-
-Temba logs each MCP when initialization and tool discovery succeed, with a
-catalog progress counter and the names still pending, failed or waiting for login:
-
-```text
-MCP 'jira' prêt (63 outils) — catalogue user-a1b2c3d4 : 2/4 MCP prêts ; en attente: slow ; en erreur: aucun ; login requis: gitlab
-```
-
-Counters are per gateway catalog: the public gateway counts only public MCPs;
-each authenticated user gateway counts its own connections. The temporary
-`user-...` identifier distinguishes concurrent catalogs without logging identity
-or tokens. A successful HTTP response alone does not mark an MCP as ready.
-While connections are incomplete, a summary appears every 10 seconds, before
-their connection timeout. Override `CONNECTION_PROGRESS_INTERVAL` via `env` to
-adjust this interval. Successful periodic health checks do not repeat readiness
-logs; reconnects do. Connection failures include safe exception type names,
-without response bodies or credentials. The SDK's repetitive
-`Terminating session: None` message is filtered; other session messages remain.
-
-## 📄 License
-
-This project is licensed under the MIT License. See the LICENSE file for more details.
-
-HF  
-**Temba, his arms wide.**
+Voir [sécurité du client local](SECURITY_CLIENT.md) et [sécurité du conteneur](SECURITY_CONTAINER.md). [La spécification V2](SPECIFICATION_TEMBA_V2.md) décrit aussi des évolutions envisagées ; la documentation ci-dessus correspond aux fonctionnalités implémentées.

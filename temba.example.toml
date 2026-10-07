@@ -1,0 +1,12 @@
+catalog_url = "http://127.0.0.1:18080"
+allow_loopback_http = true
+refresh_seconds = 60
+search_limit = 5
+# Optional local filtering; every requested label must match.
+labels = []
+
+# A token may only be sent to this exact approved endpoint. The environment
+# variable is configured on the workstation, never downloaded from the catalog.
+# [credentials.grafana]
+# token_env = "GRAFANA_MCP_TOKEN"
+# expected_endpoint = "https://grafana-mcp.example.com/mcp"

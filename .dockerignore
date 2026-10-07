@@ -1,0 +1,7 @@
+.git
+.venv
+target
+dist
+chart
+*.whl
+temba.local.toml

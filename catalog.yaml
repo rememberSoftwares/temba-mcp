@@ -1,0 +1,10 @@
+schemaVersion: 1
+servers:
+  - id: jira
+    name: Jira
+    description: Search Jira tickets and projects
+    url: https://mcp.atlassian.com/v2/mcp?tools=all
+    labels: [jira]
+    auth:
+      type: oauth
+      allowedOrigins: [https://auth.atlassian.com]

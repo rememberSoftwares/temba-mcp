@@ -1,0 +1,38 @@
+replicaCount: 1
+image:
+  repository: temba-catalog
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+  digest: ""
+auth:
+  enabled: false
+  issuer: ""
+  audience: temba-mcp
+  clientId: temba
+  callbackPort: 19877
+  jwksUri: ""
+  tokenEndpoint: ""
+catalog:
+  servers: []
+adminApi:
+  mutable: false
+  secretName: ""
+  tokenKey: token
+security:
+  allowLoopbackHttp: false
+  networkPolicy:
+    enabled: true
+    # Restrict to your Keycloak network when possible. HTTPS egress is needed only for JWT verification.
+    authCidrs: ["0.0.0.0/0", "::/0"]
+service:
+  type: ClusterIP
+  port: 8080
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  annotations: {}
+  tls: []
+resources:
+  requests: {cpu: 50m, memory: 32Mi}
+  limits: {memory: 128Mi}
