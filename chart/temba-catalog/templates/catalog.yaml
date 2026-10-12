@@ -6,5 +6,5 @@ metadata:
     {{- include "temba.labels" . | nindent 4 }}
 data:
   catalog.yaml: |
-    schemaVersion: 1
+    schemaVersion: 2
     servers: {{ .Values.catalog.servers | toJson }}

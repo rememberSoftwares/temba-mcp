@@ -1,6 +1,9 @@
-{{- if and .Values.adminApi.mutable (ne (int .Values.replicaCount) 1) }}{{ fail "RAM-only admin mutations require replicaCount=1" }}{{ end }}
-{{- if and .Values.adminApi.mutable (not .Values.adminApi.secretName) }}{{ fail "adminApi.mutable requires a pre-existing secretName" }}{{ end }}
-{{- if and .Values.auth.enabled (or (not .Values.auth.issuer) (not .Values.auth.audience) (not .Values.auth.clientId)) }}{{ fail "auth.enabled requires issuer, audience and clientId" }}{{ end }}
+{{- if hasKey .Values "auth" }}{{ fail "auth was renamed to catalogueAuth; migrate your override" }}{{ end }}
+{{- if hasKey .Values.adminApi "mutable" }}{{ fail "adminApi.mutable was replaced by adminApi.readOnly with inverse semantics" }}{{ end }}
+{{- if and (not .Values.adminApi.readOnly) (ne (int .Values.replicaCount) 1) }}{{ fail "Writable catalog requires replicaCount=1" }}{{ end }}
+{{- if and (not .Values.adminApi.readOnly) (not .Values.adminApi.secretName) }}{{ fail "adminApi.readOnly=false requires a pre-existing secretName" }}{{ end }}
+{{- if and (not .Values.adminApi.readOnly) (not .Values.persistence.enabled) }}{{ fail "adminApi.readOnly=false requires persistence.enabled=true" }}{{ end }}
+{{- if and .Values.catalogueAuth.enabled (or (not .Values.catalogueAuth.issuer) (not .Values.catalogueAuth.audience) (not .Values.catalogueAuth.clientId)) }}{{ fail "catalogueAuth.enabled requires issuer, audience and clientId" }}{{ end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,6 +12,11 @@ metadata:
     {{- include "temba.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if .Values.persistence.enabled }}
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  {{- end }}
   selector:
     matchLabels:
       {{- include "temba.selector" . | nindent 6 }}
@@ -24,6 +32,10 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        {{- if .Values.persistence.enabled }}
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        {{- end }}
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: catalog
@@ -36,15 +48,18 @@ spec:
             capabilities: {drop: [ALL]}
           env:
             - {name: CATALOG_PATH, value: /etc/temba/catalog.yaml}
-            - {name: AUTH_ENABLED, value: {{ .Values.auth.enabled | quote }}}
-            - {name: AUTH_ISSUER, value: {{ .Values.auth.issuer | quote }}}
-            - {name: AUTH_AUDIENCE, value: {{ .Values.auth.audience | quote }}}
-            - {name: AUTH_CLIENT_ID, value: {{ .Values.auth.clientId | quote }}}
-            - {name: AUTH_CALLBACK_PORT, value: {{ .Values.auth.callbackPort | quote }}}
-            - {name: AUTH_JWKS_URI, value: {{ .Values.auth.jwksUri | quote }}}
-            - {name: AUTH_TOKEN_ENDPOINT, value: {{ .Values.auth.tokenEndpoint | quote }}}
+            - {name: CATALOGUE_AUTH_ENABLED, value: {{ .Values.catalogueAuth.enabled | quote }}}
+            - {name: CATALOGUE_AUTH_ISSUER, value: {{ .Values.catalogueAuth.issuer | quote }}}
+            - {name: CATALOGUE_AUTH_AUDIENCE, value: {{ .Values.catalogueAuth.audience | quote }}}
+            - {name: CATALOGUE_AUTH_CLIENT_ID, value: {{ .Values.catalogueAuth.clientId | quote }}}
+            - {name: CATALOGUE_AUTH_CALLBACK_PORT, value: {{ .Values.catalogueAuth.callbackPort | quote }}}
+            - {name: CATALOGUE_AUTH_JWKS_URI, value: {{ .Values.catalogueAuth.jwksUri | quote }}}
+            - {name: CATALOGUE_AUTH_TOKEN_ENDPOINT, value: {{ .Values.catalogueAuth.tokenEndpoint | quote }}}
             - {name: ALLOW_INSECURE_HTTP, value: {{ .Values.security.allowLoopbackHttp | quote }}}
-            - {name: ADMIN_MUTABLE, value: {{ .Values.adminApi.mutable | quote }}}
+            - {name: ADMIN_READ_ONLY, value: {{ .Values.adminApi.readOnly | quote }}}
+            {{- if .Values.persistence.enabled }}
+            - {name: CATALOG_ADDITIONS_PATH, value: /var/lib/temba/additions.json}
+            {{- end }}
             {{- if .Values.adminApi.secretName }}
             - name: ADMIN_API_TOKEN
               valueFrom:
@@ -58,6 +73,14 @@ spec:
           livenessProbe: {httpGet: {path: /healthz, port: http}}
           volumeMounts:
             - {name: catalog, mountPath: /etc/temba, readOnly: true}
+            {{- if .Values.persistence.enabled }}
+            - {name: additions, mountPath: /var/lib/temba, readOnly: {{ .Values.adminApi.readOnly }}}
+            {{- end }}
       volumes:
         - name: catalog
           configMap: {name: {{ include "temba.name" . }}-catalog}
+        {{- if .Values.persistence.enabled }}
+        - name: additions
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-catalog" (include "temba.name" .)) .Values.persistence.existingClaim }}
+        {{- end }}

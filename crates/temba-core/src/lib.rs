@@ -4,42 +4,85 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use url::Url;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Auth {
-    #[default]
-    None,
-    Token {
-        #[serde(default = "authorization_header", rename = "headerName")]
-        header_name: String,
-        #[serde(default = "bearer_prefix")]
-        prefix: String,
-    },
-    Oauth {
-        #[serde(default, rename = "clientId")]
-        client_id: Option<String>,
-        #[serde(default)]
-        scopes: Vec<String>,
-        #[serde(default, rename = "callbackPort")]
-        callback_port: u16,
-        #[serde(default, rename = "allowedOrigins")]
-        allowed_origins: Vec<String>,
-    },
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OAuth {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub callback_port: u16,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
-fn authorization_header() -> String {
-    "Authorization".into()
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Header {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub mandatory: bool,
 }
-fn bearer_prefix() -> String {
-    "Bearer ".into()
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Access {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups_any_of: Vec<String>,
 }
-fn public() -> String {
-    "public".into()
+fn is_false(value: &bool) -> bool {
+    !value
+}
+impl Default for Access {
+    fn default() -> Self {
+        Self {
+            public: true,
+            authenticated: false,
+            groups_any_of: vec![],
+        }
+    }
+}
+impl Access {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            usize::from(self.public)
+                + usize::from(self.authenticated)
+                + usize::from(!self.groups_any_of.is_empty())
+                == 1,
+            "Access requires exactly one of public, authenticated or nonempty groupsAnyOf"
+        );
+        ensure!(self.groups_any_of.len() <= 64, "Too many access groups");
+        for group in &self.groups_any_of {
+            ensure!(
+                group.starts_with('/')
+                    && group.len() > 1
+                    && group.len() <= 1024
+                    && group.trim() == group
+                    && !group.contains(['\r', '\n']),
+                "Access groups must be exact full Keycloak paths"
+            );
+        }
+        Ok(())
+    }
+    pub fn allows(&self, groups: Option<&[String]>) -> bool {
+        self.public
+            || groups.is_some_and(|groups| {
+                self.authenticated || self.groups_any_of.iter().any(|g| groups.contains(g))
+            })
+    }
 }
 fn timeout() -> u64 {
     60
 }
 fn schema() -> u32 {
-    1
+    2
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,13 +93,15 @@ pub struct Server {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    pub url: String,
+    pub endpoint: String,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default)]
-    pub auth: Auth,
-    #[serde(default = "public")]
-    pub catalog_access: String,
+    pub oauth: Option<OAuth>,
+    #[serde(default)]
+    pub headers: Vec<Header>,
+    #[serde(default)]
+    pub access: Access,
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
 }
@@ -72,7 +117,7 @@ pub struct Catalog {
 }
 impl Catalog {
     pub fn validate(&mut self, allow_http: bool) -> Result<()> {
-        ensure!(self.schema_version == 1, "Unsupported catalog schema");
+        ensure!(self.schema_version == 2, "Unsupported catalog schema");
         ensure!(self.servers.len() <= 256, "Catalog exceeds 256 servers");
         let mut ids = HashSet::new();
         for server in &mut self.servers {
@@ -95,11 +140,8 @@ impl Server {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "Invalid server ID"
         );
-        endpoint(&self.url, allow_http)?;
-        ensure!(
-            matches!(self.catalog_access.as_str(), "public" | "authenticated"),
-            "Invalid catalog access"
-        );
+        endpoint(&self.endpoint, allow_http)?;
+        self.access.validate()?;
         ensure!(
             (1..=300).contains(&self.timeout_seconds),
             "Timeout must be between 1 and 300 seconds"
@@ -111,32 +153,54 @@ impl Server {
         for label in &mut self.labels {
             *label = label.trim().to_lowercase();
         }
-        if let Auth::Oauth {
-            allowed_origins, ..
-        } = &self.auth
-        {
-            for origin in allowed_origins {
+        if let Some(oauth) = &self.oauth {
+            for origin in &oauth.allowed_origins {
                 endpoint(origin, false)?;
             }
         }
-        if let Auth::Token {
-            header_name,
-            prefix,
-        } = &self.auth
-        {
+        ensure!(self.headers.len() <= 32, "Too many headers");
+        let mut names = HashSet::new();
+        for header in &self.headers {
+            let name = header.name.to_ascii_lowercase();
             ensure!(
-                header_name == "Authorization" || header_name.starts_with("X-"),
-                "Unsupported credential header"
+                (name == "authorization" || name.starts_with("x-"))
+                    && header.name.len() <= 128
+                    && header
+                        .name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+                "Headers must be Authorization or valid X-* names"
             );
+            ensure!(names.insert(name.clone()), "Duplicate header name");
             ensure!(
-                !prefix.contains(['\r', '\n']) && prefix.len() <= 64,
-                "Invalid credential prefix"
+                self.oauth.is_none() || name != "authorization",
+                "OAuth owns Authorization; use X-* headers alongside OAuth"
             );
+            match (&header.credential, &header.value) {
+                (Some(credential), None) => {
+                    ensure!(
+                        !credential.is_empty()
+                            && credential.len() <= 128
+                            && credential
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                        "Invalid local credential reference"
+                    );
+                }
+                (None, Some(value)) => {
+                    ensure!(
+                        name != "authorization",
+                        "Public Authorization values are not allowed; use a local credential"
+                    );
+                    ensure!(
+                        value.len() <= 16384 && !value.chars().any(|c| c.is_control() && c != '\t'),
+                        "Invalid public header value"
+                    );
+                }
+                _ => bail!("A header requires exactly one of credential or public value"),
+            }
         }
         Ok(())
-    }
-    pub fn visible(&self, labels: &[String]) -> bool {
-        self.labels.is_empty() || self.labels.iter().any(|v| labels.contains(v))
     }
 }
 pub fn endpoint(value: &str, allow_loopback_http: bool) -> Result<Url> {
@@ -222,16 +286,76 @@ pub async fn http_json<T: serde::de::DeserializeOwned>(response: reqwest::Respon
 mod tests {
     use super::*;
     #[test]
+    fn access_rules_fail_closed_and_match_exact_group_paths() {
+        for invalid in [
+            r#"{}"#,
+            r#"{"groupsAnyOf":[]}"#,
+            r#"{"public":true,"groupsAnyOf":["/X"]}"#,
+            r#"{"public":true,"authenticated":true}"#,
+            r#"{"groupsAnyOf":["X"]}"#,
+        ] {
+            let rule: Access = serde_json::from_str(invalid).unwrap();
+            assert!(rule.validate().is_err(), "accepted {invalid}");
+        }
+        let rule: Access = serde_json::from_str(r#"{"groupsAnyOf":["/X","/Y"]}"#).unwrap();
+        rule.validate().unwrap();
+        assert!(!rule.allows(None));
+        assert!(!rule.allows(Some(&[])));
+        assert!(rule.allows(Some(&["/X".into()])));
+        assert!(rule.allows(Some(&["/Y".into()])));
+        assert!(!rule.allows(Some(&["/X/subgroup".into(), "/x".into()])));
+    }
+    #[test]
     fn catalog_rejects_secrets_and_duplicates() {
-        assert!(serde_json::from_str::<Server>(r#"{"id":"jira","url":"https://jira.test/mcp","headers":{"Authorization":"secret"}}"#).is_err());
+        assert!(serde_json::from_str::<Server>(r#"{"id":"jira","endpoint":"https://jira.test/mcp","headers":{"Authorization":"secret"}}"#).is_err());
         let s: Server =
-            serde_json::from_str(r#"{"id":"jira","url":"https://jira.test/mcp"}"#).unwrap();
+            serde_json::from_str(r#"{"id":"jira","endpoint":"https://jira.test/mcp"}"#).unwrap();
         let mut c = Catalog {
-            schema_version: 1,
+            schema_version: 2,
             revision: String::new(),
             servers: vec![s.clone(), s],
         };
         assert!(c.validate(false).is_err());
+    }
+    #[test]
+    fn oauth_and_headers_are_independent_but_authorization_cannot_conflict() {
+        let definition = |headers| {
+            serde_json::from_value::<Server>(serde_json::json!({
+                "id":"jira","endpoint":"https://example.com/mcp","oauth":{},
+                "headers":headers
+            }))
+            .unwrap()
+        };
+        let mut combined = definition(serde_json::json!([
+            {"name":"X-Api-Key","credential":"api_key"},
+            {"name":"X-Tenant","credential":"tenant"}
+        ]));
+        combined.validate(false).unwrap();
+        for headers in [
+            serde_json::json!([{"name":"Authorization","credential":"key"}]),
+            serde_json::json!([{"name":"X-Tenant","credential":"key"},{"name":"x-tenant","credential":"other"}]),
+            serde_json::json!([{"name":"Host","credential":"key"}]),
+        ] {
+            assert!(definition(headers).validate(false).is_err());
+        }
+        assert!(serde_json::from_value::<Server>(serde_json::json!({"id":"jira","endpoint":"https://example.com/mcp","headers":[{"name":"X-Key","credential":"key","value":"public"}]})).unwrap().validate(false).is_err());
+    }
+    #[test]
+    fn public_headers_have_exactly_one_source_and_no_secret_authorization_value() {
+        let definition = |headers| {
+            serde_json::from_value::<Server>(serde_json::json!({"id":"public","endpoint":"https://example.com/mcp","headers":headers})).unwrap()
+        };
+        let mut public = definition(serde_json::json!([{"name":"X-App","value":"temba"}]));
+        public.validate(false).unwrap();
+        assert!(!public.headers[0].mandatory);
+        for headers in [
+            serde_json::json!([{"name":"X-Key"}]),
+            serde_json::json!([{"name":"Authorization","value":"Bearer secret"}]),
+            serde_json::json!([{"name":"X-App","value":"bad\r\nvalue"}]),
+        ] {
+            assert!(definition(headers).validate(false).is_err());
+        }
+        assert!(serde_json::from_value::<Server>(serde_json::json!({"id":"old","endpoint":"https://example.com/mcp","headers":[{"name":"X-Key","credential":"key","prefix":"old"}]})).is_err());
     }
     #[test]
     fn credentials_and_insecure_destinations_rejected() {

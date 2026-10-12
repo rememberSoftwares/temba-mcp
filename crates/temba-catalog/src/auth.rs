@@ -27,17 +27,56 @@ struct Cache {
 struct Claims {
     sub: String,
     typ: String,
+    #[serde(default)]
+    groups: Vec<String>,
+}
+pub struct Identity {
+    pub groups: Vec<String>,
+}
+pub fn rejection_reason(error: &anyhow::Error) -> &'static str {
+    use jsonwebtoken::errors::ErrorKind;
+    if let Some(error) = error.downcast_ref::<jsonwebtoken::errors::Error>() {
+        return match error.kind() {
+            ErrorKind::InvalidAudience => "invalid audience",
+            ErrorKind::InvalidIssuer => "invalid issuer",
+            ErrorKind::ExpiredSignature => "expired access token",
+            ErrorKind::ImmatureSignature => "access token not yet valid",
+            ErrorKind::InvalidSignature => "invalid signature",
+            ErrorKind::Json(_) => {
+                "malformed claims; groups must be an array of strings when present"
+            }
+            _ => "invalid access token",
+        };
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return if error.is_timeout() {
+            "signing-key discovery timed out"
+        } else if error.is_status() {
+            "signing-key discovery returned an HTTP error"
+        } else {
+            "signing-key discovery connection failed"
+        };
+    }
+    match error.to_string().as_str() {
+        "Unknown key" => "unknown signing key",
+        "Missing kid" => "missing signing key identifier",
+        "JWKS refresh cooling down" => "signing-key refresh cooling down",
+        "Issuer mismatch" => "discovery issuer mismatch",
+        "Access token required" => "access-token subject or type invalid",
+        "Invalid groups claim" => "groups claim exceeds limits",
+        _ => "token verification failed",
+    }
 }
 impl Verifier {
     pub fn from_env() -> Result<Self> {
         let get = |n| std::env::var(n).unwrap_or_default();
-        let issuer = if get("AUTH_ENABLED") == "true" {
-            get("AUTH_ISSUER")
+        let issuer = if get("CATALOGUE_AUTH_ENABLED") == "true" {
+            get("CATALOGUE_AUTH_ISSUER")
         } else {
             String::new()
         };
-        let jwks = get("AUTH_JWKS_URI");
-        let token = get("AUTH_TOKEN_ENDPOINT");
+        let jwks = get("CATALOGUE_AUTH_JWKS_URI");
+        let token = get("CATALOGUE_AUTH_TOKEN_ENDPOINT");
         if !issuer.is_empty() {
             endpoint(&issuer, false)?;
             if !jwks.is_empty() {
@@ -48,21 +87,22 @@ impl Verifier {
             }
         }
         ensure!(
-            get("AUTH_ENABLED") != "true" || !issuer.is_empty(),
-            "AUTH_ISSUER required"
+            get("CATALOGUE_AUTH_ENABLED") != "true" || !issuer.is_empty(),
+            "CATALOGUE_AUTH_ISSUER required"
         );
         ensure!(
             issuer.is_empty()
-                || (!get("AUTH_AUDIENCE").is_empty() && !get("AUTH_CLIENT_ID").is_empty()),
-            "AUTH_AUDIENCE and AUTH_CLIENT_ID required"
+                || (!get("CATALOGUE_AUTH_AUDIENCE").is_empty()
+                    && !get("CATALOGUE_AUTH_CLIENT_ID").is_empty()),
+            "CATALOGUE_AUTH_AUDIENCE and CATALOGUE_AUTH_CLIENT_ID required"
         );
         Ok(Self {
             issuer,
-            audience: get("AUTH_AUDIENCE"),
+            audience: get("CATALOGUE_AUTH_AUDIENCE"),
             jwks,
             token,
-            client_id: get("AUTH_CLIENT_ID"),
-            callback_port: get("AUTH_CALLBACK_PORT").parse().unwrap_or(19877),
+            client_id: get("CATALOGUE_AUTH_CLIENT_ID"),
+            callback_port: get("CATALOGUE_AUTH_CALLBACK_PORT").parse().unwrap_or(19877),
             http: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -81,7 +121,7 @@ impl Verifier {
         }
         json!({"issuer":self.issuer,"audience":self.audience,"clientId":self.client_id,"callbackPort":self.callback_port,"jwksUri":self.jwks,"tokenEndpoint":self.token})
     }
-    pub async fn verify(&self, token: &str) -> Result<()> {
+    pub async fn verify(&self, token: &str) -> Result<Identity> {
         ensure!(!self.issuer.is_empty(), "Catalog authentication disabled");
         let header = decode_header(token)?;
         ensure!(header.alg == Algorithm::RS256, "RS256 required");
@@ -149,16 +189,33 @@ impl Verifier {
             !claims.sub.is_empty() && claims.typ == "Bearer",
             "Access token required"
         );
-        Ok(())
+        ensure!(
+            claims.groups.len() <= 256 && claims.groups.iter().all(|g| g.len() <= 1024),
+            "Invalid groups claim"
+        );
+        Ok(Identity {
+            groups: claims.groups,
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header, encode};
     use std::time::{SystemTime, UNIX_EPOCH};
-    fn verifier() -> Verifier {
+    #[test]
+    fn rejection_diagnostics_do_not_include_tokens_or_provider_errors() {
+        let error = anyhow::Error::new(jsonwebtoken::errors::Error::from(
+            jsonwebtoken::errors::ErrorKind::InvalidAudience,
+        ));
+        assert_eq!(rejection_reason(&error), "invalid audience");
+        assert_eq!(
+            rejection_reason(&anyhow::anyhow!("provider secret-token-value")),
+            "token verification failed"
+        );
+    }
+    pub(crate) fn verifier() -> Verifier {
         let mut keys = HashMap::new();
         keys.insert(
             "test".into(),
@@ -180,7 +237,7 @@ mod tests {
             }),
         }
     }
-    fn signed(claims: Value) -> String {
+    pub(crate) fn signed(claims: Value) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("test".into());
         encode(
@@ -215,6 +272,29 @@ mod tests {
                 "accepted invalid {field}"
             );
         }
+    }
+    #[tokio::test]
+    async fn groups_are_taken_only_from_the_verified_access_token() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut claims = json!({"iss":"https://auth.example/realm","aud":"temba-mcp","sub":"user","typ":"Bearer","exp":now+300});
+        let v = verifier();
+        assert!(
+            v.verify(&signed(claims.clone()))
+                .await
+                .unwrap()
+                .groups
+                .is_empty()
+        );
+        claims["groups"] = json!(["/X", "/Y"]);
+        assert_eq!(
+            v.verify(&signed(claims.clone())).await.unwrap().groups,
+            vec!["/X", "/Y"]
+        );
+        claims["groups"] = json!("/X");
+        assert!(v.verify(&signed(claims)).await.is_err());
     }
     #[tokio::test]
     async fn failed_jwks_refresh_does_not_extend_old_key_lifetime() {

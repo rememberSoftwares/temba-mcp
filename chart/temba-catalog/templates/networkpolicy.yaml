@@ -7,7 +7,15 @@ spec:
   podSelector:
     matchLabels:
       {{- include "temba.selector" . | nindent 6 }}
-  policyTypes: [Egress]
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.ingress.namespace is required" .Values.security.networkPolicy.ingress.namespace | quote }}
+          podSelector:
+            {{- toYaml .Values.security.networkPolicy.ingress.podSelector | nindent 12 }}
+      ports: [{protocol: TCP, port: 8080}]
   egress:
     - to:
         - namespaceSelector:
@@ -17,7 +25,7 @@ spec:
       ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
-    {{- if .Values.auth.enabled }}
+    {{- if and .Values.catalogueAuth.enabled .Values.security.networkPolicy.authCidrs }}
     - to:
       {{- range .Values.security.networkPolicy.authCidrs }}
         - ipBlock: {cidr: {{ . | quote }}}

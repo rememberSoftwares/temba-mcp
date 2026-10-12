@@ -46,7 +46,7 @@ impl std::fmt::Display for OriginNotAllowed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "OAuth origin {} is not approved. Add it to this server's auth.allowedOrigins in the catalog.",
+            "OAuth origin {} is not approved. Add it to this server's oauth.allowedOrigins in the catalog.",
             self.0
         )
     }
@@ -147,11 +147,13 @@ pub async fn discover(
     resource: &str,
     origins: &[String],
     allow_http: bool,
+    headers: reqwest::header::HeaderMap,
 ) -> Result<Provider> {
     let u = endpoint(resource, allow_http)?;
-    // A fresh unauthenticated probe supplies the protected resource metadata hint.
+    // No OAuth bearer yet. Extra headers are bound to this exact MCP resource only.
     let r = http
         .get(resource)
+        .headers(headers)
         .timeout(Duration::from_secs(15))
         .send()
         .await?;
@@ -220,6 +222,28 @@ fn margin(lifetime: Duration) -> Duration {
     Duration::from_secs(60).min(lifetime / 10)
 }
 impl Session {
+    #[cfg(test)]
+    pub(crate) fn test_session(token: &str) -> Arc<Self> {
+        Arc::new(Self {
+            http: reqwest::Client::new(),
+            provider: Provider {
+                issuer: "https://test.invalid".into(),
+                authorize: "https://test.invalid".into(),
+                token: "https://test.invalid".into(),
+                registration: None,
+                require_iss: false,
+            },
+            client_id: "test".into(),
+            resource: None,
+            tokens: Mutex::new(Some(Tokens {
+                access: Zeroizing::new(token.into()),
+                refresh: None,
+                received: Instant::now(),
+                lifetime: Some(Duration::from_secs(3600)),
+            })),
+        })
+    }
+
     pub async fn access(&self) -> Result<Zeroizing<String>> {
         let mut guard = self.tokens.lock().await;
         let t = guard
@@ -673,9 +697,13 @@ mod flow_tests {
         let metadata = json!({"issuer":issuer,"authorization_endpoint":format!("{auth}/authorize"),"token_endpoint":format!("{auth}/token"),"registration_endpoint":format!("{auth}/register"),"code_challenge_methods_supported":["S256"]});
         let ar = Router::new().route(
             "/.well-known/oauth-authorization-server/tenant",
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
                 let m = metadata.clone();
-                async move { Json(m) }
+                async move {
+                    assert!(!headers.contains_key("x-api-key"));
+                    assert!(!headers.contains_key("x-tenant"));
+                    Json(m)
+                }
             }),
         );
         let at = tokio::spawn(async move { axum::serve(al, ar).await.unwrap() });
@@ -683,25 +711,57 @@ mod flow_tests {
         let resource = format!("http://{}/mcp", rl.local_addr().unwrap());
         let rm = json!({"resource":resource,"authorization_servers":[issuer]});
         let rr = Router::new()
-            .route("/mcp", get(|| async { StatusCode::UNAUTHORIZED }))
+            .route(
+                "/mcp",
+                get(|headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["x-api-key"], "local-api-key");
+                    assert_eq!(headers["x-tenant"], "local-tenant");
+                    StatusCode::UNAUTHORIZED
+                }),
+            )
             .route(
                 "/.well-known/oauth-protected-resource/mcp",
-                get(move || {
+                get(move |headers: axum::http::HeaderMap| {
                     let m = rm.clone();
-                    async move { Json(m) }
+                    async move {
+                        assert!(!headers.contains_key("x-api-key"));
+                        assert!(!headers.contains_key("x-tenant"));
+                        Json(m)
+                    }
                 }),
             );
         let rt = tokio::spawn(async move { axum::serve(rl, rr).await.unwrap() });
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let error = discover(&http, &resource, std::slice::from_ref(&resource), true)
-            .await
-            .err()
-            .unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            reqwest::header::HeaderValue::from_static("local-api-key"),
+        );
+        headers.insert(
+            "x-tenant",
+            reqwest::header::HeaderValue::from_static("local-tenant"),
+        );
+        let error = discover(
+            &http,
+            &resource,
+            std::slice::from_ref(&resource),
+            true,
+            headers.clone(),
+        )
+        .await
+        .err()
+        .unwrap();
         assert_eq!(error.downcast_ref::<OriginNotAllowed>().unwrap().0, auth);
-        assert!(error.to_string().contains("auth.allowedOrigins"));
-        let p = discover(&http, &resource, &[resource.clone(), auth.clone()], true)
-            .await
-            .unwrap();
+        assert!(error.to_string().contains("oauth.allowedOrigins"));
+        let p = discover(
+            &http,
+            &resource,
+            &[resource.clone(), auth.clone()],
+            true,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(p.issuer, issuer);
         assert_eq!(p.token, format!("{auth}/token"));
         at.abort();

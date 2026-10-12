@@ -1,5 +1,5 @@
 # Local migration: keep the existing Keycloak audience mapper; no custom scope.
-auth:
+catalogueAuth:
   enabled: true
   clientId: temba
   audience: temba-mcp
@@ -11,11 +11,19 @@ catalog:
     - id: jira
       name: Jira
       description: Search Jira tickets and projects through the Atlassian remote MCP
-      url: https://mcp.atlassian.com/v2/mcp?tools=all
+      endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
       labels: [jira]
-      auth:
-        type: oauth
+      oauth:
         allowedOrigins: [https://auth.atlassian.com]
-      catalogAccess: public
-# Grafana is omitted until its HTTPS ingress is configured. Its token belongs in
-# a workstation environment variable, never in the catalog deployment.
+      access:
+        groupsAnyOf: ["/temba-jira"]
+
+    - id: deepwiki
+      endpoint: https://mcp.deepwiki.com/mcp
+      timeoutSeconds: 45
+      labels: [docs]
+      access: {public: true}
+
+persistence:
+  size: 5Gi
+  storageClass: ""

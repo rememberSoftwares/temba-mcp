@@ -5,3 +5,4 @@ dist
 chart
 *.whl
 temba.local.toml
+temba.toml

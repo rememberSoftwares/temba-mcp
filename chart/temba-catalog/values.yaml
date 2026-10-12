@@ -1,38 +1,67 @@
 replicaCount: 1
 image:
   repository: temba-catalog
-  tag: "1.0.0"
+  tag: "1.3.1"
   pullPolicy: IfNotPresent
   digest: ""
-auth:
+
+catalogueAuth:
+  # Authentification du catalogue uniquement, indépendante de celle des MCP distants.
   enabled: false
   issuer: ""
   audience: temba-mcp
   clientId: temba
+  # Port du callback OAuth sur le poste utilisateur : http://127.0.0.1:<PORT>/oauth/callback.
   callbackPort: 19877
   jwksUri: ""
   tokenEndpoint: ""
+
 catalog:
   servers: []
+
 adminApi:
-  mutable: false
+  # true = consultation seulement ; false = ajouts/suppressions persistés sur le volume.
+  readOnly: true
+  # Secret Kubernetes existant ; vide = API administrative désactivée. Pas d’auto-génération.
   secretName: ""
   tokenKey: token
+
 security:
+  # Développement : accepte http://localhost:PORT/mcp ou http://127.0.0.1:PORT/mcp.
+  # Refuse toujours http://serveur-distant/mcp. Ne configure pas l'Ingress.
+  # Pour le port-forward du catalogue, utiliser allow_loopback_http dans le TOML client.
   allowLoopbackHttp: false
   networkPolicy:
+    # Refus par défaut en entrée/sortie, puis autorisations explicites ci-dessous.
     enabled: true
-    # Restrict to your Keycloak network when possible. HTTPS egress is needed only for JWT verification.
+    ingress:
+      # Namespace du contrôleur ingress, pas celui des clients OpenCode.
+      namespace: ingress-nginx
+      # Vide = tous les pods de ce namespace. Peut limiter aux pods du contrôleur.
+      podSelector: {}
+    # Sorties DNS + TCP 443 vers ces CIDR si catalogueAuth.enabled.
+    # Restreindre aux plages Keycloak en production.
     authCidrs: ["0.0.0.0/0", "::/0"]
+
+persistence:
+  # Définitions ajoutées par API uniquement ; aucun token ni secret sur ce volume.
+  enabled: true
+  existingClaim: ""
+  size: 100Mi
+  # Vide = StorageClass par défaut du cluster.
+  storageClass: ""
+
 service:
   type: ClusterIP
   port: 8080
+
 ingress:
   enabled: false
   className: ""
   host: ""
   annotations: {}
   tls: []
+
 resources:
   requests: {cpu: 50m, memory: 32Mi}
   limits: {memory: 128Mi}

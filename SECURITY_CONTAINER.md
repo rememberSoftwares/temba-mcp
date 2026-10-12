@@ -9,12 +9,15 @@ L’image runtime Distroless contient les bibliothèques système et les certifi
 - aucune élévation de privilèges, toutes les capabilities retirées ;
 - seccomp `RuntimeDefault` ;
 - aucun token de ServiceAccount monté ;
-- aucune zone de scratch inscriptible et aucun volume de credentials distants ;
+- seul le volume des définitions API peut être inscriptible, lorsque `adminApi.readOnly: false` ; aucun credential distant sur ce volume ;
 - limites de ressources et sondes HTTP.
 
 Le code est embarqué dans l’image. La ConfigMap contient seulement les définitions non secrètes. Les champs inconnus, secrets dans les URLs et anciennes configurations de headers sont rejetés au démarrage ou à l’ajout administratif.
 
-La NetworkPolicy est configurée sous `security.networkPolicy`. Sans authentification du catalogue, seuls les accès DNS sont permis en sortie. Avec Keycloak, une sortie TCP 443 est ajoutée pour récupérer la découverte et les JWKS. Restreindre `authCidrs` aux plages du fournisseur d’identité quand elles sont connues. Le filtrage effectif dépend d’un CNI qui applique les NetworkPolicy ; un Minikube sans ce support ne les applique pas. Le catalogue n’a aucun besoin réseau vers les MCP distants.
+La NetworkPolicy sous `security.networkPolicy` refuse les entrées et sorties par défaut. Seuls les pods du namespace du contrôleur Ingress configuré peuvent joindre TCP 8080 ; `ingress.podSelector` permet de sélectionner précisément ce contrôleur. Les sorties DNS vers kube-dns restent autorisées. Avec `catalogueAuth.enabled`, TCP 443 vers `authCidrs` permet la découverte et les JWKS Keycloak. Restreindre ces CIDR en production. Le catalogue ne contacte jamais les MCP distants. L'application nécessite un CNI compatible ; les flux depuis le nœud et certains contrôleurs en hostNetwork ont un comportement propre au CNI. Les autres NetworkPolicies peuvent ajouter des autorisations. Voir [Kubernetes](https://kubernetes.io/docs/concepts/services-networking/network-policies/).
+
+Les définitions API persistent sur un PVC de 100 Mi par défaut. Le système de fichiers racine reste en lecture seule. Les ajouts sont synchronisés et remplacés atomiquement avant publication ; un seul écrivain est autorisé et les mises à jour utilisent Recreate. Le fichier persistant est validé au démarrage et ne contient pas de valeurs privées de headers, tokens OAuth ni secrets. Sauvegarder le PVC ; il est conservé par Helm à la désinstallation.
+
 
 La vérification JWT exige RS256, issuer et audience configurés, expiration, `nbf`, sujet et type `Bearer`. Aucun scope personnalisé n’est imposé. La découverte et les overrides d’endpoints Keycloak sont en HTTPS, sans redirection vers un autre endpoint. Le cache JWKS est borné et les rafraîchissements sur un `kid` inconnu sont limités.
 
@@ -26,7 +29,7 @@ Validation locale possible avec une image construite :
 
 ```sh
 nerdctl run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \
-  --user 10001:10001 -p 18080:8080 temba-catalog:1.0.0
+  --user 10001:10001 -p 18080:8080 temba-catalog:1.3.1
 ```
 
 Le runtime n’écrit aucun fichier pour démarrer ou servir le catalogue. L’authentification navigateur et les callbacks OAuth appartiennent au client local ; aucun callback OAuth n’est exposé par ce conteneur.
