@@ -340,16 +340,33 @@ async fn start(State(s): State<Arc<CallbackState>>, Query(p): Query<Params>) -> 
     }
     Redirect::temporary(&s.authorize).into_response()
 }
+// Only fixed application messages are rendered; no OAuth query/provider data.
+fn authorization_page(title: &str, message: &str, success: bool) -> Html<String> {
+    Html(
+        include_str!("../assets/oauth-result.html")
+            .replace("{{TITLE}}", title)
+            .replace("{{MESSAGE}}", message)
+            .replace("{{CLASS}}", if success { "success" } else { "error" })
+            .replace(
+                "{{ICON}}",
+                if success {
+                    "<path d=\"m5 12 4 4 10-10\"/>"
+                } else {
+                    "<path d=\"M12 5v8M12 17v.5\"/>"
+                },
+            ),
+    )
+}
 async fn callback(State(s): State<Arc<CallbackState>>, Query(p): Query<Params>) -> Response {
     if p.state.as_deref() != Some(s.state.as_str()) || p.code.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            Html("Lien invalide ou autorisation refusee. Relance la connexion dans ton agent."),
+            authorization_page("Unable to authorize", "This authorization link is invalid, expired, or access was denied. Return to your AI client and start a new connection.", false),
         )
             .into_response();
     }
     let Some(tx) = s.sender.lock().await.take() else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, authorization_page("Link already used", "This authorization link has already been used. Return to your AI client to continue or start a new connection.", false)).into_response();
     };
     let (reply, rx) = oneshot::channel();
     if tx
@@ -360,15 +377,15 @@ async fn callback(State(s): State<Arc<CallbackState>>, Query(p): Query<Params>) 
         })
         .is_err()
     {
-        return StatusCode::GONE.into_response();
+        return (StatusCode::GONE, authorization_page("Connection expired", "This connection request is no longer active. Return to your AI client and start a new connection.", false)).into_response();
     }
     match tokio::time::timeout(Duration::from_secs(45), rx).await {
         Ok(Ok(true)) => {
-            Html("Connexion autorisee. Reviens dans ton agent pour poursuivre.").into_response()
+            authorization_page("Authentication complete", "You have successfully authorized this connection. Return to your AI client to continue.", true).into_response()
         }
         _ => (
             StatusCode::BAD_GATEWAY,
-            Html("Connexion impossible. Relance la connexion dans ton agent."),
+            authorization_page("Connection unsuccessful", "Authentication could not be completed. Return to your AI client and try connecting again.", false),
         )
             .into_response(),
     }

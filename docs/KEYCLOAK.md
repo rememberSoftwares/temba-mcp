@@ -65,10 +65,10 @@ L'authentification propre au MCP (bloc `oauth` et/ou liste `headers`) reste ind�
 
 ## 5. Tester
 
-Après déploiement, relancer OpenCode et terminer la connexion au catalogue dans le navigateur. Un membre de `/temba-jira` voit Jira ; un utilisateur hors du groupe ne le voit pas.
+Après déploiement, relancer OpenCode, demander une recherche d’outils à l’agent et terminer la connexion au catalogue dans le navigateur. Un membre de `/temba-jira` voit Jira ; un utilisateur hors du groupe ne le voit pas.
 
 Si Jira manque : vérifier l'appartenance au groupe et les deux mappers. **Client scopes → Evaluate → sélectionner l'utilisateur → Generated access token** doit contenir `groups: ["/temba-jira"]` et une audience `aud` contenant `temba-mcp`.
 
-Un changement de groupe prend effet avec un **nouveau token**, puis le rafraîchissement du catalogue. Relancer OpenCode permet de refaire ce test immédiatement. La connexion au catalogue ne connecte pas automatiquement à Jira.
+Un changement de groupe prend effet avec un **nouveau token**, puis le rafraîchissement du catalogue. Redémarrer le client Temba puis demander une recherche d’outils permet de refaire ce test. Si OpenCode utilise un serveur `opencode serve` persistant, redémarrer ce serveur aussi. La connexion au catalogue ne connecte pas automatiquement à Jira.
 
 Référence : [mappers Keycloak](https://www.keycloak.org/admin-api/protocol-mappers).
