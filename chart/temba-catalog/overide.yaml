@@ -1,4 +1,4 @@
-# Local migration: keep the existing Keycloak audience mapper; no custom scope.
+# Local Minikube test: dev / pm groups; token MCPs exposed by loopback port-forward.
 catalogueAuth:
   enabled: true
   clientId: temba
@@ -8,22 +8,56 @@ catalogueAuth:
   tokenEndpoint: https://auth.m.space-e2bd42e8.hcp.cloudgouv-eu-west-1.numspot.com/realms/master/protocol/openid-connect/token
 catalog:
   servers:
-    - id: jira
-      name: Jira
-      description: Search Jira tickets and projects through the Atlassian remote MCP
-      endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
-      labels: [jira]
-      oauth:
-        allowedOrigins: [https://auth.atlassian.com]
-      access:
-        groupsAnyOf: ["/temba-jira"]
+  - id: gitlab
+    name: GitLab (token)
+    description: GitLab tools for the dev group; project and instance configured on
+      the MCP server. Requires a client-provided raw GitLab token.
+    endpoint: http://127.0.0.1:18082/mcp
+    headers:
+    - name: X-Gitlab-Token
+      credential: token
+      mandatory: true
+    access:
+      groupsAnyOf:
+      - /dev
 
-    - id: deepwiki
-      endpoint: https://mcp.deepwiki.com/mcp
-      timeoutSeconds: 45
-      labels: [docs]
-      access: {public: true}
+  - id: jira-token
+    name: Jira (token)
+    description: Jira support tools for the dev group; instance URL and email configured
+      on the MCP server. Requires a client-provided raw Jira token.
+    endpoint: http://127.0.0.1:18081/mcp
+    labels:
+    - support
+    headers:
+    - name: X-Jira-Token
+      credential: token
+      mandatory: true
+    access:
+      groupsAnyOf:
+      - /dev
+
+  - id: jira
+    name: Jira (OIDC)
+    description: Atlassian remote Jira MCP for the pm group; sign in using its browser
+      OAuth flow.
+    endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
+    oauth:
+      allowedOrigins:
+      - https://auth.atlassian.com
+    access:
+      groupsAnyOf:
+      - /pm
+
+  - id: deepwiki
+    name: DeepWiki
+    description: Public technical documentation tools.
+    endpoint: https://mcp.deepwiki.com/mcp
+    timeoutSeconds: 45
+    access:
+      public: true
 
 persistence:
-  size: 5Gi
-  storageClass: ""
+  size: 100Mi
+  storageClass: ''
+security:
+  allowLoopbackHttp: true

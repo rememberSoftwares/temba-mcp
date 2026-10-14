@@ -1,4 +1,5 @@
 mod config;
+mod local_catalog;
 mod oauth;
 mod search;
 mod transport;
@@ -19,7 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use temba_core::{Catalog, Server};
 use tokio::sync::{Mutex, RwLock};
@@ -36,6 +37,7 @@ struct Args {
 struct Entry {
     retired: AtomicBool,
     definition: Server,
+    personal: Option<local_catalog::Personal>,
     state: RwLock<Remote>,
     operation: Mutex<()>,
     login: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -50,20 +52,30 @@ struct Local {
     config: config::Config,
     http: reqwest::Client,
     servers: RwLock<BTreeMap<String, Arc<Entry>>>,
+    personal: RwLock<BTreeMap<String, Arc<Entry>>>,
     etag: Mutex<Option<String>>,
     catalog_session: Mutex<Option<Arc<oauth::Session>>>,
     catalog_login: Mutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_auth: RwLock<Option<oauth::CatalogAuth>>,
+    catalog_status: RwLock<&'static str>,
     refresh: Mutex<()>,
 }
 #[derive(Debug)]
-struct MissingHeaders(Vec<String>);
+struct MissingHeaders(Vec<temba_core::Header>);
 impl std::fmt::Display for MissingHeaders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "Mandatory local headers missing: {}. Configure their environment variables in the local TOML and restart the client; do not provide secrets in chat.",
-            self.0.join(", ")
+            self.0
+                .iter()
+                .map(|h| format!(
+                    "{} ({})",
+                    h.name,
+                    h.credential.as_deref().unwrap_or_default()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
 }
@@ -93,6 +105,7 @@ impl Entry {
         Self {
             retired: AtomicBool::new(false),
             definition,
+            personal: None,
             state: RwLock::new(Remote {
                 status,
                 tools: vec![],
@@ -102,6 +115,11 @@ impl Entry {
             operation: Mutex::new(()),
             login: Mutex::new(None),
         }
+    }
+    fn label(&self) -> &str {
+        self.personal
+            .as_ref()
+            .map_or(self.definition.id.as_str(), |p| p.label.as_str())
     }
     async fn close(&self) {
         if let Some(task) = self.login.lock().await.take() {
@@ -117,6 +135,9 @@ impl Entry {
         }
         s.tools.clear();
         s.status = "disconnected";
+        if let Some(personal) = &self.personal {
+            personal.headers.lock().unwrap().clear();
+        }
     }
 }
 impl Local {
@@ -138,6 +159,12 @@ impl Local {
                 temba_core::https_override(&a.token_endpoint, &a.issuer)?;
             }
         }
+        let mut status = self.catalog_status.write().await;
+        if auth.is_none() {
+            *status = "public";
+        } else if *status == "public" {
+            *status = "auth_required";
+        }
         *self.catalog_auth.write().await = auth;
         Ok(())
     }
@@ -157,6 +184,7 @@ impl Local {
                 Err(_) => {
                     session.clear().await;
                     self.catalog_session.lock().await.take();
+                    *self.catalog_status.write().await = "auth_required";
                     self.drop_authenticated().await;
                     return Err(anyhow::anyhow!("Catalog reconnection required"));
                 }
@@ -164,6 +192,9 @@ impl Local {
         }
         let response = req.send().await?;
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if self.catalog_session.lock().await.is_some() {
+                *self.catalog_status.write().await = "authenticated";
+            }
             return Ok(());
         }
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -171,6 +202,7 @@ impl Local {
                 session.clear().await;
             }
             *self.etag.lock().await = None;
+            *self.catalog_status.write().await = "auth_required";
             self.drop_authenticated().await;
             bail_catalog();
             return Err(anyhow::anyhow!("Catalog reconnection required"));
@@ -183,9 +215,9 @@ impl Local {
             .map(str::to_owned);
         let mut catalog: Catalog = temba_core::http_json(response).await?;
         catalog.validate(self.config.allow_loopback_http)?;
-        catalog.servers.retain(|s| {
-            self.config.labels.is_empty() || self.config.labels.iter().all(|l| s.labels.contains(l))
-        });
+        catalog
+            .servers
+            .retain(|s| s.labels.iter().all(|l| self.config.labels.contains(l)));
         let old = self.servers.read().await.clone();
         let mut next = BTreeMap::new();
         let mut connect = vec![];
@@ -197,13 +229,13 @@ impl Local {
                 existing.clone()
             } else {
                 let e = Arc::new(Entry::new(definition));
-                if let Err(error) = self.credential_headers(&e.definition) {
+                if let Err(error) = self.credential_headers(&e) {
                     e.state.write().await.status = if error.is::<MissingHeaders>() {
                         "credentials_required"
                     } else {
                         "connection_failed"
                     };
-                    eprintln!("MCP {}: {}", e.definition.id, setup_error(&error));
+                    eprintln!("MCP {}: {}", e.label(), setup_error(&error));
                 } else if e.definition.oauth.is_none() {
                     connect.push(e.clone());
                 }
@@ -221,6 +253,9 @@ impl Local {
         for e in removed {
             e.retired.store(true, Ordering::SeqCst);
             e.close().await;
+        }
+        if self.catalog_session.lock().await.is_some() {
+            *self.catalog_status.write().await = "authenticated";
         }
         self.log_progress("Catalog: visible MCPs loaded").await;
         let local = self.clone();
@@ -257,6 +292,13 @@ impl Local {
             pending.join(", ")
         );
     }
+    async fn log_entry(&self, entry: &Entry, event: &str) {
+        if entry.personal.is_some() {
+            eprintln!("Local {event}");
+        } else {
+            self.log_progress(event).await;
+        }
+    }
     async fn drop_authenticated(&self) {
         *self.etag.lock().await = None;
         let mut servers = self.servers.write().await;
@@ -272,24 +314,36 @@ impl Local {
             e.close().await;
         }
     }
-    fn credential_headers(&self, definition: &Server) -> Result<reqwest::header::HeaderMap> {
+    fn credential_headers(&self, entry: &Entry) -> Result<reqwest::header::HeaderMap> {
+        let definition = &entry.definition;
         let mut headers = reqwest::header::HeaderMap::new();
         let tool = self.config.tool.get(&definition.id);
         let mut missing = Vec::new();
         for header in &definition.headers {
             let (value, private) = if let Some(reference) = &header.credential {
-                let value = match tool.and_then(|t| t.headers.get(reference)) {
-                    Some(source) => source.resolve()?,
-                    None => None,
+                let value = if let Some(personal) = &entry.personal {
+                    personal
+                        .headers
+                        .lock()
+                        .unwrap()
+                        .get(reference)
+                        .filter(|v| !v.is_empty())
+                        .cloned()
+                } else {
+                    match tool.and_then(|t| t.headers.get(reference)) {
+                        Some(source) => source.resolve()?,
+                        None => None,
+                    }
                 };
                 let Some(value) = value else {
                     if header.mandatory {
-                        missing.push(format!("{} ({reference})", header.name));
+                        missing.push(header.clone());
                     }
                     continue;
                 };
                 ensure!(
-                    tool.is_some_and(|t| t.expected_endpoint == definition.endpoint),
+                    entry.personal.is_some()
+                        || tool.is_some_and(|t| t.expected_endpoint == definition.endpoint),
                     "Static credential destination mismatch"
                 );
                 (value, true)
@@ -332,9 +386,9 @@ impl Local {
         if let Some(old) = old {
             let _ = tokio::time::timeout(Duration::from_secs(2), old.cancel()).await;
         }
-        self.log_progress(&format!("MCP {}: connecting", e.definition.id))
+        self.log_entry(e, &format!("MCP {}: connecting", e.label()))
             .await;
-        let credential_headers = match self.credential_headers(&e.definition) {
+        let credential_headers = match self.credential_headers(e) {
             Ok(headers) => headers,
             Err(error) => {
                 e.state.write().await.status = if error.is::<MissingHeaders>() {
@@ -342,7 +396,7 @@ impl Local {
                 } else {
                     "connection_failed"
                 };
-                self.log_progress(&format!("MCP {}: {}", e.definition.id, setup_error(&error)))
+                self.log_entry(e, &format!("MCP {}: {}", e.label(), setup_error(&error)))
                     .await;
                 return;
             }
@@ -380,12 +434,12 @@ impl Local {
                 e.state.write().await.status = "connection_failed";
                 eprintln!(
                     "MCP {}: connection failed; check ingress and local credentials",
-                    e.definition.id
+                    e.label()
                 );
             }
         }
         let status = e.state.read().await.status;
-        self.log_progress(&format!("MCP {}: {status}", e.definition.id))
+        self.log_entry(e, &format!("MCP {}: {status}", e.label()))
             .await;
     }
     async fn login(self: &Arc<Self>, e: Arc<Entry>) -> Result<Value> {
@@ -402,7 +456,7 @@ impl Local {
                 json!({"status":e.state.read().await.status,"target":"remote_mcp","server":e.definition.id}),
             );
         };
-        let headers = match self.credential_headers(&e.definition) {
+        let headers = match self.credential_headers(&e) {
             Ok(headers) => headers,
             Err(error) => {
                 e.state.write().await.status = if error.is::<MissingHeaders>() {
@@ -434,7 +488,7 @@ impl Local {
         .await?;
         let url = pending.url.clone();
         e.state.write().await.status = "auth_in_progress";
-        self.log_progress(&format!("MCP {}: auth_in_progress", e.definition.id))
+        self.log_entry(&e, &format!("MCP {}: auth_in_progress", e.label()))
             .await;
         let local = self.clone();
         let entry = e.clone();
@@ -450,10 +504,10 @@ impl Local {
                 Err(_) => {
                     entry.state.write().await.status = "auth_required";
                     local
-                        .log_progress(&format!(
-                            "MCP {}: authorization failed or timed out",
-                            entry.definition.id
-                        ))
+                        .log_entry(
+                            &entry,
+                            &format!("MCP {}: authorization failed or timed out", entry.label()),
+                        )
                         .await;
                 }
             }
@@ -470,11 +524,32 @@ impl Local {
             json!({"status":"auth_in_progress","target":"remote_mcp","server":e.definition.id,"url":url,"hint":format!("Authorization for MCP {} started. Finish it in your browser, then repeat tool_search. Do not claim the MCP is connected until its status is ready.",e.definition.id)}),
         )
     }
+    async fn ensure_catalog_login(self: &Arc<Self>) {
+        let required = *self.catalog_status.read().await == "auth_required";
+        if required && let Err(error) = self.catalog_login().await {
+            eprintln!("Catalog: {}", setup_error(&error));
+        }
+    }
     async fn catalog_login(self: &Arc<Self>) -> Result<Value> {
+        let response = self.start_catalog_login().await;
+        if response.is_err() {
+            *self.catalog_status.write().await = "auth_failed";
+        }
+        response
+    }
+    async fn start_catalog_login(self: &Arc<Self>) -> Result<Value> {
         let mut task = self.catalog_login.lock().await;
         if task.as_ref().is_some_and(|t| !t.is_finished()) {
             return Ok(catalog_login_response(None));
         }
+        if let Some(session) = self.catalog_session.lock().await.clone()
+            && session.access().await.is_ok()
+        {
+            return Ok(
+                json!({"status":*self.catalog_status.read().await,"target":"catalog","catalog":"temba","hint":"The Temba catalog is already authenticated. No login action is required."}),
+            );
+        }
+        *self.catalog_status.write().await = "auth_in_progress";
         self.bootstrap().await?;
         let auth = self
             .catalog_auth
@@ -505,15 +580,22 @@ impl Local {
             match pending.finish().await {
                 Ok(session) => {
                     eprintln!("Catalog: authentication succeeded");
+                    *local.catalog_status.write().await = "loading";
                     *local.catalog_session.lock().await = Some(session);
                     *local.etag.lock().await = None;
                     if local.refresh().await.is_err() {
                         eprintln!("Catalog: authenticated refresh failed");
+                        if local.catalog_session.lock().await.is_some() {
+                            *local.catalog_status.write().await = "catalog_unavailable";
+                        }
                     } else {
                         eprintln!("Catalog: protected definitions loaded");
                     }
                 }
-                Err(_) => eprintln!("Catalog: authorization failed or timed out"),
+                Err(_) => {
+                    *local.catalog_status.write().await = "auth_failed";
+                    eprintln!("Catalog: authorization failed or timed out");
+                }
             }
         }));
         let browser_url = url.clone();
@@ -526,21 +608,32 @@ impl Local {
         });
         Ok(catalog_login_response(Some(&url)))
     }
-    async fn search(&self, query: &str) -> Value {
-        let entries = self.servers.read().await.clone();
+    async fn search(self: &Arc<Self>, query: &str, local_ids: &[String]) -> Value {
+        self.ensure_catalog_login().await;
+        let mut entries = self.servers.read().await.clone();
+        for id in local_ids.iter().take(64) {
+            if let Some(entry) = self.personal_entry(id).await {
+                entries.insert(id.clone(), entry);
+            }
+        }
         let mut rows = vec![];
         let mut docs = vec![];
         let mut states = vec![];
         for e in entries.values() {
             let s = e.state.read().await;
-            states.push(
-                json!({"server":e.definition.id,"status":s.status,"headers":e.definition.headers}),
-            );
+            let mut state = json!({"server":e.definition.id,"label":e.label(),"status":s.status});
+            if s.status == "credentials_required"
+                && let Err(error) = self.credential_headers(e)
+                && let Some(missing) = error.downcast_ref::<MissingHeaders>()
+            {
+                state["missing_headers"] = json!(missing.0);
+            }
+            states.push(state);
             if s.status == "ready" {
                 for t in &s.tools {
                     docs.push(format!(
                         "{} {} {} {}",
-                        e.definition.id,
+                        e.label(),
                         e.definition.description,
                         t.name,
                         t.description.as_deref().unwrap_or("")
@@ -550,12 +643,12 @@ impl Local {
             } else {
                 docs.push(format!(
                     "{} {} {} {}",
-                    e.definition.id,
+                    e.label(),
                     e.definition.name,
                     e.definition.description,
                     e.definition.labels.join(" ")
                 ));
-                rows.push(json!({"tool_id":format!("{}.__temba_connect__",e.definition.id),"description":if s.status == "credentials_required" { format!("MCP {} needs mandatory local headers. Inspect its headers metadata, configure credentials in the local TOML/environment and restart the client. Do not ask for secret values in chat; this action cannot supply them.",e.definition.id) } else { format!("Connect to MCP {} ({}). This action concerns only this remote MCP. For OAuth, finish authorization in your browser and search again; connection succeeds only when its status is ready.",e.definition.id,e.definition.description) },"target":"remote_mcp","server":e.definition.id,"status":s.status}));
+                rows.push(json!({"tool_id":format!("{}.__temba_connect__",e.definition.id),"description":if s.status == "credentials_required" { format!("MCP {} needs mandatory local headers. Inspect missing_headers, configure credentials in the local TOML/environment and restart the client. Do not ask for secret values in chat; this action cannot supply them.",e.definition.id) } else { format!("Connect to MCP {} ({}). This action concerns only this remote MCP. For OAuth, finish authorization in your browser and search again; connection succeeds only when its status is ready.",e.definition.id,e.definition.description) },"target":"remote_mcp","server":e.definition.id,"status":s.status}));
             }
         }
         let scores = search::scores(query, &docs);
@@ -568,15 +661,29 @@ impl Local {
             .map(|i| rows[i].clone())
             .collect();
         let catalog_auth_enabled = self.catalog_auth.read().await.is_some();
+        let catalog_status = *self.catalog_status.read().await;
+        let retry_login = catalog_auth_enabled && catalog_status == "auth_failed";
         json!({
             "tools":tools,
             "servers":states,
-            "catalog_connect_tool":if catalog_auth_enabled{Some("__catalog__.__temba_connect__")}else{None},
+            "catalog_connect_tool":if retry_login{Some("__catalog__.__temba_connect__")}else{None},
             "catalog": {
+                "authentication_enabled": catalog_auth_enabled,
                 "authenticated": self.catalog_session.lock().await.is_some(),
-                "connect_description": if catalog_auth_enabled { Some("Sign in to the Temba catalog to reload definitions visible to your identity. This does not authenticate to any remote MCP or grant group membership.") } else { None }
+                "status": catalog_status,
+                "automatic_login": catalog_auth_enabled,
+                "connect_description": if retry_login { Some("Retry the failed Temba catalog browser login. This does not connect any remote MCP.") } else { None },
+                "hint": match catalog_status {
+                    "public" => "Catalog login is disabled; no authentication is required.",
+                    "authenticated" => "The catalog is authenticated. Do not suggest catalog login because an MCP is missing; permissions and labels still apply.",
+                    "auth_in_progress" => "Catalog login started automatically. Tell the user to finish authorization in their browser and search again. Do not ask whether to call a connection tool.",
+                    "loading" => "Catalog authentication succeeded; protected definitions are loading. Search again shortly; no login action is required.",
+                    "auth_failed" => "Automatic catalog login failed or timed out. Explain the failure; the returned catalog_connect_tool retries browser login. Do not ask the user to choose a technical tool identifier.",
+                    "catalog_unavailable" => "Authenticated catalog reload failed. Search again later; this is not a request to log in.",
+                    _ => "Catalog login is managed automatically by the client; no technical choice is required from the user."
+                }
             },
-            "hint":"Only listed servers are currently visible. A missing MCP may be unavailable or filtered by catalog permissions or local labels; do not infer the reason or invent its tool_id. Catalog login is separate from remote MCP login."
+            "hint":"Only listed servers are currently visible. A missing MCP may be unavailable or filtered by catalog permissions or local labels; do not infer the reason or invent its tool_id. Catalog login is separate from remote MCP login. Local registrations require their secret local_ids; unknown or expired IDs expose no tools and must be registered again."
         })
     }
     async fn call(
@@ -598,9 +705,15 @@ impl Local {
                         s.clear().await;
                     }
                     *self.etag.lock().await = None;
+                    *self.catalog_status.write().await = "auth_required";
                     let entries = self.servers.read().await.clone();
                     for e in entries.values() {
                         e.close().await;
+                    }
+                    let personal = std::mem::take(&mut *self.personal.write().await);
+                    for entry in personal.values() {
+                        entry.retired.store(true, Ordering::SeqCst);
+                        entry.close().await;
                     }
                     self.refresh().await?;
                     Ok(result(json!({"status":"disconnected"})))
@@ -608,17 +721,21 @@ impl Local {
                 _ => Err(anyhow::anyhow!("Unknown catalog action")),
             };
         }
-        let e = self
-            .servers
-            .read()
-            .await
-            .get(server)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Unknown server or excluded by labels"))?;
+        let e = match self.servers.read().await.get(server).cloned() {
+            Some(entry) => entry,
+            None => self
+                .personal_entry(server)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Unknown, expired or unavailable server"))?,
+        };
         if name == "__temba_connect__" {
             return Ok(result(self.login(e).await?));
         }
         if name == "__temba_disconnect__" {
+            if e.personal.is_some() {
+                self.personal.write().await.remove(server);
+                e.retired.store(true, Ordering::SeqCst);
+            }
             e.close().await;
             return Ok(result(json!({"status":"disconnected"})));
         }
@@ -658,6 +775,9 @@ impl Local {
 }
 // Only report controlled diagnostics, never provider response bodies or credentials.
 fn setup_error(error: &anyhow::Error) -> String {
+    if let Some(error) = error.downcast_ref::<local_catalog::RegistrationError>() {
+        return error.to_string();
+    }
     if let Some(missing) = error.downcast_ref::<MissingHeaders>() {
         return missing.to_string();
     }
@@ -700,18 +820,51 @@ fn catalog_login_response(url: Option<&str>) -> Value {
     response
 }
 fn bail_catalog() {
-    eprintln!("Catalog: authorization rejected; reconnect using __catalog__.__temba_connect__");
+    eprintln!("Catalog: authorization rejected; automatic reconnection required");
 }
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to Jira or another remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory headers must be configured locally; inspect the headers metadata and never ask users to paste secrets in chat. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.")
+        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically when enabled. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to Jira or another remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
+        if self.0.config.local_catalog.enabled {
+            let instructions = info.instructions.clone().unwrap_or_default();
+            info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM.", instructions))
+        } else {
+            info
+        }
     }
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools=vec![Tool::new("tool_search","Search visible tools and remote MCP connection states. An absent MCP may be filtered by permissions or labels. catalog_connect_tool signs in only to Temba; it does not connect to a remote MCP.",json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}).as_object().unwrap().clone()),Tool::new("call_tool","Call a tool_id returned by tool_search. __catalog__.__temba_connect__ authenticates only to the Temba catalog; <server>.__temba_connect__ connects only to that visible remote MCP. Report the returned target and status accurately.",json!({"type":"object","properties":{"tool_id":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_id"],"additionalProperties":false}).as_object().unwrap().clone())];
+        let mut tools=vec![Tool::new("tool_search","Search central tools and remote MCP connection states. To include ephemeral local MCPs, supply their secret IDs in local_ids. Local MCPs are never enumerated without their IDs. Catalog authentication is automatic; catalog.status reports public, auth_in_progress, loading, authenticated or failure. catalog_connect_tool is returned only to retry a failed catalog login.",json!({"type":"object","properties":{"query":{"type":"string"},"local_ids":{"type":"array","items":{"type":"string"},"maxItems":64}},"required":["query"],"additionalProperties":false}).as_object().unwrap().clone()),Tool::new("call_tool","Call a tool_id returned by tool_search. __catalog__.__temba_connect__ authenticates only to the Temba catalog; <server>.__temba_connect__ connects only to that visible remote MCP. Report the returned target and status accurately.",json!({"type":"object","properties":{"tool_id":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_id"],"additionalProperties":false}).as_object().unwrap().clone())];
+        if self.0.config.local_catalog.enabled {
+            tools.push(Tool::new("add_mcp",
+                "Register an ephemeral MCP in local RAM and return a secret local_id. Supply a definition using endpoint, oauth and header declarations, and optional private header values keyed by credential reference. No central modification or file persistence. Only callers presenting local_id can discover/use this registration. OAuth authorization is a separate browser action. Never publish another conversation's local_id.",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "definition":{
+                            "type":"object",
+                            "properties":{
+                                "id":{"type":"string"},
+                                "name":{"type":"string"},
+                                "description":{"type":"string"},
+                                "labels":{"type":"array","items":{"type":"string"}},
+                                "endpoint":{"type":"string"},
+                                "oauth":{"type":"object"},
+                                "headers":{"type":"array","items":{"type":"object"}},
+                                "timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}
+                            },
+                            "required":["id","endpoint"],
+                            "additionalProperties":false
+                        },
+                        "headers":{"type":"object","additionalProperties":{"type":"string"}}
+                    },
+                    "required":["definition"],
+                    "additionalProperties":false
+                }).as_object().unwrap().clone()));
+        }
         Ok(ListToolsResult {
             tools,
             ..Default::default()
@@ -725,7 +878,43 @@ impl ServerHandler for Handler {
         let args = p.arguments.unwrap_or_default();
         let string = |key| args.get(key).and_then(Value::as_str);
         match p.name.as_ref() {
-            "tool_search" => Ok(result(self.0.search(string("query").unwrap_or("")).await)),
+            "tool_search" => {
+                let ids: Vec<String> = match args.get("local_ids") {
+                    Some(value) => match serde_json::from_value::<Vec<String>>(value.clone()) {
+                        Ok(ids) if ids.len() <= 64 => ids,
+                        _ => return Ok(failure("local_ids must be an array of up to 64 IDs")),
+                    },
+                    None => vec![],
+                };
+                Ok(result(
+                    self.0.search(string("query").unwrap_or(""), &ids).await,
+                ))
+            }
+            "add_mcp" if self.0.config.local_catalog.enabled => {
+                let definition = match args
+                    .get("definition")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<Server>(v).ok())
+                {
+                    Some(definition) => definition,
+                    None => return Ok(failure("Invalid MCP definition")),
+                };
+                let headers: BTreeMap<String, String> = match args.get("headers") {
+                    Some(value) => match serde_json::from_value(value.clone()) {
+                        Ok(headers) => headers,
+                        Err(_) => {
+                            return Ok(failure(
+                                "headers must map credential references to string values",
+                            ));
+                        }
+                    },
+                    None => BTreeMap::new(),
+                };
+                match self.0.add_personal(definition, headers).await {
+                    Ok(value) => Ok(result(value)),
+                    Err(error) => Ok(failure(&setup_error(&error))),
+                }
+            }
             "call_tool" => {
                 let Some(id) = string("tool_id") else {
                     return Ok(failure("Missing tool_id"));
@@ -741,7 +930,7 @@ impl ServerHandler for Handler {
                     Ok(r) => Ok(r),
                     Err(error) => {
                         let message = setup_error(&error);
-                        eprintln!("MCP {id}: {message}");
+                        eprintln!("MCP call failed: {message}");
                         Ok(failure(&message))
                     }
                 }
@@ -764,38 +953,56 @@ async fn main() -> Result<()> {
         config,
         http: http()?,
         servers: RwLock::new(BTreeMap::new()),
+        personal: RwLock::new(BTreeMap::new()),
         etag: Mutex::new(None),
         catalog_session: Mutex::new(None),
         catalog_login: Mutex::new(None),
         catalog_auth: RwLock::new(None),
+        catalog_status: RwLock::new("public"),
         refresh: Mutex::new(()),
     });
     local.bootstrap().await?;
     local.refresh().await?;
     let background = local.clone();
     let task = tokio::spawn(async move {
-        if background.catalog_auth.read().await.is_some() {
-            match background.catalog_login().await {
-                Ok(_) => eprintln!("Catalog: finish authentication in your browser"),
-                Err(error) => eprintln!("Catalog: {}", setup_error(&error)),
-            }
-        }
+        background.ensure_catalog_login().await;
         loop {
             tokio::time::sleep(Duration::from_secs(background.config.refresh_seconds)).await;
             if background.refresh().await.is_err() {
                 eprintln!("Catalog: refresh failed; last valid definitions retained");
             }
+            background.ensure_catalog_login().await;
         }
     });
+    let sweep = if local.config.local_catalog.enabled {
+        let owner = local.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                owner.expire_personal().await;
+            }
+        }))
+    } else {
+        None
+    };
     let service = Handler(local.clone())
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;
     task.abort();
+    if let Some(sweep) = sweep {
+        sweep.abort();
+    }
     if let Some(t) = local.catalog_login.lock().await.take() {
         t.abort();
     }
-    for e in local.servers.read().await.values() {
+    for e in local
+        .servers
+        .read()
+        .await
+        .values()
+        .chain(local.personal.read().await.values())
+    {
         e.close().await;
     }
     Ok(())
@@ -862,10 +1069,12 @@ mod integration_tests {
             config,
             http: http().unwrap(),
             servers: RwLock::new(BTreeMap::new()),
+            personal: RwLock::new(BTreeMap::new()),
             etag: Mutex::new(None),
             catalog_session: Mutex::new(None),
             catalog_login: Mutex::new(None),
             catalog_auth: RwLock::new(None),
+            catalog_status: RwLock::new("public"),
             refresh: Mutex::new(()),
         })
     }
@@ -936,7 +1145,7 @@ mod integration_tests {
         let mut config: config::Config = toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[tool.combined]\nexpected_endpoint='{url}'\n[tool.combined.headers]\napi_key={{env='PATH'}}\ntenant='Bearer complete-tenant-value'")).unwrap();
         config.validate().unwrap();
         let local = local(config);
-        let mut definition: Server = serde_json::from_value(json!({"id":"combined","endpoint":url,"oauth":{},"headers":[{"name":"X-Api-Key","credential":"api_key"},{"name":"X-Tenant","credential":"tenant"},{"name":"X-App","value":"temba"}]})).unwrap();
+        let mut definition: Server = serde_json::from_value(json!({"id":"combined","endpoint":url,"oauth":{},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-Tenant","credential":"tenant"},{"name":"X-App","value":"temba"}]})).unwrap();
         definition.validate(true).unwrap();
         let entry = Arc::new(Entry::new(definition.clone()));
         entry.state.write().await.session = Some(oauth::Session::test_session("oauth-access"));
@@ -947,6 +1156,11 @@ mod integration_tests {
             .insert("combined".into(), entry.clone());
         local.connect(&entry).await;
         assert_eq!(entry.state.read().await.status, "ready");
+        let results = local.search("combined", &[]).await;
+        assert_eq!(results["servers"][0]["status"], "ready");
+        assert!(results["servers"][0].get("headers").is_none());
+        assert!(results["servers"][0].get("missing_headers").is_none());
+        assert!(!results.to_string().contains("Bearer complete-tenant-value"));
         local.call("combined.echo", None).await.unwrap();
         let value = std::env::var("PATH").unwrap();
         for headers in upstream.headers.lock().await.iter() {
@@ -968,7 +1182,7 @@ mod integration_tests {
     async fn missing_optional_headers_are_omitted_and_mandatory_headers_block_before_network() {
         let (url, upstream, server) = mock().await;
         let config: config::Config =
-            toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true").unwrap();
+            toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[tool.mandatory]\nexpected_endpoint='{url}'\n[tool.mandatory.headers]\nprovided='private-supplied-header'")).unwrap();
         let local = local(config);
         let mut definition: Server = serde_json::from_value(json!({
             "id":"optional","endpoint":url,"headers":[
@@ -997,6 +1211,12 @@ mod integration_tests {
             value: None,
             mandatory: true,
         });
+        definition.headers.push(temba_core::Header {
+            name: "X-Provided".into(),
+            credential: Some("provided".into()),
+            value: None,
+            mandatory: true,
+        });
         let required = Arc::new(Entry::new(definition));
         local
             .servers
@@ -1007,20 +1227,345 @@ mod integration_tests {
         local.connect(&required).await;
         assert_eq!(required.state.read().await.status, "credentials_required");
         assert_eq!(upstream.requests.lock().await.len(), before);
-        let results = local.search("mandatory").await;
+        let results = local.search("mandatory", &[]).await;
         let server_row = results["servers"]
             .as_array()
             .unwrap()
             .iter()
             .find(|s| s["server"] == "mandatory")
             .unwrap();
-        assert_eq!(server_row["headers"][0]["mandatory"], false);
-        assert_eq!(server_row["headers"][2]["mandatory"], true);
-        assert_eq!(server_row["headers"][2]["credential"], "required");
-        let error = local.credential_headers(&required.definition).unwrap_err();
+        assert!(server_row.get("headers").is_none());
+        assert_eq!(server_row["missing_headers"].as_array().unwrap().len(), 1);
+        assert_eq!(server_row["missing_headers"][0]["name"], "X-Required");
+        assert_eq!(server_row["missing_headers"][0]["mandatory"], true);
+        assert_eq!(server_row["missing_headers"][0]["credential"], "required");
+        assert!(server_row["missing_headers"][0].get("value").is_none());
+        let ready_row = results["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["server"] == "optional")
+            .unwrap();
+        assert_eq!(ready_row["status"], "ready");
+        assert!(ready_row.get("headers").is_none());
+        assert!(ready_row.get("missing_headers").is_none());
+        assert!(!results.to_string().contains("private-supplied-header"));
+        let error = local.credential_headers(&required).unwrap_err();
         assert!(setup_error(&error).contains("X-Required (required)"));
         entry.close().await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn personal_ids_isolate_headers_and_expiration_and_disconnect_clear_secrets() {
+        let (a, upstream_a, task_a) = mock().await;
+        let (b, upstream_b, task_b) = mock().await;
+        let mut config: config::Config = toml::from_str(
+            "catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[local_catalog]\nenabled=true\nidle_timeout_seconds=60\nmax_servers=2"
+        ).unwrap();
+        config.validate().unwrap();
+        let local = local(config);
+        let definition = |endpoint| {
+            serde_json::from_value::<Server>(json!({
+                "id":"same-label","endpoint":endpoint,
+                "headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true}]
+            }))
+            .unwrap()
+        };
+        let ra = local
+            .add_personal(
+                definition(&a),
+                BTreeMap::from([("api_key".into(), "private-A".into())]),
+            )
+            .await
+            .unwrap();
+        let rb = local
+            .add_personal(
+                definition(&b),
+                BTreeMap::from([("api_key".into(), "private-B".into())]),
+            )
+            .await
+            .unwrap();
+        let id_a = ra["local_id"].as_str().unwrap().to_owned();
+        let id_b = rb["local_id"].as_str().unwrap().to_owned();
+        assert_ne!(id_a, id_b);
+        let key = id_a.strip_prefix("__local_").unwrap();
+        use base64::Engine;
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(key)
+                .unwrap()
+                .len(),
+            32
+        );
+        let ea = local.personal_entry(&id_a).await.unwrap();
+        let eb = local.personal_entry(&id_b).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while ea.state.read().await.status != "ready" || eb.state.read().await.status != "ready"
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let global = local.search("", &[]).await.to_string();
+        assert!(!global.contains(&id_a) && !global.contains(&id_b));
+        assert!(!global.contains("private-A") && !global.contains("private-B"));
+        let scoped = local
+            .search("", std::slice::from_ref(&id_a))
+            .await
+            .to_string();
+        assert!(scoped.contains(&format!("{id_a}.echo")) && !scoped.contains(&id_b));
+        assert!(
+            !local
+                .search("same-label", std::slice::from_ref(&id_a))
+                .await["tools"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!scoped.contains("private-A") && !scoped.contains("private-B"));
+        local.call(&format!("{id_a}.echo"), None).await.unwrap();
+        local.call(&format!("{id_b}.echo"), None).await.unwrap();
+        for h in upstream_a.headers.lock().await.iter() {
+            assert_eq!(h["x-api-key"], "private-A");
+        }
+        for h in upstream_b.headers.lock().await.iter() {
+            assert_eq!(h["x-api-key"], "private-B");
+        }
+        assert!(
+            local
+                .add_personal(
+                    definition(&a),
+                    BTreeMap::from([("api_key".into(), "C".into())])
+                )
+                .await
+                .is_err()
+        );
+        assert!(local.call("__local_unknown.echo", None).await.is_err());
+        assert_eq!(ea.label(), "same-label"); // diagnostics never use the secret ID
+        let session = oauth::Session::test_session("test-session");
+        ea.state.write().await.session = Some(session.clone());
+        *ea.personal.as_ref().unwrap().last_used.lock().await =
+            Instant::now() - Duration::from_secs(61);
+        assert!(local.call(&format!("{id_a}.echo"), None).await.is_err());
+        local.expire_personal().await;
+        assert!(local.personal.read().await.get(&id_a).is_none());
+        assert!(
+            ea.personal
+                .as_ref()
+                .unwrap()
+                .headers
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(session.access().await.is_err());
+        assert!(local.personal_entry(&id_b).await.is_some());
+        local
+            .call(&format!("{id_b}.__temba_disconnect__"), None)
+            .await
+            .unwrap();
+        assert!(local.personal_entry(&id_b).await.is_none());
+        assert!(
+            eb.personal
+                .as_ref()
+                .unwrap()
+                .headers
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        task_a.abort();
+        task_b.abort();
+    }
+    #[tokio::test]
+    async fn personal_registration_is_optional_and_does_not_reuse_toml_headers() {
+        for enabled in [false, true] {
+            let config: config::Config = toml::from_str(&format!(
+                "catalog_url='https://catalog.example.com'\n[local_catalog]\nenabled={enabled}\n[tool.shared]\nexpected_endpoint='https://mcp.example.com'\n[tool.shared.headers]\nkey='TOML-private-value'"
+            )).unwrap();
+            let local = local(config);
+            let (front, back) = tokio::io::duplex(16384);
+            let handler = Handler(local.clone());
+            let server_task =
+                tokio::spawn(async move { handler.serve(tokio::io::split(back)).await.unwrap() });
+            let client = ().serve(tokio::io::split(front)).await.unwrap();
+            let server = server_task.await.unwrap();
+            let tools = client.peer().list_all_tools().await.unwrap();
+            assert_eq!(tools.len(), if enabled { 3 } else { 2 });
+            assert_eq!(tools.iter().any(|t| t.name == "add_mcp"), enabled);
+            let definition: Server = serde_json::from_value(json!({
+                "id":"shared","endpoint":"https://mcp.example.com","oauth":{},
+                "headers":[{"name":"X-Key","credential":"key","mandatory":true}]
+            }))
+            .unwrap();
+            // Even when enabled and a TOML mapping has the same label, registrations cannot reuse it.
+            assert!(
+                local
+                    .add_personal(definition, BTreeMap::new())
+                    .await
+                    .is_err()
+            );
+            assert!(local.personal.read().await.is_empty());
+            let call = client.peer().call_tool(CallToolRequestParams::new("add_mcp").with_arguments(
+                json!({
+                    "definition":{"id":"shared","endpoint":"https://mcp.example.com","oauth":{},
+                        "headers":[{"name":"X-Key","credential":"key","mandatory":true}]},
+                    "headers":{"key":"provided-private-value"}
+                }).as_object().unwrap().clone()
+            )).await;
+            if enabled {
+                let value = serde_json::to_value(call.unwrap()).unwrap();
+                let text = value["content"][0]["text"].as_str().unwrap();
+                assert!(
+                    !text.contains("provided-private-value")
+                        && !text.contains("TOML-private-value")
+                );
+                let registration: Value = serde_json::from_str(text).unwrap();
+                assert_eq!(registration["status"], "auth_required");
+                let id = registration["local_id"].as_str().unwrap();
+                assert!(local.personal_entry(id).await.is_some());
+                local
+                    .call(&format!("{id}.__temba_disconnect__"), None)
+                    .await
+                    .unwrap();
+            } else {
+                assert!(call.is_err());
+            }
+            client.cancel().await.unwrap();
+            server.cancel().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_search_reports_state_and_only_offers_retry_after_failure() {
+        let config = toml::from_str("catalog_url='https://catalog.example.com'").unwrap();
+        let local = local(config);
+        let public = local.search("jira", &[]).await;
+        assert_eq!(public["catalog"]["status"], "public");
+        assert_eq!(public["catalog"]["authentication_enabled"], false);
+        assert!(public["catalog_connect_tool"].is_null());
+        *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
+            issuer: "https://issuer.example.com".into(),
+            client_id: "temba".into(),
+            callback_port: 19877,
+            token_endpoint: String::new(),
+        });
+        *local.catalog_status.write().await = "auth_in_progress";
+        let pending = tokio::spawn(std::future::pending::<()>());
+        *local.catalog_login.lock().await = Some(pending);
+        let waiting = local.search("jira", &[]).await;
+        assert_eq!(waiting["catalog"]["status"], "auth_in_progress");
+        assert_eq!(waiting["catalog"]["automatic_login"], true);
+        assert!(waiting["catalog_connect_tool"].is_null());
+        assert!(local.catalog_login().await.unwrap()["url"].is_null());
+        local.catalog_login.lock().await.take().unwrap().abort();
+        *local.catalog_status.write().await = "auth_failed";
+        assert_eq!(
+            local.search("jira", &[]).await["catalog_connect_tool"],
+            "__catalog__.__temba_connect__"
+        );
+        *local.catalog_session.lock().await =
+            Some(oauth::Session::test_session("test-catalog-token"));
+        *local.catalog_status.write().await = "authenticated";
+        let ready = local.search("jira", &[]).await;
+        assert_eq!(ready["catalog"]["authenticated"], true);
+        assert_eq!(ready["catalog"]["status"], "authenticated");
+        assert!(ready["catalog_connect_tool"].is_null());
+        // Calling an old connection action cannot relaunch login when already connected.
+        assert_eq!(
+            local.catalog_login().await.unwrap()["status"],
+            "authenticated"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_search_starts_login_without_llm_action_and_reports_startup_failure() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/v1/bootstrap",
+            get(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::SERVICE_UNAVAILABLE }
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let config =
+            toml::from_str(&format!("catalog_url='{base}'\nallow_loopback_http=true")).unwrap();
+        let local = local(config);
+        *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
+            issuer: "https://issuer.example.com".into(),
+            client_id: "temba".into(),
+            callback_port: 19877,
+            token_endpoint: String::new(),
+        });
+        *local.catalog_status.write().await = "auth_required";
+        let response = tokio::time::timeout(Duration::from_secs(2), local.search("jira", &[]))
+            .await
+            .unwrap();
+        assert_eq!(response["catalog"]["status"], "auth_failed");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        local.search("jira", &[]).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1); // failed logins never open a repeated browser loop
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn catalog_labels_require_explicit_opt_in_and_keep_unlabelled_servers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/v1/catalog",
+            get(|| async {
+                Json(json!({"schemaVersion":2,"servers":[
+                    {"id":"gitlab","endpoint":"https://gitlab.example.com/mcp",
+                     "headers":[{"name":"X-Token","credential":"token","mandatory":true}]},
+                    {"id":"jira","endpoint":"https://jira.example.com/mcp","labels":["support"],
+                     "headers":[{"name":"X-Token","credential":"token","mandatory":true}]},
+                    {"id":"deepwiki","endpoint":"https://deepwiki.example.com/mcp","labels":["tech"],
+                     "headers":[{"name":"X-Token","credential":"token","mandatory":true}]},
+                    {"id":"both","endpoint":"https://both.example.com/mcp","labels":["support","tech"],
+                     "headers":[{"name":"X-Token","credential":"token","mandatory":true}]}
+                ]}))
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        for (labels, expected) in [
+            ("[]", vec!["gitlab"]),
+            ("['support']", vec!["gitlab", "jira"]),
+            ("['tech']", vec!["deepwiki", "gitlab"]),
+            (
+                "['support','tech']",
+                vec!["both", "deepwiki", "gitlab", "jira"],
+            ),
+        ] {
+            let mut config: config::Config = toml::from_str(&format!(
+                "catalog_url='{base}'\nallow_loopback_http=true\nlabels={labels}"
+            ))
+            .unwrap();
+            config.validate().unwrap();
+            let local = local(config);
+            local.refresh().await.unwrap();
+            assert_eq!(
+                local
+                    .servers
+                    .read()
+                    .await
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            // Hidden entries cannot be accessed by inventing their tool IDs.
+            if !expected.contains(&"jira") {
+                assert!(local.call("jira.__temba_connect__", None).await.is_err());
+            }
+        }
+        task.abort();
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ catalog_url = "http://127.0.0.1:18080"
 allow_loopback_http = true
 refresh_seconds = 60
 search_limit = 5
-# Optional local filtering; every requested label must match.
+# Opt into labelled MCPs; [] includes only MCPs without labels.
 labels = []
 
 # A token may only be sent to this exact approved endpoint. The environment
@@ -11,3 +11,9 @@ labels = []
 # expected_endpoint = "https://grafana-mcp.example.com/mcp"
 # [tool.grafana.headers]
 # api_token = { env = "GRAFANA_AUTHORIZATION" }
+
+# Optional third tool: ephemeral registrations, never saved to disk.
+[local_catalog]
+enabled = false
+idle_timeout_seconds = 1800
+max_servers = 16
