@@ -17,13 +17,13 @@ Le client est distribué sous forme de wheels contenant un binaire Rust précomp
 Le package n’est pas encore publié. Avec un wheel fourni par la CI ou construit localement :
 
 ```sh
-uvx --from /chemin/temba_client-1.4.5-…whl temba-client --config /chemin/temba.toml
+uvx --from /chemin/temba_client-1.4.6-…whl temba-client --config /chemin/temba.toml
 ```
 
 Après publication du package, la commande sera :
 
 ```sh
-uvx --from temba-client==1.4.5 temba-client --config /chemin/temba.toml
+uvx --from temba-client==1.4.6 temba-client --config /chemin/temba.toml
 ```
 
 Copier [temba.example.toml](temba.example.toml) et adapter `catalog_url`. Exemple de configuration OpenCode pour un wheel local :
@@ -33,7 +33,7 @@ Copier [temba.example.toml](temba.example.toml) et adapter `catalog_url`. Exempl
   "mcp": {
     "temba": {
       "type": "local",
-      "command": ["uvx", "--from", "/chemin/temba_client-1.4.5-…whl", "temba-client", "--config", "/chemin/temba.toml"],
+      "command": ["uvx", "--from", "/chemin/temba_client-1.4.6-…whl", "temba-client", "--config", "/chemin/temba.toml"],
       "enabled": true
     }
   }
@@ -172,7 +172,7 @@ Chaque MCP peut être public, accessible à tous les utilisateurs connectés ou 
 
 Voir [la configuration Keycloak et les exemples de règles](docs/KEYCLOAK.md). La surcharge locale de test utilise `/dev` (GitLab et Jira par headers) et `/pm` (Jira OAuth). DeepWiki est public. Voir [le scénario de test Minikube](docs/MINIKUBE_TEST.md) pour les headers et labels.
 
-Lorsque l'authentification du catalogue est activée, le client ouvre automatiquement la connexion navigateur lors du premier appel à un outil Temba, si la session est absente ou invalide. Le démarrage, la liste des outils et le rafraîchissement périodique ne déclenchent aucune ouverture de navigateur ; le renouvellement par refresh token reste silencieux. `tool_search` expose `catalog.authentication_enabled`, `catalog.authenticated` et `catalog.status` (`public`, `auth_in_progress`, `loading`, `authenticated`, `auth_failed` ou `catalog_unavailable`). Le LLM indique uniquement que la validation est attendue dans le navigateur, sans demander à l’utilisateur de choisir un tool technique. `catalog_connect_tool` vaut `null` tant que la connexion fonctionne ou est en cours ; il est proposé uniquement pour réessayer après un échec. Une session perdue déclenche automatiquement une nouvelle connexion au prochain appel d’outil, et une action de connexion sur une session déjà valide ne rouvre pas le navigateur. Les règles portent sur les entrées MCP, pas sur les outils individuels ni sur les permissions des données distantes. Cette action reconnecte uniquement le catalogue Temba : elle ne lance pas l'OAuth de Jira et ne donne aucun droit supplémentaire. Pour connecter un MCP distant visible, utiliser son action `<serveur>.__temba_connect__` renvoyée par `tool_search`. Un MCP absent peut être filtré par les droits du catalogue ou les labels locaux ; le client ne peut pas en déduire la cause exacte.
+Lorsque l'authentification du catalogue est activée, le client ouvre automatiquement la connexion navigateur lors du premier appel à un outil Temba, si la session est absente ou invalide. Le démarrage, la liste des outils et le rafraîchissement périodique ne déclenchent aucune ouverture de navigateur ; le renouvellement par refresh token reste silencieux. `tool_search` expose `catalog.authentication_enabled`, `catalog.authenticated` et `catalog.status` (`public`, `auth_in_progress`, `loading`, `authenticated`, `auth_failed` ou `catalog_unavailable`). Après lancement de la connexion, le client attend jusqu’à 10 secondes son résultat. Si la session SSO du navigateur permet une validation immédiate, la recherche continue et les actions de connexion renvoient le statut final ; aucun « réessaie » n’est nécessaire. Une courte attente couvre aussi les connexions MCP en cours de chargement. Si la validation nécessite encore une action humaine à la fin du délai, le LLM indique uniquement qu’elle est attendue dans le navigateur, sans demander à l’utilisateur de choisir un tool technique. `catalog_connect_tool` vaut `null` tant que la connexion fonctionne ou est en cours ; il est proposé uniquement pour réessayer après un échec. Une session perdue déclenche automatiquement une nouvelle connexion au prochain appel d’outil, et une action de connexion sur une session déjà valide ne rouvre pas le navigateur. Les règles portent sur les entrées MCP, pas sur les outils individuels ni sur les permissions des données distantes. Cette action reconnecte uniquement le catalogue Temba : elle ne lance pas l'OAuth de Jira et ne donne aucun droit supplémentaire. Pour connecter un MCP distant visible, utiliser son action `<serveur>.__temba_connect__` renvoyée par `tool_search`. Un MCP absent peut être filtré par les droits du catalogue ou les labels locaux ; le client ne peut pas en déduire la cause exacte.
 
 Configuration du client Keycloak :
 

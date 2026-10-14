@@ -25,6 +25,29 @@ use std::{
 use temba_core::{Catalog, Server};
 use tokio::sync::{Mutex, RwLock};
 use zeroize::Zeroizing;
+const AUTH_COMPLETION_WAIT: Duration = Duration::from_secs(10);
+
+// Browser SSO may complete without user interaction. Wait briefly for the actual
+// outcome, including MCP discovery, rather than reporting a stale pending state.
+async fn wait_for_connection<F, Fut>(mut status: F, budget: Duration) -> &'static str
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = &'static str>,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        let current = status().await;
+        if !matches!(current, "auth_in_progress" | "loading" | "connecting") {
+            return current;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return current;
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -443,10 +466,49 @@ impl Local {
             .await;
     }
     async fn login(self: &Arc<Self>, e: Arc<Entry>) -> Result<Value> {
+        let response = self.start_remote_login(e.clone()).await?;
+        if response["status"] != "auth_in_progress" {
+            return Ok(response);
+        }
+        let status = wait_for_connection(
+            || async { e.state.read().await.status },
+            AUTH_COMPLETION_WAIT,
+        )
+        .await;
+        if status == "auth_in_progress" {
+            return Ok(response);
+        }
+        Ok(
+            json!({"status":status,"target":"remote_mcp","server":e.definition.id,
+            "hint": if status == "ready" {
+                "The MCP connection is ready. Search its tools and continue the user's request without asking them to retry or authorize again."
+            } else if status == "connecting" {
+                "Authorization is complete; MCP tools are still loading. Repeat tool_search shortly. No browser action is required."
+            } else {
+                "The MCP connection did not complete. Inspect its status with tool_search; do not report it as connected."
+            }}),
+        )
+    }
+    async fn start_remote_login(self: &Arc<Self>, e: Arc<Entry>) -> Result<Value> {
         let mut task = e.login.lock().await;
         if task.as_ref().is_some_and(|t| !t.is_finished()) {
             return Ok(
                 json!({"status":"auth_in_progress","target":"remote_mcp","server":e.definition.id,"hint":format!("Authorization for MCP {} is in progress. Finish it in your browser, then repeat tool_search.",e.definition.id)}),
+            );
+        }
+        let (ready, session) = {
+            let state = e.state.read().await;
+            (state.status == "ready", state.session.clone())
+        };
+        if let Some(session) = session
+            && session.access().await.is_ok()
+        {
+            drop(task);
+            if !ready {
+                self.connect(&e).await;
+            }
+            return Ok(
+                json!({"status":e.state.read().await.status,"target":"remote_mcp","server":e.definition.id}),
             );
         }
         let Some(oauth) = &e.definition.oauth else {
@@ -545,17 +607,39 @@ impl Local {
             *self.catalog_status.write().await = "auth_required";
             self.drop_authenticated().await;
         }
-        let required = *self.catalog_status.read().await == "auth_required";
-        if required && let Err(error) = self.catalog_login().await {
+        let status = *self.catalog_status.read().await;
+        if matches!(status, "auth_required" | "auth_in_progress")
+            && let Err(error) = self.catalog_login().await
+        {
             eprintln!("Catalog: {}", setup_error(&error));
         }
     }
     async fn catalog_login(self: &Arc<Self>) -> Result<Value> {
-        let response = self.start_catalog_login().await;
-        if response.is_err() {
-            *self.catalog_status.write().await = "auth_failed";
+        let response = match self.start_catalog_login().await {
+            Ok(response) => response,
+            Err(error) => {
+                *self.catalog_status.write().await = "auth_failed";
+                return Err(error);
+            }
+        };
+        if response["status"] != "auth_in_progress" {
+            return Ok(response);
         }
-        response
+        let status = wait_for_connection(
+            || async { *self.catalog_status.read().await },
+            AUTH_COMPLETION_WAIT,
+        )
+        .await;
+        if status == "auth_in_progress" {
+            return Ok(response);
+        }
+        Ok(json!({"status":status,"target":"catalog","catalog":"temba",
+        "hint": match status {
+            "authenticated" => "The catalog is ready. Continue the user's request without asking them to retry or authorize again.",
+            "loading" => "Authentication is complete; catalog definitions are still loading. Search again shortly. No browser action is required.",
+            "catalog_unavailable" => "Authentication is complete but catalog loading failed. Search again later; no browser authorization is required.",
+            _ => "Catalog authentication did not complete. Search again to inspect its status."
+        }}))
     }
     async fn start_catalog_login(self: &Arc<Self>) -> Result<Value> {
         let mut task = self.catalog_login.lock().await;
@@ -629,7 +713,27 @@ impl Local {
         Ok(catalog_login_response(Some(&url)))
     }
     async fn search(self: &Arc<Self>, query: &str, local_ids: &[String]) -> Value {
+        let started = Instant::now();
         self.ensure_catalog_login().await;
+        let _ = wait_for_connection(
+            || async {
+                let entries = self
+                    .servers
+                    .read()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for entry in entries {
+                    if entry.state.read().await.status == "connecting" {
+                        return "connecting";
+                    }
+                }
+                "ready"
+            },
+            AUTH_COMPLETION_WAIT.saturating_sub(started.elapsed()),
+        )
+        .await;
         let mut entries = self.servers.read().await.clone();
         for id in local_ids.iter().take(64) {
             if let Some(entry) = self.personal_entry(id).await {
@@ -741,6 +845,7 @@ impl Local {
                 _ => Err(anyhow::anyhow!("Unknown catalog action")),
             };
         }
+        let started = Instant::now();
         self.ensure_catalog_login().await;
         let central = self.servers.read().await.get(server).cloned();
         let e = match central.or(self.personal_entry(server).await) {
@@ -761,6 +866,11 @@ impl Local {
             e.close().await;
             return Ok(result(json!({"status":"disconnected"})));
         }
+        let _ = wait_for_connection(
+            || async { e.state.read().await.status },
+            AUTH_COMPLETION_WAIT.saturating_sub(started.elapsed()),
+        )
+        .await;
         let _lock = e.operation.lock().await;
         ensure!(
             !e.retired.load(Ordering::SeqCst),
@@ -846,7 +956,7 @@ fn bail_catalog() {
 }
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to Jira or another remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
+        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to Jira or another remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. When a connection result is authenticated or ready, continue the original request immediately without asking the user to retry. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
         if self.0.config.local_catalog.enabled {
             let instructions = info.instructions.clone().unwrap_or_default();
             info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM.", instructions))
@@ -1037,6 +1147,7 @@ mod integration_tests {
         routing::{get, post},
     };
     struct Mock {
+        methods: Mutex<Vec<String>>,
         requests: Mutex<Vec<Option<String>>>,
         headers: Mutex<Vec<HeaderMap>>,
     }
@@ -1045,6 +1156,10 @@ mod integration_tests {
         headers: HeaderMap,
         Json(request): Json<Value>,
     ) -> Response {
+        m.methods
+            .lock()
+            .await
+            .push(request["method"].as_str().unwrap().to_owned());
         m.headers.lock().await.push(headers.clone());
         m.requests.lock().await.push(
             headers
@@ -1070,6 +1185,7 @@ mod integration_tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", l.local_addr().unwrap());
         let state = Arc::new(Mock {
+            methods: Mutex::new(vec![]),
             requests: Mutex::new(vec![]),
             headers: Mutex::new(vec![]),
         });
@@ -1179,6 +1295,9 @@ mod integration_tests {
         assert!(results["servers"][0].get("headers").is_none());
         assert!(results["servers"][0].get("missing_headers").is_none());
         assert!(!results.to_string().contains("Bearer complete-tenant-value"));
+        let requests_before = upstream.requests.lock().await.len();
+        assert_eq!(local.login(entry.clone()).await.unwrap()["status"], "ready");
+        assert_eq!(upstream.requests.lock().await.len(), requests_before);
         local.call("combined.echo", None).await.unwrap();
         let value = std::env::var("PATH").unwrap();
         for headers in upstream.headers.lock().await.iter() {
@@ -1477,7 +1596,7 @@ mod integration_tests {
         assert_eq!(waiting["catalog"]["status"], "auth_in_progress");
         assert_eq!(waiting["catalog"]["automatic_login"], true);
         assert!(waiting["catalog_connect_tool"].is_null());
-        assert!(local.catalog_login().await.unwrap()["url"].is_null());
+        assert!(local.start_catalog_login().await.unwrap()["url"].is_null());
         local.catalog_login.lock().await.take().unwrap().abort();
         *local.catalog_status.write().await = "auth_failed";
         assert_eq!(
@@ -1595,6 +1714,134 @@ mod integration_tests {
         assert_ne!(result["catalog"]["status"], "authenticated");
         assert!(local.catalog_session.lock().await.is_none());
         local.catalog_login.lock().await.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn fast_catalog_sso_search_includes_discovered_tools_without_retry() {
+        let (endpoint, _, upstream) = mock().await;
+        let local = local(toml::from_str("catalog_url='https://catalog.example.com'").unwrap());
+        *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
+            issuer: "https://issuer.example.com".into(),
+            client_id: "temba".into(),
+            callback_port: 19877,
+            token_endpoint: String::new(),
+        });
+        *local.catalog_status.write().await = "auth_in_progress";
+        let definition = serde_json::from_value(json!({"id":"jira","endpoint":endpoint})).unwrap();
+        let entry = Arc::new(Entry::new(definition));
+        let callback = local.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            *callback.catalog_session.lock().await =
+                Some(oauth::Session::test_session("test-access"));
+            callback
+                .servers
+                .write()
+                .await
+                .insert("jira".into(), entry.clone());
+            *callback.catalog_status.write().await = "authenticated";
+            callback.connect(&entry).await;
+        });
+        *local.catalog_login.lock().await = Some(task);
+        let results = local.search("echo", &[]).await;
+        assert_eq!(results["catalog"]["status"], "authenticated");
+        assert_eq!(results["servers"][0]["status"], "ready");
+        assert_eq!(results["tools"][0]["tool_id"], "jira.echo");
+        assert!(results["catalog_connect_tool"].is_null());
+        local.servers.read().await["jira"].close().await;
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn fast_catalog_sso_continues_the_original_call_once_after_discovery() {
+        let (endpoint, requests, upstream) = mock().await;
+        let local = local(toml::from_str("catalog_url='https://catalog.example.com'").unwrap());
+        *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
+            issuer: "https://issuer.example.com".into(),
+            client_id: "temba".into(),
+            callback_port: 19877,
+            token_endpoint: String::new(),
+        });
+        *local.catalog_status.write().await = "auth_in_progress";
+        let definition = serde_json::from_value(json!({"id":"jira","endpoint":endpoint})).unwrap();
+        let entry = Arc::new(Entry::new(definition));
+        let callback = local.clone();
+        let remote = entry.clone();
+        *local.catalog_login.lock().await = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            *callback.catalog_session.lock().await =
+                Some(oauth::Session::test_session("test-access"));
+            callback
+                .servers
+                .write()
+                .await
+                .insert("jira".into(), remote.clone());
+            *callback.catalog_status.write().await = "authenticated";
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            callback.connect(&remote).await;
+        }));
+        let CallToolResponse::Complete(response) = local.call("jira.echo", None).await.unwrap()
+        else {
+            panic!("Expected a completed call");
+        };
+        assert!(
+            serde_json::to_string(&response)
+                .unwrap()
+                .contains("echo-ok")
+        );
+        assert_eq!(
+            requests
+                .methods
+                .lock()
+                .await
+                .iter()
+                .filter(|m| *m == "tools/call")
+                .count(),
+            1
+        );
+        entry.close().await;
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn fast_remote_sso_connect_returns_ready_not_pending() {
+        let (endpoint, _, upstream) = mock().await;
+        let local = local(toml::from_str("catalog_url='https://catalog.example.com'").unwrap());
+        let definition =
+            serde_json::from_value(json!({"id":"jira","endpoint":endpoint,"oauth":{}})).unwrap();
+        let entry = Arc::new(Entry::new(definition));
+        entry.state.write().await.status = "auth_in_progress";
+        let callback = local.clone();
+        let remote = entry.clone();
+        *entry.login.lock().await = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            callback.connect(&remote).await;
+        }));
+        let response = local.login(entry.clone()).await.unwrap();
+        assert_eq!(response["status"], "ready");
+        assert!(response.get("url").is_none());
+        assert_eq!(response["target"], "remote_mcp");
+        entry.close().await;
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn quick_authorization_wait_is_bounded_and_reports_failure() {
+        let state = Arc::new(RwLock::new("auth_in_progress"));
+        let callback = state.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            *callback.write().await = "auth_failed";
+        });
+        assert_eq!(
+            wait_for_connection(|| async { *state.read().await }, Duration::from_millis(100)).await,
+            "auth_failed"
+        );
+        task.await.unwrap();
+        assert_eq!(
+            wait_for_connection(|| async { "auth_in_progress" }, Duration::from_millis(20)).await,
+            "auth_in_progress"
+        );
     }
 
     #[tokio::test]
