@@ -1,6 +1,6 @@
 # Local Minikube test: dev / pm groups; token MCPs exposed by loopback port-forward.
 catalogueAuth:
-  enabled: true
+  enabled: false
   clientId: temba
   audience: temba-mcp
   issuer: https://auth.m.space-e2bd42e8.hcp.cloudgouv-eu-west-1.numspot.com/realms/master

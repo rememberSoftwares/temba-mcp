@@ -17,13 +17,13 @@ Le client est distribué sous forme de wheels contenant un binaire Rust précomp
 Le package n’est pas encore publié. Avec un wheel fourni par la CI ou construit localement :
 
 ```sh
-uvx --from /chemin/temba_client-1.4.6-…whl temba-client --config /chemin/temba.toml
+uvx --from /chemin/temba_client-1.4.8-…whl temba-client --config /chemin/temba.toml
 ```
 
 Après publication du package, la commande sera :
 
 ```sh
-uvx --from temba-client==1.4.6 temba-client --config /chemin/temba.toml
+uvx --from temba-client==1.4.8 temba-client --config /chemin/temba.toml
 ```
 
 Copier [temba.example.toml](temba.example.toml) et adapter `catalog_url`. Exemple de configuration OpenCode pour un wheel local :
@@ -33,7 +33,7 @@ Copier [temba.example.toml](temba.example.toml) et adapter `catalog_url`. Exempl
   "mcp": {
     "temba": {
       "type": "local",
-      "command": ["uvx", "--from", "/chemin/temba_client-1.4.6-…whl", "temba-client", "--config", "/chemin/temba.toml"],
+      "command": ["uvx", "--from", "/chemin/temba_client-1.4.8-…whl", "temba-client", "--config", "/chemin/temba.toml"],
       "enabled": true
     }
   }
@@ -79,6 +79,26 @@ Exemple d'appel avec un header privé fourni pour cette seule connexion :
 }
 ```
 
+Pour un MCP OAuth dont le fournisseur est sur un autre domaine, déclarer cette
+origine dans **l’ajout local**, même si l’authentification du catalogue Temba est
+désactivée. Par exemple :
+
+```json
+{
+  "definition": {
+    "id": "jira-temp",
+    "endpoint": "https://mcp.atlassian.com/v2/mcp",
+    "oauth": { "allowedOrigins": ["https://auth.atlassian.com"] }
+  }
+}
+```
+
+`allowedOrigins` autorise les destinations OAuth de ce MCP ; ce champ n’active
+pas l’authentification du catalogue. Le contrôle empêche un serveur distant de
+rediriger le client vers un fournisseur non déclaré. Si l’origine a été omise,
+déconnecter l’inscription et refaire `add_mcp` avec la définition corrigée : aucun
+changement du catalogue central n’est nécessaire.
+
 Le client renvoie `local_id`, un identifiant secret de 256 bits, le statut de connexion et `connect_tool_id`. Les valeurs de `headers` sont complètes et ne sont pas renvoyées. Ces connexions ne consultent pas les headers du TOML : leurs valeurs restent propres à l'ajout.
 
 1. Appeler `add_mcp` et conserver son `local_id` dans la conversation.
@@ -87,7 +107,7 @@ Le client renvoie `local_id`, un identifiant secret de 256 bits, le statut de co
 4. Quand le statut est `ready`, appeler les `tool_id` découverts avec le `call_tool` habituel.
 5. L'action `<local_id>.__temba_disconnect__` supprime l'ajout et ses secrets.
 
-Deux conversations peuvent créer des MCP avec le même nom : elles reçoivent des IDs différents et des connexions séparées. Les ajouts ne sont jamais listés globalement, même lorsqu'ils sont prêts. Ils expirent après 30 minutes sans appel/recherche avec leur ID, ou disparaissent à l'arrêt du processus. Les limites sont configurables (délai : 60 à 86400 secondes ; nombre : 1 à 64). Le nettoyage passe toutes les 10 secondes ; un ID expiré est immédiatement refusé à l'appel.
+Deux conversations peuvent créer des MCP avec le même nom : elles reçoivent des IDs différents et des connexions séparées. Les ajouts ne sont jamais listés globalement, même lorsqu'ils sont prêts. Ils expirent après 30 minutes sans appel/recherche avec leur ID, ou disparaissent à l'arrêt du processus. Les limites sont configurables (délai : 60 à 86400 secondes ; nombre : 1 à 64). Le nettoyage passe toutes les 10 secondes ; un ID expiré est immédiatement refusé à l'appel. Ce délai d’inactivité évite de conserver des ajouts inutilisés quand le client LLM garde le processus Temba vivant entre plusieurs conversations. À l’arrêt du processus, toutes les inscriptions disparaissent immédiatement ; l’expiration est alors redondante. Ce n’est pas un minuteur qui vide tout le catalogue : chaque inscription a son propre délai, renouvelé par les recherches et appels présentant son ID.
 
 Ce mécanisme est indépendant du client LLM. **Posséder l'ID permet d'utiliser l'ajout** : aucune identité de conversation n'est inférée. Un ID copié dans une autre conversation donne donc accès à la même connexion. Sans notification de fin de conversation, le client utilise l'expiration et l'arrêt du processus pour nettoyer.
 
@@ -168,7 +188,7 @@ Les `labels` de chaque serveur dans la chart permettent de rendre son inclusion 
 
 `catalogueAuth.enabled` contrôle uniquement la connexion au catalogue ; `oauth` contrôle celle du MCP distant. Le catalogue est public par défaut : **Keycloak est optionnel**, même pour une définition de MCP distant OAuth. L’authentification au catalogue et celle à Jira sont indépendantes.
 
-Chaque MCP peut être public, accessible à tous les utilisateurs connectés ou réservé à un ou plusieurs groupes Keycloak. Par exemple `access: {groupsAnyOf: ["/temba-jira"]}` réserve l'entrée Jira à ce groupe, et `access: {public: true}` reste accessible sans connexion. Les règles sont appliquées par le catalogue à partir du claim signé `groups`, indépendamment des labels locaux. L'ancien champ `catalogAccess` est remplacé par `access`.
+Chaque MCP peut être public, accessible à tous les utilisateurs connectés ou réservé à un ou plusieurs groupes Keycloak. Par exemple `access: {groupsAnyOf: ["/equipe-a"]}` réserve une entrée MCP à ce groupe, et `access: {public: true}` reste accessible sans connexion. Les règles sont appliquées par le catalogue à partir du claim signé `groups`, indépendamment des labels locaux. L'ancien champ `catalogAccess` est remplacé par `access`.
 
 Voir [la configuration Keycloak et les exemples de règles](docs/KEYCLOAK.md). La surcharge locale de test utilise `/dev` (GitLab et Jira par headers) et `/pm` (Jira OAuth). DeepWiki est public. Voir [le scénario de test Minikube](docs/MINIKUBE_TEST.md) pour les headers et labels.
 

@@ -1,8 +1,8 @@
 # Réserver des MCP à des groupes Keycloak
 
-Un **groupe** rassemble des utilisateurs. Temba peut montrer Jira au groupe `/temba-jira`, Grafana à un autre groupe et DeepWiki à tout le monde.
+Un **groupe** rassemble des utilisateurs. Temba peut réserver un MCP à un groupe, à plusieurs groupes, ou le rendre public. Les noms de groupes sont libres ; ce guide utilise `equipe-a` et `equipe-b` comme exemples.
 
-Ces règles concernent **tous les outils d'un MCP**. Elles contrôlent sa visibilité dans le catalogue ; Jira garde ses propres permissions et sa propre connexion OAuth.
+Ces règles concernent **tous les outils d'un MCP**. Elles contrôlent sa visibilité dans le catalogue ; chaque MCP conserve ses propres permissions et son éventuelle authentification.
 
 ## 1. Configurer le client Keycloak
 
@@ -30,10 +30,10 @@ Les **groupes** indiquent ce que l'utilisateur peut voir. L'**audience** indique
 
 Si le scope dédié n'apparaît pas, placer ces mappers dans un client scope attaché à `temba` en **Default**, pour qu'ils soient toujours appliqués.
 
-## 3. Créer le groupe et affecter les utilisateurs
+## 3. Créer les groupes et affecter les utilisateurs
 
-1. **Groups → Create group** : nom `temba-jira`, au premier niveau. Son chemin sera `/temba-jira`.
-2. **Users → utilisateur → Groups → Join group** : sélectionner `temba-jira`.
+1. **Groups → Create group** : créer `equipe-a` au premier niveau. Son chemin sera `/equipe-a`. Répéter pour `equipe-b` (`/equipe-b`).
+2. **Users → utilisateur → Groups → Join group** : sélectionner un ou plusieurs de ces groupes.
 
 Le mapper transmet les appartenances ; il n'ajoute pas les utilisateurs aux groupes.
 
@@ -56,19 +56,19 @@ Dans la définition de chaque MCP, choisir **une seule** règle :
 |---|---|
 | `access: {public: true}` | Tout le monde, sans connexion au catalogue |
 | `access: {authenticated: true}` | Tous les utilisateurs connectés au catalogue |
-| `access: {groupsAnyOf: ["/temba-jira"]}` | Les membres de ce groupe |
-| `access: {groupsAnyOf: ["/X", "/Y"]}` | Les membres de X **ou** Y |
+| `access: {groupsAnyOf: ["/equipe-a"]}` | Les membres de ce groupe |
+| `access: {groupsAnyOf: ["/equipe-a", "/equipe-b"]}` | Les membres de l’une **ou** l’autre équipe |
 
-Sans `access`, le MCP est public. Les chemins doivent correspondre exactement, casse comprise. Le groupe `/X/enfant` ne correspond pas automatiquement à `/X`.
+Sans `access`, le MCP est public. Les chemins doivent correspondre exactement, casse comprise. Le groupe `/equipe-a/enfant` ne correspond pas automatiquement à `/equipe-a`.
 
 L'authentification propre au MCP (bloc `oauth` et/ou liste `headers`) reste indépendante de ces règles. Désactiver `catalogueAuth.enabled` rend les entrées protégées invisibles à tous.
 
 ## 5. Tester
 
-Après déploiement, relancer OpenCode, demander une recherche d’outils à l’agent et terminer la connexion au catalogue dans le navigateur. Un membre de `/temba-jira` voit Jira ; un utilisateur hors du groupe ne le voit pas.
+Après déploiement, relancer le client Temba, demander une recherche d’outils à l’agent et terminer la connexion au catalogue dans le navigateur. Un membre de `/equipe-a` voit les MCP réservés à ce groupe ; un utilisateur hors du groupe ne les voit pas. Les labels locaux doivent également autoriser leur affichage.
 
-Si Jira manque : vérifier l'appartenance au groupe et les deux mappers. **Client scopes → Evaluate → sélectionner l'utilisateur → Generated access token** doit contenir `groups: ["/temba-jira"]` et une audience `aud` contenant `temba-mcp`.
+Si un MCP attendu manque : vérifier l’appartenance au groupe, les labels locaux et les deux mappers. **Client scopes → Evaluate → sélectionner l'utilisateur → Generated access token** doit contenir `groups: ["/equipe-a"]` et une audience `aud` contenant `temba-mcp`.
 
-Un changement de groupe prend effet avec un **nouveau token**, puis le rafraîchissement du catalogue. Redémarrer le client Temba puis demander une recherche d’outils permet de refaire ce test. Si OpenCode utilise un serveur `opencode serve` persistant, redémarrer ce serveur aussi. La connexion au catalogue ne connecte pas automatiquement à Jira.
+Un changement de groupe prend effet avec un **nouveau token**, puis le rafraîchissement du catalogue. Redémarrer le client Temba puis demander une recherche d’outils permet de refaire ce test. Si le client LLM utilise un serveur persistant, redémarrer le processus Temba côté serveur ; rouvrir une interface ne suffit pas. La connexion au catalogue ne connecte pas automatiquement aux MCP distants.
 
 Référence : [mappers Keycloak](https://www.keycloak.org/admin-api/protocol-mappers).

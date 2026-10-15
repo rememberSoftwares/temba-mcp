@@ -17,6 +17,19 @@ impl std::fmt::Display for RegistrationError {
 }
 impl std::error::Error for RegistrationError {}
 
+#[derive(Debug)]
+pub(super) struct LocalOAuthOriginNotAllowed(pub String);
+impl std::fmt::Display for LocalOAuthOriginNotAllowed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OAuth origin {} is not approved for this ephemeral local MCP. Disconnect this registration and call add_mcp again with definition.oauth.allowedOrigins including this provider's trusted origin, then connect the new local_id. No central catalog change or Temba catalog authentication is required. Do not disable OAuth origin validation.",
+            self.0
+        )
+    }
+}
+impl std::error::Error for LocalOAuthOriginNotAllowed {}
+
 impl Local {
     pub(super) async fn add_personal(
         self: &Arc<Self>,
@@ -95,7 +108,7 @@ impl Local {
             "status":status,
             "connect_tool_id":format!("{id}.__temba_connect__"),
             "idle_timeout_seconds":self.config.local_catalog.idle_timeout_seconds,
-            "hint":"Keep local_id in this conversation. Pass local_ids:[local_id] to tool_search to discover its tools, then use their returned tool_id with call_tool. Local entries are not listed without their ID. For auth_required, use connect_tool_id to start this MCP's OAuth flow. For connecting, search again; do not report ready until confirmed. Nothing is saved to the central catalog or a local file."
+            "hint":"Keep local_id in this conversation. Pass local_ids:[local_id] to tool_search to discover its tools, then use their returned tool_id with call_tool. Local entries are not listed without their ID. For auth_required, use connect_tool_id to start this MCP's OAuth flow. For connecting, search again; do not report ready until confirmed. Catalog authentication is not required for this local registration. A provider on another origin must be declared in definition.oauth.allowedOrigins; if omitted, disconnect and register a corrected definition. Nothing is saved to the central catalog or a local file."
         }))
     }
 

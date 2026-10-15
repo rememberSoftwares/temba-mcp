@@ -538,7 +538,16 @@ impl Local {
             self.config.allow_loopback_http,
             headers,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            if e.personal.is_some()
+                && let Some(origin) = error.downcast_ref::<oauth::OriginNotAllowed>()
+            {
+                anyhow::Error::new(local_catalog::LocalOAuthOriginNotAllowed(origin.0.clone()))
+            } else {
+                error
+            }
+        })?;
         let pending = oauth::Pending::new(
             self.http.clone(),
             provider,
@@ -593,9 +602,7 @@ impl Local {
             );
         }
     }
-    async fn ensure_catalog_login(self: &Arc<Self>) {
-        // Only called by user tool requests: refresh tokens silently, never open
-        // the browser from the periodic catalog refresh.
+    async fn validate_catalog_session(self: &Arc<Self>) {
         let session = self.catalog_session.lock().await.clone();
         let auth_enabled = self.catalog_auth.read().await.is_some();
         if auth_enabled
@@ -607,6 +614,10 @@ impl Local {
             *self.catalog_status.write().await = "auth_required";
             self.drop_authenticated().await;
         }
+    }
+    async fn ensure_catalog_login(self: &Arc<Self>) {
+        // Only catalog tool requests may trigger interactive login.
+        self.validate_catalog_session().await;
         let status = *self.catalog_status.read().await;
         if matches!(status, "auth_required" | "auth_in_progress")
             && let Err(error) = self.catalog_login().await
@@ -714,7 +725,11 @@ impl Local {
     }
     async fn search(self: &Arc<Self>, query: &str, local_ids: &[String]) -> Value {
         let started = Instant::now();
-        self.ensure_catalog_login().await;
+        if local_ids.is_empty() {
+            self.ensure_catalog_login().await;
+        } else {
+            self.validate_catalog_session().await;
+        }
         let _ = wait_for_connection(
             || async {
                 let entries = self
@@ -846,14 +861,19 @@ impl Local {
             };
         }
         let started = Instant::now();
-        self.ensure_catalog_login().await;
-        let central = self.servers.read().await.get(server).cloned();
-        let e = match central.or(self.personal_entry(server).await) {
-            Some(entry) => entry,
-            None if *self.catalog_status.read().await == "auth_in_progress" => {
-                return Ok(result(catalog_login_response(None)));
+        let e = if server.starts_with("__local_") {
+            self.personal_entry(server)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Unknown, expired or unavailable server"))?
+        } else {
+            self.ensure_catalog_login().await;
+            match self.servers.read().await.get(server).cloned() {
+                Some(entry) => entry,
+                None if *self.catalog_status.read().await == "auth_in_progress" => {
+                    return Ok(result(catalog_login_response(None)));
+                }
+                None => return Err(anyhow::anyhow!("Unknown, expired or unavailable server")),
             }
-            None => return Err(anyhow::anyhow!("Unknown, expired or unavailable server")),
         };
         if name == "__temba_connect__" {
             return Ok(result(self.login(e).await?));
@@ -907,6 +927,9 @@ impl Local {
 }
 // Only report controlled diagnostics, never provider response bodies or credentials.
 fn setup_error(error: &anyhow::Error) -> String {
+    if let Some(error) = error.downcast_ref::<local_catalog::LocalOAuthOriginNotAllowed>() {
+        return error.to_string();
+    }
     if let Some(error) = error.downcast_ref::<local_catalog::RegistrationError>() {
         return error.to_string();
     }
@@ -944,7 +967,7 @@ fn catalog_login_response(url: Option<&str>) -> Value {
         "status":"auth_in_progress",
         "target":"catalog",
         "catalog":"temba",
-        "hint":"Authentication to the Temba catalog is in progress, not to Jira or any other remote MCP. Finish authorization in your browser, then repeat tool_search to reload definitions allowed for your identity. This does not grant group membership or start remote MCP authorization. If the requested MCP remains absent, report that it is not available in the visible catalog."
+        "hint":"Authentication to the Temba catalog is in progress. This does not authenticate to remote MCPs. Finish authorization in your browser, then repeat tool_search to reload definitions allowed for your identity. This does not grant group membership or start remote MCP authorization. If the requested MCP remains absent, report that it is not available in the visible catalog."
     });
     if let Some(url) = url {
         response["url"] = json!(url);
@@ -956,10 +979,10 @@ fn bail_catalog() {
 }
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to Jira or another remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. When a connection result is authenticated or ready, continue the original request immediately without asking the user to retry. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
+        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to a remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. When a connection result is authenticated or ready, continue the original request immediately without asking the user to retry. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
         if self.0.config.local_catalog.enabled {
             let instructions = info.instructions.clone().unwrap_or_default();
-            info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM.", instructions))
+            info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM. Local registration, scoped search and connection do not require catalog authentication. OAuth origin approval belongs to each MCP definition: for a local entry, use definition.oauth.allowedOrigins in add_mcp, not central server configuration. A registration can be disconnected and recreated with a corrected definition.", instructions))
         } else {
             info
         }
@@ -972,7 +995,7 @@ impl ServerHandler for Handler {
         let mut tools=vec![Tool::new("tool_search","Search central tools and remote MCP connection states. To include ephemeral local MCPs, supply their secret IDs in local_ids. Local MCPs are never enumerated without their IDs. Catalog authentication is automatic; catalog.status reports public, auth_in_progress, loading, authenticated or failure. catalog_connect_tool is returned only to retry a failed catalog login.",json!({"type":"object","properties":{"query":{"type":"string"},"local_ids":{"type":"array","items":{"type":"string"},"maxItems":64}},"required":["query"],"additionalProperties":false}).as_object().unwrap().clone()),Tool::new("call_tool","Call a tool_id returned by tool_search. __catalog__.__temba_connect__ authenticates only to the Temba catalog; <server>.__temba_connect__ connects only to that visible remote MCP. Report the returned target and status accurately.",json!({"type":"object","properties":{"tool_id":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_id"],"additionalProperties":false}).as_object().unwrap().clone())];
         if self.0.config.local_catalog.enabled {
             tools.push(Tool::new("add_mcp",
-                "Register an ephemeral MCP in local RAM and return a secret local_id. Supply a definition using endpoint, oauth and header declarations, and optional private header values keyed by credential reference. No central modification or file persistence. Only callers presenting local_id can discover/use this registration. OAuth authorization is a separate browser action. Never publish another conversation's local_id.",
+                "Register an ephemeral MCP in local RAM and return a secret local_id. Supply a definition using endpoint, oauth and header declarations, and optional private header values keyed by credential reference. No central modification or file persistence. Only callers presenting local_id can discover/use this registration. OAuth authorization is independent of catalog authentication. Declare trusted external provider origins in definition.oauth.allowedOrigins. If that field was omitted, disconnect and register a corrected local definition; do not request central server changes. OAuth authorization is a separate browser action. Never publish another conversation's local_id.",
                 json!({
                     "type":"object",
                     "properties":{
@@ -984,7 +1007,17 @@ impl ServerHandler for Handler {
                                 "description":{"type":"string"},
                                 "labels":{"type":"array","items":{"type":"string"}},
                                 "endpoint":{"type":"string"},
-                                "oauth":{"type":"object"},
+                                "oauth":{
+                                    "type":"object",
+                                    "description":"This MCP's OAuth settings, independent of catalog login. An external identity provider must be explicitly listed in allowedOrigins.",
+                                    "properties":{
+                                        "allowedOrigins":{"type":"array","items":{"type":"string","format":"uri"},"description":"Trusted HTTPS authorization-server origins. The MCP endpoint origin is already allowed."},
+                                        "clientId":{"type":["string","null"]},
+                                        "scopes":{"type":"array","items":{"type":"string"}},
+                                        "callbackPort":{"type":"integer","minimum":0,"maximum":65535}
+                                    },
+                                    "additionalProperties":false
+                                },
                                 "headers":{"type":"array","items":{"type":"object"}},
                                 "timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}
                             },
@@ -1842,6 +1875,100 @@ mod integration_tests {
             wait_for_connection(|| async { "auth_in_progress" }, Duration::from_millis(20)).await,
             "auth_in_progress"
         );
+    }
+
+    #[tokio::test]
+    async fn local_oauth_origin_rules_are_independent_of_catalog_authentication() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let resource = endpoint.clone();
+        let state = Arc::new(Mock {
+            methods: Mutex::new(vec![]),
+            requests: Mutex::new(vec![]),
+            headers: Mutex::new(vec![]),
+        });
+        let router = Router::new()
+            .route("/mcp", post(mcp).get(|| async { StatusCode::UNAUTHORIZED }))
+            .route("/.well-known/oauth-protected-resource/mcp", get(move || {
+                let resource = resource.clone();
+                async move { Json(json!({"resource":resource,"authorization_servers":["https://auth.atlassian.com"]})) }
+            })).with_state(state);
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        for authenticated_catalog in [false, true] {
+            let config = toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[local_catalog]\nenabled=true").unwrap();
+            let local = local(config);
+            if authenticated_catalog {
+                *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
+                    issuer: "https://issuer.example.com".into(),
+                    client_id: "temba".into(),
+                    callback_port: 19877,
+                    token_endpoint: String::new(),
+                });
+                *local.catalog_status.write().await = "auth_required";
+            }
+            let expected_status = if authenticated_catalog {
+                "auth_required"
+            } else {
+                "public"
+            };
+            let definition =
+                serde_json::from_value(json!({"id":"jira-temp","endpoint":endpoint,"oauth":{}}))
+                    .unwrap();
+            let registered = local
+                .add_personal(definition, BTreeMap::new())
+                .await
+                .unwrap();
+            let id = registered["local_id"].as_str().unwrap();
+            let error = local
+                .call(&format!("{id}.__temba_connect__"), None)
+                .await
+                .unwrap_err();
+            assert!(error.is::<local_catalog::LocalOAuthOriginNotAllowed>());
+            let message = setup_error(&error);
+            assert!(message.contains("definition.oauth.allowedOrigins"));
+            assert!(message.contains("No central catalog change"));
+            assert!(!message.contains(id));
+            assert_eq!(*local.catalog_status.read().await, expected_status);
+            let rejected_entry = local.personal_entry(id).await.unwrap();
+            assert!(rejected_entry.login.lock().await.is_none());
+            local
+                .call(&format!("{id}.__temba_disconnect__"), None)
+                .await
+                .unwrap();
+            let corrected = serde_json::from_value(json!({"id":"jira-temp","endpoint":endpoint,
+                "oauth":{"allowedOrigins":["https://auth.atlassian.com"]}}))
+            .unwrap();
+            let registered = local
+                .add_personal(corrected, BTreeMap::new())
+                .await
+                .unwrap();
+            let id = registered["local_id"].as_str().unwrap();
+            let entry = local.personal_entry(id).await.unwrap();
+            assert_eq!(
+                entry.definition.oauth.as_ref().unwrap().allowed_origins,
+                vec!["https://auth.atlassian.com"]
+            );
+            // Simulate a valid remote session; connecting and searching must not start catalog login.
+            entry.state.write().await.session =
+                Some(oauth::Session::test_session("local-test-access"));
+            let CallToolResponse::Complete(response) = local
+                .call(&format!("{id}.__temba_connect__"), None)
+                .await
+                .unwrap()
+            else {
+                panic!("Expected completed response");
+            };
+            assert!(serde_json::to_string(&response).unwrap().contains("ready"));
+            let results = local.search("echo", &[id.to_owned()]).await;
+            assert_eq!(results["servers"][0]["status"], "ready");
+            assert_eq!(*local.catalog_status.read().await, expected_status);
+            assert!(local.catalog_login.lock().await.is_none());
+            local
+                .call(&format!("{id}.__temba_disconnect__"), None)
+                .await
+                .unwrap();
+        }
+        task.abort();
     }
 
     #[tokio::test]

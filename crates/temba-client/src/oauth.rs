@@ -46,7 +46,7 @@ impl std::fmt::Display for OriginNotAllowed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "OAuth origin {} is not approved. Add it to this server's oauth.allowedOrigins in the catalog.",
+            "OAuth origin {} is not approved. Add it to this MCP definition's oauth.allowedOrigins. This check is independent of Temba catalog authentication.",
             self.0
         )
     }
