@@ -24,7 +24,7 @@ Le `security.allowLoopbackHttp` de la chart peut rester `false` si tous les MCP 
 
 ## Réseau Kubernetes
 
-OpenCode et les appels administratifs passent par le même Ingress vers le catalogue. La policy autorise les pods du namespace du contrôleur, sur TCP 8080 :
+Les clients Temba et les appels administratifs passent par le même Ingress vers le catalogue. La policy autorise les pods du namespace du contrôleur, sur TCP 8080 :
 
 ```yaml
 security:

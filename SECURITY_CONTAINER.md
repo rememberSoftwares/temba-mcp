@@ -1,6 +1,6 @@
 # Sécurité du conteneur catalogue
 
-Le conteneur V2 exécute uniquement `temba-catalog`, un binaire Rust. Il ne contient aucun moteur de proxy MCP et ne manipule aucun token Jira/Grafana. Il traite temporairement les bearers du catalogue pour vérifier les JWT et peut conserver le token administratif fourni par Secret Kubernetes. Le cache JWKS contient des clés publiques.
+Le conteneur V2 exécute uniquement `temba-catalog`, un binaire Rust. Il ne contient aucun moteur de proxy MCP et ne manipule aucun token des MCP distants. Il traite temporairement les bearers du catalogue pour vérifier les JWT et peut conserver le token administratif fourni par Secret Kubernetes. Le cache JWKS contient des clés publiques.
 
 L’image runtime Distroless contient les bibliothèques système et les certificats CA nécessaires au HTTPS, sans shell, Python, Cargo ou gestionnaire de packages. La chart impose :
 
@@ -21,7 +21,7 @@ Les définitions API persistent sur un PVC de 100 Mi par défaut. Le système de
 
 La vérification JWT exige RS256, issuer et audience configurés, expiration, `nbf`, sujet et type `Bearer`. Aucun scope personnalisé n’est imposé. La découverte et les overrides d’endpoints Keycloak sont en HTTPS, sans redirection vers un autre endpoint. Le cache JWKS est borné et les rafraîchissements sur un `kid` inconnu sont limités.
 
-Ne pas mettre de secrets de MCP dans les valeurs Helm ou les ConfigMaps. Pour l’API administrative, référencer un Secret préexistant, utiliser un token aléatoire et protéger l’accès réseau aux routes `/v1/admin`. Cette API n’écrit pas sur disque : les ajouts temporaires sont perdus au redémarrage et ne remplacent pas les définitions Helm.
+Ne pas mettre de secrets de MCP dans les valeurs Helm ou les ConfigMaps. Pour l’API administrative, référencer un Secret préexistant, utiliser un token aléatoire et protéger l’accès réseau aux routes `/v1/admin`. Les ajouts de cette API sont persistés sur le PVC et rechargés au redémarrage ; ils ne remplacent pas les définitions Helm.
 
 Le filesystem readonly réduit les possibilités de modification persistante, mais ne protège pas une mémoire déjà compromise. Il faut maintenir le runtime et le noyau, limiter l’accès aux pods et au plan de contrôle Kubernetes, et déployer les images validées par digest (`image.digest`). Les core dumps sont désactivés par le binaire sur Unix.
 
@@ -32,4 +32,4 @@ nerdctl run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   --user 10001:10001 -p 18080:8080 temba-catalog:1.3.1
 ```
 
-Le runtime n’écrit aucun fichier pour démarrer ou servir le catalogue. L’authentification navigateur et les callbacks OAuth appartiennent au client local ; aucun callback OAuth n’est exposé par ce conteneur.
+La consultation du catalogue ne nécessite aucune écriture dans le système de fichiers racine. Les modifications administratives écrivent uniquement les définitions sur le volume prévu à cet effet. L’authentification navigateur et les callbacks OAuth appartiennent au client local ; aucun callback OAuth n’est exposé par ce conteneur.

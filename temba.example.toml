@@ -7,10 +7,10 @@ labels = []
 
 # A token may only be sent to this exact approved endpoint. The environment
 # variable is configured on the workstation, never downloaded from the catalog.
-# [tool.grafana]
-# expected_endpoint = "https://grafana-mcp.example.com/mcp"
-# [tool.grafana.headers]
-# api_token = { env = "GRAFANA_AUTHORIZATION" }
+# [tool.service]
+# expected_endpoint = "https://mcp.example.com/mcp"
+# [tool.service.headers]
+# api_token = { env = "SERVICE_TOKEN" }
 
 # Optional third tool: ephemeral registrations, never saved to disk.
 [local_catalog]
