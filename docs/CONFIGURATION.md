@@ -1,30 +1,30 @@
-# Options du catalogue
+# Catalog options
 
-## HTTP sur le poste de développement
+## HTTP on the development machine
 
-HTTPS est requis par défaut. `allowLoopbackHttp` accepte une exception pour une adresse locale :
+HTTPS is required by default. `allowLoopbackHttp` allows an exception for a local address:
 
-| URL d'un MCP | Avec `security.allowLoopbackHttp: true` |
+| MCP server URL | With `security.allowLoopbackHttp: true` |
 |---|---|
-| `http://localhost:9000/mcp` | Acceptée |
-| `http://127.0.0.1:9000/mcp` | Acceptée |
-| `http://mcp.entreprise/mcp` | Refusée |
-| `https://mcp.entreprise/mcp` | Acceptée même sans l'option |
+| `http://localhost:9000/mcp` | Accepted |
+| `http://127.0.0.1:9000/mcp` | Accepted |
+| `http://mcp.entreprise/mcp` | Rejected |
+| `https://mcp.entreprise/mcp` | Accepted even without the option |
 
-L'adresse du MCP est utilisée par le **client sur le poste utilisateur**. Une adresse localhost désigne donc un MCP sur ce poste, pas un service dans Kubernetes.
+The MCP server address is used by the **client on the user's machine**. A localhost address therefore refers to an MCP server on that machine, not a service in Kubernetes.
 
-Cette option ne configure ni l'Ingress ni les certificats de Keycloak. Pour joindre **le catalogue** via un port-forward, c'est le TOML local qui compte :
+This option configures neither the Ingress nor Keycloak certificates. To reach **the catalog** through port forwarding, the local TOML file is what matters:
 
 ```toml
 catalog_url = "http://127.0.0.1:18080"
 allow_loopback_http = true
 ```
 
-Le `security.allowLoopbackHttp` de la chart peut rester `false` si tous les MCP distants sont en HTTPS.
+The chart's `security.allowLoopbackHttp` can remain `false` if all remote MCP servers use HTTPS.
 
-## Réseau Kubernetes
+## Kubernetes networking
 
-Les clients Temba et les appels administratifs passent par le même Ingress vers le catalogue. La policy autorise les pods du namespace du contrôleur, sur TCP 8080 :
+Temba clients and administrative calls go through the same Ingress to the catalog. The policy allows pods from the controller's namespace on TCP 8080:
 
 ```yaml
 security:
@@ -32,19 +32,19 @@ security:
     enabled: true
     ingress:
       namespace: ingress-nginx
-      podSelector: {}  # facultatif : labels des seuls pods du contrôleur
-    authCidrs: ["203.0.113.0/24"]  # exemple à remplacer par les CIDR de votre Keycloak
+      podSelector: {}  # optional: labels selecting only the controller pods
+    authCidrs: ["203.0.113.0/24"]  # replace this example with your Keycloak CIDRs
 ```
 
-Les autres entrées sont refusées par cette policy. Un port-forward Kubernetes n'est pas une connexion ordinaire depuis un autre pod et ne valide pas ce filtrage.
+This policy rejects other incoming traffic. Kubernetes port forwarding is not an ordinary connection from another pod and does not validate this filtering.
 
-En sortie : DNS vers kube-dns, et HTTPS/TCP 443 vers `authCidrs` seulement si `catalogueAuth.enabled`. Tout le reste est refusé par cette policy. Sans ces exceptions, la validation Keycloak ne fonctionnerait plus. Les MCP sont contactés par le poste utilisateur ; leurs URL n'ont pas à être autorisées dans cette policy.
+Outbound traffic: DNS to kube-dns, and HTTPS/TCP 443 to `authCidrs` only if `catalogueAuth.enabled`. This policy rejects everything else. Without these exceptions, Keycloak validation would no longer work. MCP servers are contacted by the user's machine; their URLs do not need to be allowed in this policy.
 
-Le CNI doit appliquer les NetworkPolicies. Les connexions depuis les nœuds, les contrôleurs en hostNetwork et les autres policies nécessitent de vérifier le comportement du cluster. Cette policy filtre des adresses et ports, pas les routes HTTP : le bearer administratif reste nécessaire pour l'API admin.
+The CNI must enforce NetworkPolicies. Connections from nodes, controllers using hostNetwork, and other policies require checking the cluster's behavior. This policy filters addresses and ports, not HTTP routes: the administrative bearer token is still required for the admin API.
 
-## Catalogue modifiable et stockage
+## Mutable catalog and storage
 
-`adminApi.readOnly: true` signifie consultation seulement. Pour autoriser les ajouts et suppressions :
+`adminApi.readOnly: true` means read access only. To allow additions and deletions:
 
 ```yaml
 adminApi:
@@ -57,8 +57,8 @@ persistence:
   storageClass: ""
 ```
 
-Créer d'abord le Secret Kubernetes contenant le bearer administratif. Les définitions API sont enregistrées sur le PVC et rechargées après redémarrage ; les définitions Helm restent gérées par Helm. Les tokens OAuth et valeurs privées de headers restent sur les postes utilisateurs.
+First create the Kubernetes Secret containing the administrative bearer token. API definitions are saved on the PVC and reloaded after restart; Helm definitions remain managed by Helm. OAuth tokens and private header values stay on users' machines.
 
-Une seule réplique écrit le fichier. Un échec de sauvegarde renvoie une erreur et ne modifie pas le catalogue en RAM. Un fichier corrompu ou une collision avec un identifiant Helm bloque le démarrage pour éviter une perte silencieuse. Le PVC est conservé à la désinstallation Helm ; penser à le sauvegarder.
+Only one replica writes the file. A save failure returns an error and does not change the catalog in RAM. A corrupt file or a conflict with a Helm identifier blocks startup to prevent silent data loss. The PVC is retained when Helm uninstalls the release; remember to back it up.
 
-Références : [NetworkPolicies](https://kubernetes.io/docs/concepts/services-networking/network-policies/), [volumes persistants](https://kubernetes.io/docs/concepts/storage/persistent-volumes/).
+References: [NetworkPolicies](https://kubernetes.io/docs/concepts/services-networking/network-policies/), [persistent volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/).

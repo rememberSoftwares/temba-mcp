@@ -90,8 +90,6 @@ fn schema() -> u32 {
 pub struct Server {
     pub id: String,
     #[serde(default)]
-    pub name: String,
-    #[serde(default)]
     pub description: String,
     pub endpoint: String,
     #[serde(default)]
@@ -146,10 +144,7 @@ impl Server {
             (1..=300).contains(&self.timeout_seconds),
             "Timeout must be between 1 and 300 seconds"
         );
-        ensure!(
-            self.description.len() <= 8192 && self.name.len() <= 256,
-            "Metadata too large"
-        );
+        ensure!(self.description.len() <= 8192, "Metadata too large");
         for label in &mut self.labels {
             *label = label.trim().to_lowercase();
         }
@@ -316,6 +311,24 @@ mod tests {
             servers: vec![s.clone(), s],
         };
         assert!(c.validate(false).is_err());
+    }
+    #[test]
+    fn server_uses_only_id_and_rejects_the_removed_display_name() {
+        let server: Server = serde_json::from_value(serde_json::json!({
+            "id":"service", "endpoint":"https://example.com/mcp",
+            "headers":[{"name":"X-Tenant","value":"team"}]
+        }))
+        .unwrap();
+        let value = serde_json::to_value(server).unwrap();
+        assert_eq!(value["id"], "service");
+        assert!(value.get("name").is_none());
+        assert_eq!(value["headers"][0]["name"], "X-Tenant");
+        assert!(
+            serde_json::from_value::<Server>(serde_json::json!({
+                "id":"service", "name":"Legacy display name", "endpoint":"https://example.com/mcp"
+            }))
+            .is_err()
+        );
     }
     #[test]
     fn oauth_and_headers_are_independent_but_authorization_cannot_conflict() {

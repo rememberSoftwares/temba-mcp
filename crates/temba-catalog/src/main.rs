@@ -391,6 +391,16 @@ mod api_tests {
             "authorization",
             HeaderValue::from_static("Bearer admin-test-only"),
         );
+        // An API addition cannot reuse an ID owned by the Helm catalog.
+        let mut collision = app.catalog.servers[0].clone();
+        collision.endpoint = "https://other.example/mcp".into();
+        assert_eq!(
+            add(State(app.clone()), h.clone(), Json(collision))
+                .await
+                .unwrap_err(),
+            StatusCode::CONFLICT
+        );
+        assert!(app.additions.read().await.is_empty());
         assert_eq!(
             add(State(app.clone()), h.clone(), Json(definition()))
                 .await

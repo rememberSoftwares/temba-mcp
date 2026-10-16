@@ -1,7 +1,6 @@
 schemaVersion: 2
 servers:
   - id: jira
-    name: Jira
     description: Search Jira tickets and projects
     endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
     labels: [jira]

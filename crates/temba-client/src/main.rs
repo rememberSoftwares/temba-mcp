@@ -781,9 +781,8 @@ impl Local {
                 }
             } else {
                 docs.push(format!(
-                    "{} {} {} {}",
+                    "{} {} {}",
                     e.label(),
-                    e.definition.name,
                     e.definition.description,
                     e.definition.labels.join(" ")
                 ));
@@ -1003,7 +1002,6 @@ impl ServerHandler for Handler {
                             "type":"object",
                             "properties":{
                                 "id":{"type":"string"},
-                                "name":{"type":"string"},
                                 "description":{"type":"string"},
                                 "labels":{"type":"array","items":{"type":"string"}},
                                 "endpoint":{"type":"string"},
@@ -1565,6 +1563,12 @@ mod integration_tests {
             let tools = client.peer().list_all_tools().await.unwrap();
             assert_eq!(tools.len(), if enabled { 3 } else { 2 });
             assert_eq!(tools.iter().any(|t| t.name == "add_mcp"), enabled);
+            if enabled {
+                let add = tools.iter().find(|t| t.name == "add_mcp").unwrap();
+                let fields = &add.input_schema["properties"]["definition"]["properties"];
+                assert!(fields.get("id").is_some());
+                assert!(fields.get("name").is_none());
+            }
             let definition: Server = serde_json::from_value(json!({
                 "id":"shared","endpoint":"https://mcp.example.com","oauth":{},
                 "headers":[{"name":"X-Key","credential":"key","mandatory":true}]

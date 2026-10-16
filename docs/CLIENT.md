@@ -1,10 +1,10 @@
-# Configurer le client local
+# Configuring the local client
 
-Ce guide complète les [premiers pas du README](../README.md#premiers-pas).
-Le fichier `temba.toml` appartient au poste qui exécute `temba-client`.
-Il est lu au démarrage du processus.
+This guide complements the [README getting started guide](../README.md#getting-started).
+The `temba.toml` file belongs on the machine running `temba-client`.
+It is read when the process starts.
 
-## Les réglages de base
+## Basic settings
 
 ```toml
 catalog_url = "https://catalogue.example.com"
@@ -13,43 +13,43 @@ refresh_seconds = 60
 search_limit = 5
 ```
 
-| Option | Utilité | Valeur par défaut |
+| Option | Purpose | Default |
 | --- | --- | --- |
-| `catalog_url` | URL du catalogue REST, sans suffixe `/mcp` ni `/v1/catalog` | Obligatoire |
-| `labels` | Labels des MCP que vous choisissez d’inclure | `[]` : MCP sans label |
-| `refresh_seconds` | Intervalle de relecture du catalogue central, entre 10 et 3 600 secondes | `60` |
-| `search_limit` | Nombre maximum d’outils retournés par recherche, entre 1 et 50 | `5` |
-| `allow_loopback_http` | Autorise HTTP pour les adresses de loopback en développement | `false` |
+| `catalog_url` | REST catalog URL, without an `/mcp` or `/v1/catalog` suffix | Required |
+| `labels` | Labels of the MCP servers you choose to include | `[]`: MCP servers without labels |
+| `refresh_seconds` | Central catalog refresh interval, between 10 and 3,600 seconds | `60` |
+| `search_limit` | Maximum number of tools returned per search, between 1 and 50 | `5` |
+| `allow_loopback_http` | Allows HTTP for loopback addresses during development | `false` |
 
-Pour un catalogue accessible via un port-forward :
+For a catalog accessed through port forwarding:
 
 ```toml
 catalog_url = "http://127.0.0.1:18080"
 allow_loopback_http = true
 ```
 
-Les MCP distants doivent être joignables **depuis le poste utilisateur**.
-Une URL localhost désigne ce poste, pas un pod Kubernetes.
-Voir [HTTP local et réseau](CONFIGURATION.md).
+Remote MCP servers must be reachable **from the user's machine**.
+A localhost URL refers to that machine, not a Kubernetes pod.
+See [local HTTP and networking](CONFIGURATION.md).
 
-## Choisir les MCP par labels
+## Selecting MCP servers by label
 
-Les labels servent à activer des catégories de MCP sans changer vos permissions.
-Pour inclure un MCP, tous ses labels doivent figurer dans votre liste.
-Les MCP sans label restent inclus.
+Labels enable categories of MCP servers without changing your permissions.
+To include an MCP server, all of its labels must appear in your list.
+MCP servers without labels remain included.
 
-| Labels dans le TOML | MCP inclus, parmi ceux autorisés par le catalogue |
+| Labels in the TOML file | MCP servers included, among those allowed by the catalog |
 | --- | --- |
-| `[]` | Ceux qui n’ont aucun label |
-| `["support"]` | Ceux sans label, et ceux portant seulement `support` |
-| `["support", "documentation"]` | Ceux dont les labels sont un sous-ensemble de cette liste |
+| `[]` | Those without any labels |
+| `["support"]` | Those without labels and those labeled only `support` |
+| `["support", "documentation"]` | Those whose labels are a subset of this list |
 
-Les règles de groupes sont vérifiées séparément par le catalogue central.
-Un label ne permet pas de contourner une règle Keycloak.
+Group rules are checked separately by the central catalog.
+A label cannot bypass a Keycloak rule.
 
-## Fournir des tokens et des headers privés
+## Providing tokens and private headers
 
-Supposons que le catalogue contienne cette définition :
+Suppose the catalog contains this definition:
 
 ```yaml
 id: service
@@ -62,7 +62,7 @@ headers:
     credential: tenant
 ```
 
-Votre TOML fournit les valeurs pour **cet identifiant de MCP** :
+Your TOML file provides values for **this MCP server identifier**:
 
 ```toml
 [tool.service]
@@ -73,107 +73,107 @@ api_token = { env = "SERVICE_TOKEN" }
 tenant = "engineering"
 ```
 
-`api_token` et `tenant` sont les références `credential` du catalogue.
-Ce ne sont pas les noms des headers HTTP.
+`api_token` and `tenant` are the catalog's `credential` references.
+They are not HTTP header names.
 
-### Valeur directe ou variable d’environnement ?
+### Direct value or environment variable?
 
-Une chaîne est toujours une **valeur littérale** :
+A string is always a **literal value**:
 
 ```toml
 [tool.service]
 expected_endpoint = "https://mcp.example.com/mcp"
 
 [tool.service.headers]
-api_token = "Bearer votre-token"
+api_token = "Bearer your-token"
 ```
 
-Pour lire une variable, utilisez explicitement `{ env = "SERVICE_TOKEN" }`.
-Écrire `api_token = "SERVICE_TOKEN"` enverrait ces mots au serveur.
+To read a variable, explicitly use `{ env = "SERVICE_TOKEN" }`.
+Writing `api_token = "SERVICE_TOKEN"` would send those words to the server.
 
-La valeur est envoyée telle quelle : si le MCP attend `Bearer …`, fournissez
-également le préfixe. S’il attend un token brut, fournissez seulement le token.
+The value is sent as provided: if the MCP server expects `Bearer …`, include
+the prefix. If it expects a raw token, provide only the token.
 
-Une valeur directe reste sur disque dans le TOML ; gardez ce fichier privé et hors du dépôt.
-Avec une variable d’environnement, celle-ci doit être présente dans le **processus Temba**.
-Un serveur IA déjà démarré n’hérite pas des exports faits ensuite dans un autre terminal.
+A direct value stays on disk in the TOML file; keep this file private and out of the repository.
+An environment variable must be present in the **Temba process**.
+An AI server that is already running does not inherit variables exported later in another terminal.
 
-### Pourquoi `expected_endpoint` ?
+### Why `expected_endpoint`?
 
-`endpoint` est l’adresse annoncée par le catalogue.
-`expected_endpoint` est l’adresse à laquelle **vous autorisez l’envoi de vos valeurs privées**.
-Les deux doivent correspondre exactement, y compris le chemin et les paramètres de requête.
+`endpoint` is the address advertised by the catalog.
+`expected_endpoint` is the address to which **you authorize sending your private values**.
+The two must match exactly, including the path and query parameters.
 
-Si la destination change, Temba refuse d’envoyer vos headers jusqu’à ce que vous
-ayez approuvé la nouvelle adresse dans le TOML. Ces valeurs ne sont pas envoyées
-au catalogue, aux fournisseurs OAuth ni aux autres MCP. Les redirections HTTP sont désactivées.
+If the destination changes, Temba refuses to send your headers until you
+approve the new address in the TOML file. These values are not sent
+to the catalog, OAuth providers, or other MCP servers. HTTP redirects are disabled.
 
-Ce réglage est nécessaire pour des headers privés configurés dans le TOML.
-Un header public fourni par le catalogue n’en a pas besoin.
+This setting is required for private headers configured in the TOML file.
+A public header provided by the catalog does not need it.
 
-### Que voit l’assistant ?
+### What does the assistant see?
 
-Un header optionnel absent est simplement omis. L’absence d’un header `mandatory: true`
-bloque la connexion avant tout appel distant.
+A missing optional header is simply omitted. A missing `mandatory: true` header
+blocks the connection before any remote call.
 
-Dans ce cas, le MCP reste visible avec `credentials_required` et `missing_headers`
-liste seulement les headers obligatoires manquants. Lorsque les credentials sont
-configurés, les déclarations de headers ne sont pas exposées par `tool_search`.
-Leurs valeurs privées ne sont jamais renvoyées dans ses résultats.
+In that case, the MCP server remains visible with `credentials_required`, and `missing_headers`
+lists only the missing required headers. Once credentials are
+configured, header declarations are not exposed by `tool_search`.
+Their private values are never returned in its results.
 
-## Comprendre les connexions OAuth
+## Understanding OAuth connections
 
-Il existe deux connexions indépendantes :
+There are two independent connections:
 
-- **Au catalogue**, si son administrateur a activé `catalogueAuth` : elle détermine
-  les définitions visibles pour votre identité.
-- **À chaque MCP OAuth** : elle autorise l’accès au service distant avec votre compte.
+- **To the catalog**, if its administrator has enabled `catalogueAuth`: this determines
+  which definitions are visible to your identity.
+- **To each OAuth MCP server**: this authorizes access to the remote service with your account.
 
-Un catalogue public peut donc contenir un MCP OAuth. Une inscription locale peut
-également utiliser OAuth sans authentification du catalogue central.
+A public catalog can therefore contain an OAuth MCP server. A local registration can
+also use OAuth without authentication to the central catalog.
 
-La connexion au catalogue démarre automatiquement au premier appel d’outil qui
-la nécessite. Pour un MCP distant, l’assistant utilise l’action de connexion renvoyée
-par la recherche. Les actions techniques sont `<id>.__temba_connect__`, appelées via `call_tool`.
+The catalog connection starts automatically on the first tool call that
+requires it. For a remote MCP server, the assistant uses the connection action returned
+by the search. The technical actions are `<id>.__temba_connect__`, called through `call_tool`.
 
-Temba attend jusqu’à 10 secondes le résultat d’une autorisation lancée. Si votre
-session navigateur permet un SSO rapide, la demande peut se poursuivre immédiatement.
-Sinon, l’assistant indique qu’une validation reste attendue dans le navigateur.
-La recherche peut aussi attendre brièvement la découverte des outils en cours.
+Temba waits up to 10 seconds for the result of an authorization it has started. If your
+browser session allows quick SSO, the request can continue immediately.
+Otherwise, the assistant indicates that browser approval is still pending.
+Search may also wait briefly for ongoing tool discovery.
 
-Le rafraîchissement périodique ne rouvre pas le navigateur. Le renouvellement par
-refresh token est silencieux ; si une nouvelle autorisation devient nécessaire,
-elle attend un prochain appel d’outil. Les appels métier échoués ne sont pas rejoués automatiquement.
+Periodic refresh does not reopen the browser. Renewal using a
+refresh token is silent; if new authorization is required,
+it waits for a subsequent tool call. Failed service calls are not retried automatically.
 
-Les callbacks OAuth écoutent sur `127.0.0.1`, expirent après dix minutes et sont à usage unique.
-Les tokens OAuth ne sont écrits ni sur disque ni dans le trousseau système par Temba.
-Une nouvelle connexion peut donc être nécessaire après l’arrêt du processus.
+OAuth callbacks listen on `127.0.0.1`, expire after ten minutes, and can be used only once.
+Temba writes OAuth tokens neither to disk nor to the system keychain.
+A new connection may therefore be needed after the process stops.
 
-### Lire les états du catalogue
+### Reading catalog states
 
-`tool_search` renvoie notamment `catalog.status` :
+`tool_search` returns `catalog.status`, among other fields:
 
-| État | Signification |
+| State | Meaning |
 | --- | --- |
-| `public` | L’authentification du catalogue est désactivée |
-| `auth_in_progress` | Une autorisation navigateur est en cours |
-| `loading` | L’authentification a réussi ; les définitions sont en cours de chargement |
-| `authenticated` | Le catalogue authentifié est chargé |
-| `auth_required` | Une connexion est nécessaire ; elle sera déclenchée lors d’un appel concerné |
-| `auth_failed` | La connexion a échoué ou a expiré avant validation |
-| `catalog_unavailable` | L’authentification a réussi, mais le chargement a échoué |
+| `public` | Catalog authentication is disabled |
+| `auth_in_progress` | Browser authorization is in progress |
+| `loading` | Authentication succeeded; definitions are loading |
+| `authenticated` | The authenticated catalog is loaded |
+| `auth_required` | A connection is required; a relevant call will trigger it |
+| `auth_failed` | The connection failed or expired before approval |
+| `catalog_unavailable` | Authentication succeeded, but loading failed |
 
-La réponse contient aussi `catalog.authentication_enabled`, `catalog.authenticated`
-et `catalog.automatic_login`. `catalog_connect_tool` propose une relance seulement
-après un échec d’authentification, pas pendant une connexion en cours ou déjà établie.
+The response also contains `catalog.authentication_enabled`, `catalog.authenticated`,
+and `catalog.automatic_login`. `catalog_connect_tool` offers a retry only
+after authentication fails, not while a connection is in progress or already established.
 
-L’action `<id>.__temba_disconnect__` ferme la connexion au MCP et supprime sa session OAuth.
-`__catalog__.__temba_disconnect__` termine la session du catalogue et ferme les connexions,
-y compris les inscriptions locales.
+The `<id>.__temba_disconnect__` action closes the MCP connection and removes its OAuth session.
+`__catalog__.__temba_disconnect__` ends the catalog session and closes connections,
+including local registrations.
 
-## Ajouts locaux éphémères
+## Temporary local additions
 
-Cette option, désactivée par défaut, ajoute le tool `add_mcp` :
+This option, disabled by default, adds the `add_mcp` tool:
 
 ```toml
 [local_catalog]
@@ -182,48 +182,48 @@ idle_timeout_seconds = 1800
 max_servers = 16
 ```
 
-| Option | Effet |
+| Option | Effect |
 | --- | --- |
-| `enabled` | Expose ou retire le tool d’ajout dynamique |
-| `idle_timeout_seconds` | Expiration de chaque inscription sans usage de son ID : 1 800 secondes par défaut, entre 60 et 86 400 |
-| `max_servers` | Nombre maximum d’inscriptions locales simultanées par processus : 16 par défaut, entre 1 et 64 |
+| `enabled` | Exposes or removes the dynamic addition tool |
+| `idle_timeout_seconds` | Registration expiration when its ID is unused: 1,800 seconds by default, between 60 and 86,400 |
+| `max_servers` | Maximum simultaneous local registrations per process: 16 by default, between 1 and 64 |
 
-### Ajouter un MCP avec un token
+### Adding an MCP server with a token
 
-Voici les arguments de `add_mcp` :
+Here are the arguments for `add_mcp`:
 
 ```json
 {
   "definition": {
-    "id": "service-temporaire",
+    "id": "temporary-service",
     "endpoint": "https://mcp.example.com/mcp",
     "headers": [
       {"name": "Authorization", "credential": "api_token", "mandatory": true}
     ]
   },
-  "headers": {"api_token": "Bearer votre-token"}
+  "headers": {"api_token": "Bearer your-token"}
 }
 ```
 
-Les valeurs sont propres à cette inscription ; elle ne lit pas les headers du TOML.
-`add_mcp` renvoie un `local_id` secret de 256 bits et un `connect_tool_id`.
+The values are specific to this registration; it does not read headers from the TOML file.
+`add_mcp` returns a secret 256-bit `local_id` and a `connect_tool_id`.
 
-1. Conserver le `local_id` dans la conversation.
-2. Chercher les outils avec `tool_search`, en passant `local_ids: [local_id]` et une requête.
-3. Si le statut est `auth_required`, appeler `connect_tool_id` via `call_tool`.
-4. Dès que le statut est `ready`, utiliser les `tool_id` renvoyés par la recherche.
+1. Keep the `local_id` in the conversation.
+2. Search for tools with `tool_search`, passing `local_ids: [local_id]` and a query.
+3. If the status is `auth_required`, call `connect_tool_id` through `call_tool`.
+4. Once the status is `ready`, use the `tool_id` values returned by the search.
 
-Sans `local_ids`, les inscriptions locales ne sont pas énumérées.
-L’action `<local_id>.__temba_disconnect__` supprime l’inscription.
+Without `local_ids`, local registrations are not listed.
+The `<local_id>.__temba_disconnect__` action removes the registration.
 
-### Ajouter un MCP OAuth
+### Adding an OAuth MCP server
 
-Déclarez les origines HTTPS des fournisseurs externes dans **la définition locale** :
+Declare external providers' HTTPS origins in **the local definition**:
 
 ```json
 {
   "definition": {
-    "id": "service-temporaire",
+    "id": "temporary-service",
     "endpoint": "https://mcp.example.com/mcp",
     "oauth": {
       "allowedOrigins": ["https://identity.example.com"]
@@ -232,52 +232,52 @@ Déclarez les origines HTTPS des fournisseurs externes dans **la définition loc
 }
 ```
 
-L’origine du MCP est déjà autorisée. `allowedOrigins` autorise les destinations OAuth
-supplémentaires ; ce champ n’active pas l’authentification du catalogue Temba.
-Il empêche un MCP de choisir un fournisseur non déclaré.
+The MCP server's origin is already allowed. `allowedOrigins` allows additional OAuth
+destinations; this field does not enable Temba catalog authentication.
+It prevents an MCP server from choosing an undeclared provider.
 
-Si une origine a été omise, déconnectez l’inscription puis refaites `add_mcp` avec
-la définition corrigée. Aucun changement du catalogue central n’est nécessaire.
+If an origin was omitted, disconnect the registration and run `add_mcp` again with
+the corrected definition. No change to the central catalog is needed.
 
-### Durée de vie et portée
+### Lifetime and scope
 
-Chaque recherche ou appel présentant un ID valide renouvelle son délai d’inactivité.
-Un ID expiré est immédiatement refusé ; un nettoyage toutes les 10 secondes ferme
-les connexions expirées et libère les credentials possédés par le client.
-L’arrêt du processus supprime toutes les inscriptions.
+Every search or call presenting a valid ID renews its idle timeout.
+An expired ID is rejected immediately; cleanup every 10 seconds closes
+expired connections and releases credentials held by the client.
+Stopping the process removes all registrations.
 
-Deux ajouts portant le même nom reçoivent des IDs et des connexions distincts.
-**La possession de l’ID autorise l’utilisation** dans ce processus : il n’existe pas
-d’identité universelle de conversation. Le client IA peut conserver les arguments,
-les tokens fournis et les réponses dans son propre historique.
+Two additions with the same name receive separate IDs and connections.
+**Possession of the ID authorizes use** within that process: there is no
+universal conversation identity. The AI client may store arguments,
+provided tokens, and responses in its own history.
 
-## Mettre à jour et dépanner
+## Updating and troubleshooting
 
-Après une modification du TOML ou de l’environnement, redémarrez le processus Temba.
-Après une mise à jour du client, changez aussi le chemin du wheel dans votre client IA.
-Un wheel remplacé au même chemin peut laisser `uvx` utiliser son ancien binaire en cache.
+After changing the TOML file or environment, restart the Temba process.
+After updating the client, also change the wheel path in your AI client.
+Replacing a wheel at the same path may cause `uvx` to use its old cached binary.
 
-Avec un serveur IA persistant, redémarrez le serveur qui lance les MCP.
-Fermer seulement une conversation ou rouvrir le terminal ne suffit pas toujours.
+With a persistent AI server, restart the server that launches the MCP servers.
+Closing only a conversation or reopening the terminal is not always enough.
 
-Les logs vont sur **stderr**, tandis que stdout est réservé au protocole MCP.
-Ils indiquent le nom des MCP, leur état et la progression des connexions :
+Logs go to **stderr**, while stdout is reserved for the MCP protocol.
+They show MCP server names, their states, and connection progress:
 
 ```text
 MCP service-a: ready; ready=2/3; pending=[service-b:connecting]
 ```
 
-| Symptôme | Vérification |
+| Symptom | Check |
 | --- | --- |
-| MCP absent | Groupes du token Keycloak, labels locaux et définition du catalogue |
-| `credentials_required` | Références `credential`, valeurs non vides et environnement du processus Temba |
-| Destination refusée | Égalité exacte de `expected_endpoint` et `endpoint` ; vérifier le changement avant d’approuver |
-| Origine OAuth refusée | `oauth.allowedOrigins` dans la bonne définition, centrale ou locale |
-| Port de callback déjà occupé | Une autre connexion utilise ce port local ; fermer l’ancien processus ou configurer un autre port |
-| Timeout d’un appel | Vérifier le résultat de l’opération distante avant de réessayer une écriture |
+| Missing MCP server | Keycloak token groups, local labels, and catalog definition |
+| `credentials_required` | `credential` references, nonempty values, and the Temba process environment |
+| Destination rejected | Exact match between `expected_endpoint` and `endpoint`; check the change before approving |
+| OAuth origin rejected | `oauth.allowedOrigins` in the correct definition, central or local |
+| Callback port already in use | Another connection is using this local port; stop the old process or configure another port |
+| Call timeout | Check the result of the remote operation before retrying a write |
 
-Le client relit le catalogue toutes les 60 secondes par défaut. Une suppression ou
-un changement de définition ferme l’ancienne connexion. Une réponse invalide
-ne remplace pas le dernier catalogue valide.
+The client refreshes the catalog every 60 seconds by default. Removing or
+changing a definition closes the old connection. An invalid response
+does not replace the last valid catalog.
 
-Pour le modèle de protection mémoire et des tokens, voir [la sécurité du client](../SECURITY_CLIENT.md).
+For the memory and token protection model, see [client security](../SECURITY_CLIENT.md).

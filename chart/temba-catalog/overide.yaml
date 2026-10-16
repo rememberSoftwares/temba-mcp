@@ -9,7 +9,6 @@ catalogueAuth:
 catalog:
   servers:
   - id: gitlab
-    name: GitLab (token)
     description: GitLab tools for the dev group; project and instance configured on
       the MCP server. Requires a client-provided raw GitLab token.
     endpoint: http://127.0.0.1:18082/mcp
@@ -22,7 +21,6 @@ catalog:
       - /dev
 
   - id: jira-token
-    name: Jira (token)
     description: Jira support tools for the dev group; instance URL and email configured
       on the MCP server. Requires a client-provided raw Jira token.
     endpoint: http://127.0.0.1:18081/mcp
@@ -37,7 +35,6 @@ catalog:
       - /dev
 
   - id: jira
-    name: Jira (OIDC)
     description: Atlassian remote Jira MCP for the pm group; sign in using its browser
       OAuth flow.
     endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
@@ -49,7 +46,6 @@ catalog:
       - /pm
 
   - id: deepwiki
-    name: DeepWiki
     description: Public technical documentation tools.
     endpoint: https://mcp.deepwiki.com/mcp
     timeoutSeconds: 45

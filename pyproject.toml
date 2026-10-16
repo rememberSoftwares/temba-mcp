@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "temba-client"
-version = "1.4.8"
+version = "1.4.9"
 description = "Local Rust MCP client with RAM-only OAuth sessions"
 requires-python = ">=3.9"
 readme = "README.md"

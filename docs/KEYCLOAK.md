@@ -1,74 +1,74 @@
-# Réserver des MCP à des groupes Keycloak
+# Restricting MCP servers to Keycloak groups
 
-Un **groupe** rassemble des utilisateurs. Temba peut réserver un MCP à un groupe, à plusieurs groupes, ou le rendre public. Les noms de groupes sont libres ; ce guide utilise `equipe-a` et `equipe-b` comme exemples.
+A **group** brings users together. Temba can restrict an MCP server to one group, several groups, or make it public. Group names are up to you; this guide uses `team-a` and `team-b` as examples.
 
-Ces règles concernent **tous les outils d'un MCP**. Elles contrôlent sa visibilité dans le catalogue ; chaque MCP conserve ses propres permissions et son éventuelle authentification.
+These rules apply to **all tools of an MCP server**. They control its visibility in the catalog; each MCP server keeps its own permissions and any authentication it requires.
 
-## 1. Configurer le client Keycloak
+## 1. Configure the Keycloak client
 
-Dans le realm choisi (l'espace contenant vos utilisateurs), ouvrir **Clients → temba**, ou créer un client OpenID Connect nommé `temba`.
+In your chosen realm (the space containing your users), open **Clients → temba**, or create an OpenID Connect client named `temba`.
 
-- **Client authentication** : Off ; **Standard flow** : On.
-- **Require PKCE** : On, méthode **S256** si le choix est proposé.
-- **Valid redirect URIs** : `http://127.0.0.1:19877/oauth/callback`.
-- Root URL, Home URL, Web origins et les URL de logout peuvent rester vides.
+- **Client authentication**: Off; **Standard flow**: On.
+- **Require PKCE**: On, with method **S256** if the choice is offered.
+- **Valid redirect URIs**: `http://127.0.0.1:19877/oauth/callback`.
+- Root URL, Home URL, Web origins, and logout URLs can remain empty.
 
-Ce callback revient sur le **poste utilisateur**, pas dans Kubernetes. Adapter le port si `catalogueAuth.callbackPort` change.
+This callback returns to the **user's machine**, not Kubernetes. Adjust the port if `catalogueAuth.callbackPort` changes.
 
-## 2. Ajouter les deux mappers
+## 2. Add the two mappers
 
-Un **mapper** ajoute des informations au token de connexion envoyé à Temba.
+A **mapper** adds information to the authentication token sent to Temba.
 
-Ouvrir **Clients → temba → Client scopes → temba-dedicated → Mappers → Add mapper → By configuration**. Créer puis sauvegarder :
+Open **Clients → temba → Client scopes → temba-dedicated → Mappers → Add mapper → By configuration**. Create and save:
 
-| Type de mapper | Champs à renseigner |
+| Mapper type | Fields to fill in |
 |---|---|
-| **Group Membership** | Name : `temba-groups` ; Token Claim Name : `groups` ; Full group path : **On** ; Add to access token : **On** |
-| **Audience** | Name : `temba-audience` ; Included Client Audience : **vide** ; Included Custom Audience : `temba-mcp` ; Add to access token : **On** ; Add to ID token : **Off** |
+| **Group Membership** | Name: `temba-groups`; Token Claim Name: `groups`; Full group path: **On**; Add to access token: **On** |
+| **Audience** | Name: `temba-audience`; Included Client Audience: **empty**; Included Custom Audience: `temba-mcp`; Add to access token: **On**; Add to ID token: **Off** |
 
-Les **groupes** indiquent ce que l'utilisateur peut voir. L'**audience** indique que le token est destiné au catalogue Temba. Aucun scope spécial `temba:use` n'est demandé.
+**Groups** indicate what the user can see. The **audience** indicates that the token is intended for the Temba catalog. No special `temba:use` scope is requested.
 
-Si le scope dédié n'apparaît pas, placer ces mappers dans un client scope attaché à `temba` en **Default**, pour qu'ils soient toujours appliqués.
+If the dedicated scope does not appear, put these mappers in a client scope attached to `temba` as **Default**, so they are always applied.
 
-## 3. Créer les groupes et affecter les utilisateurs
+## 3. Create groups and assign users
 
-1. **Groups → Create group** : créer `equipe-a` au premier niveau. Son chemin sera `/equipe-a`. Répéter pour `equipe-b` (`/equipe-b`).
-2. **Users → utilisateur → Groups → Join group** : sélectionner un ou plusieurs de ces groupes.
+1. **Groups → Create group**: create `team-a` at the top level. Its path will be `/team-a`. Repeat for `team-b` (`/team-b`).
+2. **Users → user → Groups → Join group**: select one or more of these groups.
 
-Le mapper transmet les appartenances ; il n'ajoute pas les utilisateurs aux groupes.
+The mapper passes along group memberships; it does not add users to groups.
 
-## 4. Configurer la surcharge Helm
+## 4. Configure the Helm override
 
-Activer l'authentification du catalogue :
+Enable catalog authentication:
 
 ```yaml
 catalogueAuth:
   enabled: true
-  issuer: https://keycloak.example.com/realms/mon-realm
+  issuer: https://keycloak.example.com/realms/my-realm
   clientId: temba
   audience: temba-mcp
   callbackPort: 19877
 ```
 
-Dans la définition de chaque MCP, choisir **une seule** règle :
+In each MCP server definition, choose **only one** rule:
 
-| Règle | Qui voit le MCP ? |
+| Rule | Who can see the MCP server? |
 |---|---|
-| `access: {public: true}` | Tout le monde, sans connexion au catalogue |
-| `access: {authenticated: true}` | Tous les utilisateurs connectés au catalogue |
-| `access: {groupsAnyOf: ["/equipe-a"]}` | Les membres de ce groupe |
-| `access: {groupsAnyOf: ["/equipe-a", "/equipe-b"]}` | Les membres de l’une **ou** l’autre équipe |
+| `access: {public: true}` | Everyone, without a catalog connection |
+| `access: {authenticated: true}` | All users connected to the catalog |
+| `access: {groupsAnyOf: ["/team-a"]}` | Members of this group |
+| `access: {groupsAnyOf: ["/team-a", "/team-b"]}` | Members of either team |
 
-Sans `access`, le MCP est public. Les chemins doivent correspondre exactement, casse comprise. Le groupe `/equipe-a/enfant` ne correspond pas automatiquement à `/equipe-a`.
+Without `access`, the MCP server is public. Paths must match exactly, including case. The group `/team-a/child` does not automatically match `/team-a`.
 
-L'authentification propre au MCP (bloc `oauth` et/ou liste `headers`) reste indépendante de ces règles. Désactiver `catalogueAuth.enabled` rend les entrées protégées invisibles à tous.
+The MCP server's own authentication (`oauth` block and/or `headers` list) remains independent of these rules. Disabling `catalogueAuth.enabled` makes protected entries invisible to everyone.
 
-## 5. Tester
+## 5. Test
 
-Après déploiement, relancer le client Temba, demander une recherche d’outils à l’agent et terminer la connexion au catalogue dans le navigateur. Un membre de `/equipe-a` voit les MCP réservés à ce groupe ; un utilisateur hors du groupe ne les voit pas. Les labels locaux doivent également autoriser leur affichage.
+After deployment, restart the Temba client, ask the agent to search for tools, and complete the catalog connection in the browser. A member of `/team-a` sees MCP servers restricted to that group; a user outside the group does not. Local labels must also allow them to be displayed.
 
-Si un MCP attendu manque : vérifier l’appartenance au groupe, les labels locaux et les deux mappers. **Client scopes → Evaluate → sélectionner l'utilisateur → Generated access token** doit contenir `groups: ["/equipe-a"]` et une audience `aud` contenant `temba-mcp`.
+If an expected MCP server is missing, check group membership, local labels, and both mappers. **Client scopes → Evaluate → select the user → Generated access token** must contain `groups: ["/team-a"]` and an `aud` audience containing `temba-mcp`.
 
-Un changement de groupe prend effet avec un **nouveau token**, puis le rafraîchissement du catalogue. Redémarrer le client Temba puis demander une recherche d’outils permet de refaire ce test. Si le client LLM utilise un serveur persistant, redémarrer le processus Temba côté serveur ; rouvrir une interface ne suffit pas. La connexion au catalogue ne connecte pas automatiquement aux MCP distants.
+A group change takes effect with a **new token**, followed by a catalog refresh. Restarting the Temba client and then requesting a tool search lets you repeat this test. If the LLM client uses a persistent server, restart the Temba process on the server; reopening an interface is not enough. Connecting to the catalog does not automatically connect to remote MCP servers.
 
-Référence : [mappers Keycloak](https://www.keycloak.org/admin-api/protocol-mappers).
+Reference: [Keycloak mappers](https://www.keycloak.org/admin-api/protocol-mappers).

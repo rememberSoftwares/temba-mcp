@@ -1,51 +1,51 @@
-# Déployer le catalogue
+# Deploying the catalog
 
-Ce guide installe **le catalogue REST central**. Les utilisateurs exécutent ensuite
-[le client local](../README.md#premiers-pas) sur leur poste.
-Les MCP distants doivent déjà exister et être accessibles depuis ces postes.
+This guide installs **the central REST catalog**. Users then run
+[the local client](../README.md#getting-started) on their machines.
+Remote MCP servers must already exist and be accessible from those machines.
 
-Le catalogue utilise une image conteneur et la chart [temba-catalog](../chart/temba-catalog).
-Les versions du catalogue et du client évoluent indépendamment : actuellement,
-le catalogue est en **1.3.1** et le client en **1.4.8**.
+The catalog uses a container image and the [temba-catalog](../chart/temba-catalog) chart.
+Catalog and client versions evolve independently: currently,
+the catalog is at **1.3.2** and the client at **1.4.9**.
 
-## Prérequis
+## Prerequisites
 
-Pour le parcours Minikube :
+For the Minikube walkthrough:
 
-- un Minikube démarré et un contexte `kubectl` nommé `minikube` ;
-- Helm et `nerdctl` ;
-- les sources du dépôt et l’accès aux images de base utilisées par le Dockerfile.
+- a running Minikube instance and a `kubectl` context named `minikube`;
+- Helm and `nerdctl`;
+- the repository source code and access to the base images used by the Dockerfile.
 
-Pour un autre cluster, construisez et publiez l’image dans votre registre habituel,
-puis renseignez `image.repository`, `image.tag` ou `image.digest` dans les valeurs Helm.
-Adaptez également le contexte et le namespace des commandes.
+For another cluster, build and publish the image to your usual registry,
+then set `image.repository`, `image.tag`, or `image.digest` in the Helm values.
+Also adjust the context and namespace in the commands.
 
-## 1. Construire l’image
+## 1. Build the image
 
-Depuis la racine du dépôt :
-
-```sh
-nerdctl build -t temba-catalog:1.3.1 .
-```
-
-Dans Minikube, chargez explicitement une archive de l’image :
+From the repository root:
 
 ```sh
-nerdctl save -o /tmp/temba-catalog-1.3.1.tar temba-catalog:1.3.1
-minikube image load /tmp/temba-catalog-1.3.1.tar
+nerdctl build -t temba-catalog:1.3.2 .
 ```
 
-L’image embarque le binaire Rust. La ConfigMap créée par Helm contient uniquement
-les définitions de MCP, pas le code ni des tokens de services distants.
+In Minikube, explicitly load an image archive:
 
-## 2. Décrire vos MCP
+```sh
+nerdctl save -o /tmp/temba-catalog-1.3.2.tar temba-catalog:1.3.2
+minikube image load /tmp/temba-catalog-1.3.2.tar
+```
 
-Créez un fichier `values.local.yaml` :
+The image includes the Rust binary. The ConfigMap created by Helm contains only
+MCP server definitions, not code or remote service tokens.
+
+## 2. Define your MCP servers
+
+Create a `values.local.yaml` file:
 
 ```yaml
 image:
   repository: temba-catalog
-  tag: "1.3.1"
+  tag: "1.3.2"
 
 catalogueAuth:
   enabled: false
@@ -53,23 +53,22 @@ catalogueAuth:
 catalog:
   servers:
     - id: documentation
-      name: Documentation
-      description: Rechercher et consulter la documentation de l’équipe
+      description: Search and browse the team's documentation
       endpoint: https://docs-mcp.example.com/mcp
       access:
         public: true
 ```
 
-Remplacez l’endpoint d’exemple par l’adresse HTTPS d’un MCP réel, joignable depuis
-les postes utilisateurs. L’authentification du catalogue est ici désactivée ;
-vous pourrez activer les groupes ensuite avec le [guide Keycloak](KEYCLOAK.md).
+Replace the example endpoint with the HTTPS address of a real MCP server reachable from
+users' machines. Catalog authentication is disabled here;
+you can enable groups later using the [Keycloak guide](KEYCLOAK.md).
 
-Les valeurs par défaut sont dans [values.yaml](../chart/temba-catalog/values.yaml).
-Le [guide du catalogue](CATALOGUE.md) détaille OAuth, headers et règles de visibilité.
-La surcharge `overide.yaml` du dépôt appartient à l’environnement de test ; ne la
-reprenez pas telle quelle pour une nouvelle installation.
+Default values are in [values.yaml](../chart/temba-catalog/values.yaml).
+The [catalog guide](CATALOGUE.md) covers OAuth, headers, and visibility rules in detail.
+The repository's `overide.yaml` override belongs to the test environment; do not
+reuse it as is for a new installation.
 
-## 3. Installer la release
+## 3. Install the release
 
 ```sh
 helm upgrade --install temba chart/temba-catalog \
@@ -78,48 +77,48 @@ helm upgrade --install temba chart/temba-catalog \
   -f values.local.yaml
 ```
 
-La chart utilise un PVC par défaut. Vérifiez que le cluster dispose d’une StorageClass
-adaptée, ou renseignez `persistence.storageClass` / `persistence.existingClaim`.
+The chart uses a PVC by default. Check that the cluster has a suitable StorageClass,
+or set `persistence.storageClass` / `persistence.existingClaim`.
 
-Vérifiez le déploiement :
+Check the deployment:
 
 ```sh
 kubectl --context minikube -n temba rollout status deployment/temba
 kubectl --context minikube -n temba logs deployment/temba
 ```
 
-L’API administrative reste désactivée tant qu’aucun Secret n’est référencé.
-Vous pouvez commencer avec les définitions Helm seules.
+The administrative API stays disabled until a Secret is referenced.
+You can start with Helm definitions alone.
 
-## 4. Joindre le catalogue en développement
+## 4. Reach the catalog during development
 
-Gardez ce port-forward ouvert :
+Keep this port forwarding session open:
 
 ```sh
 kubectl --context minikube -n temba port-forward service/temba 18080:8080
 ```
 
-Dans le TOML du poste utilisateur :
+In the TOML file on the user's machine:
 
 ```toml
 catalog_url = "http://127.0.0.1:18080"
 allow_loopback_http = true
 ```
 
-Pour vérifier les définitions publiques :
+To check public definitions:
 
 ```sh
 curl --fail http://127.0.0.1:18080/v1/catalog
 ```
 
-Le flag du TOML suffit pour joindre le catalogue via ce port-forward.
-`security.allowLoopbackHttp` dans la chart concerne les **endpoints de MCP déclarés** :
-activez-le seulement si ces définitions utilisent elles aussi du HTTP local.
-Il n’autorise jamais un endpoint HTTP distant arbitraire.
+The TOML flag is enough to reach the catalog through this port forwarding session.
+`security.allowLoopbackHttp` in the chart applies to **declared MCP endpoints**:
+enable it only if those definitions also use local HTTP.
+It never allows an arbitrary remote HTTP endpoint.
 
-## Exposer le catalogue en HTTPS
+## Exposing the catalog over HTTPS
 
-Pour une installation partagée, exposez le catalogue par un Ingress HTTPS :
+For a shared installation, expose the catalog through an HTTPS Ingress:
 
 ```yaml
 ingress:
@@ -136,52 +135,55 @@ security:
       namespace: ingress-nginx
 ```
 
-Les noms du contrôleur, du namespace, du domaine et du Secret TLS sont à adapter
-à votre cluster. Le Secret TLS doit être fourni par votre gestion habituelle des certificats.
-L’Ingress de la chart expose `/v1`, utilisé par l’API utilisateur et l’API admin.
+Adjust the controller, namespace, domain, and TLS Secret names
+to your cluster. The TLS Secret must be supplied through your usual certificate management process.
+The chart's Ingress exposes `/v1`, used by both the user API and the admin API.
 
-Communiquez ensuite `https://catalogue.example.com` aux utilisateurs comme `catalog_url`.
-Chaque MCP distant doit, lui aussi, être accessible depuis leurs postes.
-Le catalogue ne proxifie pas leurs appels.
+Then share `https://catalogue.example.com` with users as their `catalog_url`.
+Each remote MCP server must also be accessible from their machines.
+The catalog does not proxy their calls.
 
-Les NetworkPolicies sont activées par défaut : autorisez le namespace de votre
-contrôleur Ingress et, si Keycloak est activé, ses plages d’adresses de sortie.
-Voir [les flux autorisés](CONFIGURATION.md#réseau-kubernetes) et le
-[durcissement du conteneur](../SECURITY_CONTAINER.md).
+NetworkPolicies are enabled by default: allow your Ingress controller's
+namespace and, if Keycloak is enabled, its outbound address ranges.
+See [allowed traffic](CONFIGURATION.md#kubernetes-networking) and
+[container hardening](../SECURITY_CONTAINER.md).
 
-## Mises à jour et stockage
+## Updates and storage
 
-Les ajouts administratifs sont persistés sur le PVC ; les définitions Helm restent
-dans vos valeurs. Le PVC est conservé lors d’une désinstallation Helm.
+Administrative additions are persisted on the PVC; Helm definitions remain
+in your values. The PVC is retained when Helm uninstalls the release.
 
-Avec le volume, le Deployment utilise **Recreate** : prévoyez une courte interruption
-pendant la mise à jour. Un seul processus peut écrire les ajouts persistants.
-Ne modifiez pas des définitions Helm pour réutiliser l’identifiant d’un ajout API existant.
+With the volume, the Deployment uses **Recreate**: expect a brief interruption
+during updates. Only one process can write persistent additions.
+Do not change Helm definitions to reuse the identifier of an existing API addition.
 
-### Migrer une ancienne configuration
+### Migrating an old configuration
 
-Les anciennes clés sont rejetées. Pour mettre à jour une installation issue des premières versions :
+Old keys are rejected. To update an installation from earlier versions:
 
-| Ancien réglage | Réglage actuel |
+| Old setting | Current setting |
 | --- | --- |
-| `auth` global | `catalogueAuth` |
-| `catalogAccess` | Une règle `access` |
-| `adminApi.mutable` | `adminApi.readOnly`, avec la logique inversée |
-| `auth.type` sur un MCP | `oauth` et/ou `headers` |
-| `url` sur une définition MCP | `endpoint` |
-| `headers[].prefix` | Valeur complète fournie côté client |
-| `[credentials.<id>]` dans le TOML | `[tool.<id>]` et `[tool.<id>.headers]` |
-| Référence ENV implicite | Objet explicite `{ env = "VARIABLE" }` |
+| Global `auth` | `catalogueAuth` |
+| `catalogAccess` | An `access` rule |
+| `adminApi.mutable` | `adminApi.readOnly`, with inverted logic |
+| `auth.type` on an MCP server | `oauth` and/or `headers` |
+| `url` on an MCP definition | `endpoint` |
+| Display `name` on an MCP definition | Remove it; keep the existing unique `id` |
+| `headers[].prefix` | Complete value supplied by the client |
+| `[credentials.<id>]` in TOML | `[tool.<id>]` and `[tool.<id>.headers]` |
+| Implicit ENV reference | Explicit `{ env = "VARIABLE" }` object |
 
-Le format du catalogue est `schemaVersion: 2`. La gateway Python, Redis, les enveloppes
-de tokens et les anciennes routes MCP HTTP ne font plus partie de l’architecture.
-Le client actuel est un MCP local stdio ; il n’y a pas de couche de compatibilité V1.
+Before using client 1.4.9, update the catalog to 1.3.2 and remove server-level `name` from Helm values, raw catalog files and persisted API definitions. Keep the existing IDs so TOML mappings and tool IDs remain stable. Header `name` fields are unchanged.
 
-Les callbacks historiques `/session/callback` et `/oidc/callback` sont remplacés par
-le callback natif sur le poste, décrit dans le [guide Keycloak](KEYCLOAK.md).
+The catalog format is `schemaVersion: 2`. The Python gateway, Redis, token envelopes,
+and old HTTP MCP routes are no longer part of the architecture.
+The current client is a local stdio MCP server; there is no V1 compatibility layer.
 
-Lors de la migration d’un ancien Deployment vers `Recreate`, si Helm conserve
-la section `rollingUpdate`, retirez-la une fois avant de relancer la mise à jour :
+The legacy `/session/callback` and `/oidc/callback` routes are replaced by
+the native callback on the user's machine, described in the [Keycloak guide](KEYCLOAK.md).
+
+When migrating an old Deployment to `Recreate`, if Helm retains
+the `rollingUpdate` section, remove it once before retrying the update:
 
 ```sh
 kubectl --context minikube -n temba patch deployment temba \
@@ -189,4 +191,4 @@ kubectl --context minikube -n temba patch deployment temba \
   -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
 ```
 
-Adaptez le contexte, le namespace et le nom du Deployment à votre installation.
+Adjust the context, namespace, and Deployment name to your installation.

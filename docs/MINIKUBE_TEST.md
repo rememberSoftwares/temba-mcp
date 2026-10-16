@@ -1,46 +1,46 @@
-# Test Minikube : groupes et tokens
+# Minikube test: groups and tokens
 
-Les groupes Keycloak sont créés à la racine : `dev` et `pm`. Le mapper `groups`
-doit inclure leur chemin complet dans l’access token (`/dev`, `/pm`). Voir
-[la configuration Keycloak](KEYCLOAK.md).
+The Keycloak groups are created at the top level: `dev` and `pm`. The `groups` mapper
+must include their full paths in the access token (`/dev`, `/pm`). See
+[Keycloak configuration](KEYCLOAK.md).
 
-| Groupe dans le token | MCP visibles | Label |
+| Group in the token | Visible MCP servers | Label |
 | --- | --- | --- |
-| Tous, même sans connexion | DeepWiki | `tech` |
-| `/dev` | GitLab par token | — |
-| `/dev` | Jira par token | `support` |
-| `/pm` | Jira OAuth Atlassian | — |
+| Everyone, even without a connection | DeepWiki | `tech` |
+| `/dev` | GitLab with a token | — |
+| `/dev` | Jira with a token | `support` |
+| `/pm` | Jira with Atlassian OAuth | — |
 
-Avec les deux groupes, les quatre MCP sont visibles. Après un changement de
-groupe, reconnecter le catalogue pour obtenir un nouveau token Keycloak ;
-redémarrer OpenCode relance cette connexion. Un token déjà délivré conserve
-ses anciens groupes jusqu’à son renouvellement.
+With both groups, all four MCP servers are visible. After a group
+change, reconnect to the catalog to obtain a new Keycloak token;
+restarting OpenCode restarts this connection. An existing token keeps
+its old groups until it is renewed.
 
-## Déploiements locaux
+## Local deployments
 
-Les copies dans `deploy/minikube-test/` ne modifient pas les exemples des dépôts
-Jira et GitLab. Elles utilisent les images construites depuis leurs sources,
-chargées dans Minikube (`*-mcp:temba-test-20261013`), car le registre privé était
-injoignable. Ces images doivent être présentes avant de réappliquer les copies :
+The copies in `deploy/minikube-test/` do not change the examples in the
+Jira and GitLab repositories. They use images built from their source code,
+loaded into Minikube (`*-mcp:temba-test-20261013`), because the private registry was
+unreachable. These images must be present before reapplying the copies:
 
 ```sh
 kubectl --context minikube apply -f deploy/minikube-test/
 ```
 
-Les paramètres fixes sont dans l’ENV des pods :
+Fixed settings are in the pods' environment variables:
 
-- Jira : `JIRA_URL=https://numsproduct.atlassian.net` et
+- Jira: `JIRA_URL=https://numsproduct.atlassian.net` and
   `JIRA_EMAIL=emilien.lancelot@numspot.com`.
-- GitLab : `GITLAB_PROJECTS=https://gitlab.tooling.cloudgouv-eu-west-1.numspot.internal/cloud-compute/eclused-compute`
-  et `GITLAB_VERIFY_SSL=false` pour ce test.
+- GitLab: `GITLAB_PROJECTS=https://gitlab.tooling.cloudgouv-eu-west-1.numspot.internal/cloud-compute/eclused-compute`
+  and `GITLAB_VERIFY_SSL=false` for this test.
 
-Aucun token n’est défini dans ces manifests : chaque client fournit son token
-par header. Pour Jira, ce token doit correspondre au compte email configuré.
+No token is defined in these manifests: each client provides its token
+through a header. For Jira, this token must match the configured email account.
 
-## Accès depuis le poste
+## Access from the user's machine
 
-Pour ce test local, maintenir ces trois port-forwards ouverts, chacun dans son
-terminal (ou via k9s) :
+For this local test, keep these three port forwarding sessions open, each in its
+own terminal (or through k9s):
 
 ```sh
 kubectl --context minikube port-forward service/temba 18080:8080
@@ -48,12 +48,12 @@ kubectl --context minikube -n agent port-forward service/jira-mcp 18081:8000
 kubectl --context minikube -n agent port-forward service/gitlab-mcp 18082:8000
 ```
 
-En dehors de ce test, remplacer les endpoints loopback par les ingress HTTPS
-accessibles depuis les postes clients.
+Outside this test, replace the loopback endpoints with HTTPS ingress addresses
+accessible from client machines.
 
-## Configuration du client
+## Client configuration
 
-Le fichier local `temba.toml` contient uniquement les références des tokens :
+The local `temba.toml` file contains only token references:
 
 ```toml
 [tool.jira-token]
@@ -67,18 +67,18 @@ expected_endpoint = "http://127.0.0.1:18082/mcp"
 token = { env = "GITLAB_TOKEN" }
 ```
 
-Définir ces deux variables dans l’environnement qui lance OpenCode. Les valeurs
-sont les tokens bruts, sans préfixe `Bearer `. Une valeur littérale locale dans
-le TOML fonctionne aussi. `expected_endpoint` limite la destination autorisée
-pour l’envoi du token.
+Set these two variables in the environment that launches OpenCode. The values
+are raw tokens, without the `Bearer ` prefix. A local literal value in
+the TOML file also works. `expected_endpoint` restricts the allowed destination
+for sending the token.
 
-Les labels sont un filtre local, distinct des permissions Keycloak : `labels = []`
-inclut uniquement les MCP sans label (GitLab pour `/dev`, Jira OAuth pour `/pm`).
-`labels = ["support"]` ajoute Jira par token ; `labels = ["tech"]` ajoute DeepWiki.
-Pour inclure les deux, utiliser `labels = ["support", "tech"]`. Les MCP sans
-label restent visibles. Si un MCP porte plusieurs labels, tous doivent être
-activés dans le TOML. Même public, DeepWiki nécessite donc le label `tech`
-pour être inclus par le client local.
+Labels are a local filter, separate from Keycloak permissions: `labels = []`
+includes only MCP servers without labels (GitLab for `/dev`, Jira OAuth for `/pm`).
+`labels = ["support"]` adds Jira with a token; `labels = ["tech"]` adds DeepWiki.
+To include both, use `labels = ["support", "tech"]`. MCP servers without
+labels remain visible. If an MCP server has multiple labels, all must be
+enabled in the TOML file. Even though DeepWiki is public, it therefore requires the `tech` label
+to be included by the local client.
 
-Sans token métier, un MCP autorisé reste annoncé avec le statut
-`credentials_required`. Les appels Jira/GitLab nécessitent ensuite un token valide.
+Without a service token, an allowed MCP server is still listed with the
+`credentials_required` status. Jira/GitLab calls then require a valid token.

@@ -1,46 +1,52 @@
-# Décrire et administrer le catalogue
+# Defining and managing the catalog
 
-Le catalogue partagé contient des **définitions de MCP** : leurs identifiants,
-leurs adresses, leurs options de connexion et leurs règles de visibilité.
-Les appels aux MCP et leurs sessions OAuth sont gérés par le client local.
+The shared catalog contains **MCP server definitions**: their identifiers,
+addresses, connection options, and visibility rules.
+MCP calls and their OAuth sessions are managed by the local client.
 
-Pour installer le service, suivez le [guide de déploiement](DEPLOYMENT.md).
+To install the service, follow the [deployment guide](DEPLOYMENT.md).
 
-## Déclarer un premier MCP
+## Declaring your first MCP server
 
-Dans votre fichier de valeurs Helm :
+In your Helm values file:
 
 ```yaml
 catalog:
   servers:
     - id: documentation
-      name: Documentation
-      description: Rechercher et consulter la documentation de l’équipe
+      description: Search and browse the team's documentation
       endpoint: https://docs-mcp.example.com/mcp
       access:
         public: true
 ```
 
-Remplacez le domaine d’exemple par un MCP réel. L’adresse doit être joignable
-**depuis les postes utilisateurs**, généralement via un Ingress HTTPS.
-Une adresse de Service Kubernetes n’est pas une adresse utilisable par ces postes.
+Replace the example domain with a real MCP server. The address must be reachable
+**from users' machines**, usually through an HTTPS Ingress.
+A Kubernetes Service address is not an address these machines can use.
 
-| Champ | Rôle |
+| Field | Purpose |
 | --- | --- |
-| `id` | Identifiant stable, repris dans le TOML et les `tool_id` |
-| `name` | Nom lisible du MCP |
-| `description` | Aide l’assistant à identifier les usages du service |
-| `endpoint` | URL du transport MCP Streamable HTTP |
-| `labels` | Catégories que les utilisateurs peuvent activer localement |
-| `timeoutSeconds` | Délai maximal des connexions et appels au MCP, entre 1 et 300 secondes, 60 par défaut |
-| `oauth` | Active et configure la connexion OAuth au MCP |
-| `headers` | Déclare les headers privés ou publics attendus |
-| `access` | Définit qui peut voir le MCP dans le catalogue |
+| `id` | Unique MCP identifier, used in the TOML file, display and `tool_id` values |
+| `description` | Helps the assistant identify what the service can be used for |
+| `endpoint` | MCP Streamable HTTP transport URL |
+| `labels` | Categories that users can enable locally |
+| `timeoutSeconds` | Maximum time for MCP connections and calls, between 1 and 300 seconds, 60 by default |
+| `oauth` | Enables and configures OAuth connections to the MCP server |
+| `headers` | Declares expected private or public headers |
+| `access` | Defines who can see the MCP server in the catalog |
 
-Sans `oauth` ni `headers`, aucune authentification distante n’est configurée.
-Sans `access`, l’entrée est publique.
+Without `oauth` or `headers`, no remote authentication is configured.
+Without `access`, the entry is public.
 
-Hors Helm, le fichier chargé par le binaire catalogue utilise le schéma suivant :
+There is no separate display `name`. IDs are case-sensitive and must contain
+1–64 ASCII letters, digits, hyphens or underscores, without the reserved `__` prefix.
+
+Helm rejects duplicate IDs in `catalog.servers` at render time, before installation
+or upgrade. The API rejects IDs already owned by either Helm or an API addition
+with HTTP `409 Conflict`. Collisions with persisted API definitions are also
+rejected when the catalog starts.
+
+Outside Helm, the file loaded by the catalog binary uses the following schema:
 
 ```yaml
 schemaVersion: 2
@@ -49,9 +55,9 @@ servers:
     endpoint: https://docs-mcp.example.com/mcp
 ```
 
-## OAuth et headers : deux options combinables
+## OAuth and headers: two options you can combine
 
-### Une connexion OAuth
+### An OAuth connection
 
 ```yaml
 catalog:
@@ -63,11 +69,11 @@ catalog:
           - https://identity.example.com
 ```
 
-Le client découvre le fournisseur et utilise le navigateur avec PKCE S256.
-L’origine du MCP est autorisée implicitement. Toute origine supplémentaire du
-fournisseur OAuth doit être déclarée dans `allowedOrigins`, en HTTPS.
+The client discovers the provider and uses the browser with PKCE S256.
+The MCP server's origin is implicitly allowed. Any additional OAuth
+provider origin must be declared in `allowedOrigins`, using HTTPS.
 
-Pour un fournisseur sans enregistrement dynamique de client (DCR), ajoutez :
+For a provider without dynamic client registration (DCR), add:
 
 ```yaml
 oauth:
@@ -77,15 +83,15 @@ oauth:
   allowedOrigins: [https://identity.example.com]
 ```
 
-Le `clientId` et les scopes dépendent du fournisseur. Enregistrez auprès de celui-ci
-la redirect URI exacte `http://127.0.0.1:19878/oauth/callback`.
-Le callback se trouve sur le poste utilisateur. Sans port imposé pour un MCP,
-le client choisit un port local disponible.
+The `clientId` and scopes depend on the provider. Register the exact
+redirect URI `http://127.0.0.1:19878/oauth/callback` with it.
+The callback runs on the user's machine. Without a fixed port for an MCP server,
+the client chooses an available local port.
 
-Cette connexion est indépendante de l’authentification du catalogue Temba.
-Les tokens et leur renouvellement restent dans le processus local.
+This connection is independent of Temba catalog authentication.
+Tokens and their renewal stay within the local process.
 
-### Un token ou plusieurs headers
+### A token or multiple headers
 
 ```yaml
 catalog:
@@ -102,75 +108,75 @@ catalog:
           value: temba
 ```
 
-Chaque header a **exactement une source** :
+Each header has **exactly one source**:
 
-- `credential` référence une valeur privée que l’utilisateur fournit localement ;
-- `value` contient une valeur publique, identique pour tous les clients.
+- `credential` references a private value that the user provides locally;
+- `value` contains a public value, identical for all clients.
 
-`mandatory` vaut `false` par défaut. Une valeur privée optionnelle absente est omise.
-Si une valeur obligatoire manque, le client annonce `credentials_required` avant
-de contacter le MCP. Voir [le TOML des credentials](CLIENT.md#fournir-des-tokens-et-des-headers-privés).
+`mandatory` defaults to `false`. A missing optional private value is omitted.
+If a required value is missing, the client reports `credentials_required` before
+contacting the MCP server. See [credentials in TOML](CLIENT.md#providing-tokens-and-private-headers).
 
-Les valeurs publiques sont visibles dans l’API utilisateur et peuvent être persistées.
-**N’y placez pas de token ni de clé API.** Les headers privés ne sont pas envoyés au catalogue.
+Public values are visible in the user API and may be persisted.
+**Do not put tokens or API keys there.** Private headers are not sent to the catalog.
 
-Les noms autorisés sont `Authorization` et les noms `X-*`.
-Un header public `value` doit être un `X-*` ; les doublons de noms sont rejetés,
-y compris lorsqu’ils diffèrent seulement par la casse.
+Allowed names are `Authorization` and `X-*` names.
+A public `value` header must be an `X-*`; duplicate names are rejected,
+including names that differ only in case.
 
-### OAuth avec des headers supplémentaires
+### OAuth with additional headers
 
-Un même MCP peut déclarer `oauth` et plusieurs headers `X-*`.
-OAuth fournit déjà `Authorization` : il ne peut donc pas être combiné avec un
-second header `Authorization` statique.
+The same MCP server can declare `oauth` and multiple `X-*` headers.
+OAuth already provides `Authorization`, so it cannot be combined with a
+second static `Authorization` header.
 
-Le client envoie les valeurs complètes, sans ajouter de préfixe.
-Il ne transmet pas les headers privés aux endpoints de découverte ou d’échange OAuth.
+The client sends complete values without adding a prefix.
+It does not forward private headers to OAuth discovery or token exchange endpoints.
 
-## Rendre un MCP visible pour les bons utilisateurs
+## Making an MCP server visible to the right users
 
-Choisissez une règle `access` par entrée :
+Choose one `access` rule per entry:
 
-| Règle | Visibilité |
+| Rule | Visibility |
 | --- | --- |
-| `public: true` | Tout le monde, même sans connexion au catalogue |
-| `authenticated: true` | Tous les utilisateurs authentifiés auprès du catalogue |
-| `groupsAnyOf: ["/equipe-a", "/equipe-b"]` | Les membres d’au moins un des groupes |
+| `public: true` | Everyone, even without a catalog connection |
+| `authenticated: true` | All users authenticated with the catalog |
+| `groupsAnyOf: ["/team-a", "/team-b"]` | Members of at least one group |
 
-Les règles portent sur **tous les outils d’un MCP**, pas sur les opérations métier
-que le service autorise ensuite. Connaître directement l’adresse d’un MCP ne donne
-pas de droit supplémentaire sur ce service.
+Rules apply to **all tools of an MCP server**, not to the service operations
+it subsequently authorizes. Knowing an MCP server's address directly does not
+grant additional rights to that service.
 
-Les entrées protégées nécessitent `catalogueAuth.enabled: true`.
-Si cette option est désactivée, seules les entrées publiques sont visibles.
-Le [tutoriel Keycloak](KEYCLOAK.md) décrit les groupes, les mappers et l’audience.
+Protected entries require `catalogueAuth.enabled: true`.
+If this option is disabled, only public entries are visible.
+The [Keycloak tutorial](KEYCLOAK.md) covers groups, mappers, and audience.
 
-Les labels sont indépendants des groupes : même public, un MCP portant un label
-doit être activé dans la [sélection locale](CLIENT.md#choisir-les-mcp-par-labels).
+Labels are independent of groups: even a public MCP server with a label
+must be enabled in the [local selection](CLIENT.md#selecting-mcp-servers-by-label).
 
-Si la découverte Keycloak annonce des endpoints incorrects, les valeurs Helm
-`catalogueAuth.jwksUri` et `catalogueAuth.tokenEndpoint` permettent de les préciser.
-Ces URLs doivent rester en HTTPS et sur la même origine que `catalogueAuth.issuer`.
-`jwksUri` sert à la vérification des signatures côté catalogue ; `tokenEndpoint`
-est communiqué au client natif pour l’échange du code et le renouvellement.
+If Keycloak discovery advertises incorrect endpoints, the Helm values
+`catalogueAuth.jwksUri` and `catalogueAuth.tokenEndpoint` let you specify them.
+These URLs must use HTTPS and share the same origin as `catalogueAuth.issuer`.
+`jwksUri` is used for signature verification by the catalog; `tokenEndpoint`
+is sent to the native client for code exchange and token renewal.
 
 
-## Modifier le catalogue partagé
+## Updating the shared catalog
 
-Il existe deux sources de définitions :
+There are two sources of definitions:
 
-| Source | Modification | Conservation |
+| Source | How to change it | Storage |
 | --- | --- | --- |
-| `catalog.servers` dans les valeurs Helm | Mise à jour Helm | Fichier de valeurs / configuration déployée |
-| API administrative | Ajout ou suppression par bearer administratif | Fichier sur volume persistant |
+| `catalog.servers` in Helm values | Helm update | Values file / deployed configuration |
+| Administrative API | Addition or deletion using an administrative bearer token | File on a persistent volume |
 
-Les définitions Helm restent gérées par Helm : l’API ne peut ni les remplacer ni les supprimer.
-Les identifiants doivent être uniques entre les deux sources.
+Helm definitions remain managed by Helm: the API cannot replace or delete them.
+Identifiers must be unique across both sources.
 
-### Activer l’API administrative
+### Enabling the administrative API
 
-Par défaut, `adminApi.secretName` est vide : l’API administrative n’autorise aucun accès.
-Créez un Secret Kubernetes contenant un token administratif aléatoire, puis référencez-le :
+By default, `adminApi.secretName` is empty: the administrative API allows no access.
+Create a Kubernetes Secret containing a random administrative token, then reference it:
 
 ```yaml
 adminApi:
@@ -182,27 +188,26 @@ persistence:
   size: 100Mi
 ```
 
-Le Secret doit exister dans le namespace du catalogue. La chart ne le génère pas.
-`readOnly: true` permet seulement de consulter les définitions ; `false` permet
-les ajouts et suppressions, avec une seule réplique et un volume persistant.
+The Secret must exist in the catalog's namespace. The chart does not generate it.
+`readOnly: true` only allows viewing definitions; `false` allows
+additions and deletions, with a single replica and a persistent volume.
 
-Pour le stockage, les NetworkPolicies et la protection réseau de cette API, voir
-[les options du catalogue](CONFIGURATION.md).
+For storage, NetworkPolicies, and network protection for this API, see
+[catalog options](CONFIGURATION.md).
 
-### Ajouter une définition par API
+### Adding a definition through the API
 
-Créez un fichier `server.json` :
+Create a `server.json` file:
 
 ```json
 {
   "id": "service",
-  "name": "Service partagé",
   "endpoint": "https://mcp.example.com/mcp",
   "access": {"public": true}
 }
 ```
 
-Puis envoyez-le avec le bearer administratif fourni par votre opérateur :
+Then send it with the administrative bearer token supplied by your operator:
 
 ```sh
 curl --fail-with-body \
@@ -212,35 +217,35 @@ curl --fail-with-body \
   https://catalogue.example.com/v1/admin/servers
 ```
 
-Ces ajouts sont partagés selon leur règle `access`. Pour un besoin personnel et
-éphémère, utilisez plutôt [le tool local `add_mcp`](CLIENT.md#ajouts-locaux-éphémères).
+These additions are shared according to their `access` rule. For a personal,
+temporary need, use the [local `add_mcp` tool](CLIENT.md#temporary-local-additions).
 
-### Que se passe-t-il au redémarrage ?
+### What happens on restart?
 
-Les ajouts API sont sauvegardés dans `/var/lib/temba/additions.json`, puis chargés au démarrage.
-L’API confirme une modification après sauvegarde et synchronisation du fichier.
-Un échec d’écriture ne publie pas la modification en RAM.
+API additions are saved in `/var/lib/temba/additions.json`, then loaded at startup.
+The API confirms a change after saving and syncing the file.
+A write failure does not publish the change in RAM.
 
-Un fichier invalide ou une collision avec une définition Helm bloque le démarrage
-pour éviter une perte silencieuse. Sauvegardez le PVC : il est conservé lors d’une
-désinstallation Helm, et sa suppression définitive reste une action d’administration.
+An invalid file or a conflict with a Helm definition blocks startup
+to prevent silent data loss. Back up the PVC: it is retained when
+Helm uninstalls the release, and permanently deleting it remains an administrative action.
 
-Le volume ne contient pas les tokens OAuth ni les headers privés des utilisateurs.
+The volume contains neither OAuth tokens nor users' private headers.
 
-## Routes exposées
+## Exposed routes
 
-| Route | Accès et rôle |
+| Route | Access and purpose |
 | --- | --- |
-| `GET /healthz`, `GET /readyz` | Sondes de vie et de disponibilité |
-| `GET /v1/bootstrap` | Paramètres OAuth publics et non secrets du catalogue |
-| `GET /v1/catalog` | API utilisateur : définitions filtrées, ETag et cache privé |
-| `GET /v1/admin/servers` | Bearer administratif : toutes les définitions |
-| `POST /v1/admin/servers` | Ajout persistant si l’écriture est activée |
-| `DELETE /v1/admin/servers/{id}` | Suppression persistante d’un ajout API |
+| `GET /healthz`, `GET /readyz` | Liveness and readiness probes |
+| `GET /v1/bootstrap` | Public, nonsecret catalog OAuth settings |
+| `GET /v1/catalog` | User API: filtered definitions, ETag, and private cache |
+| `GET /v1/admin/servers` | Administrative bearer token: all definitions |
+| `POST /v1/admin/servers` | Persistent addition if writes are enabled |
+| `DELETE /v1/admin/servers/{id}` | Persistent deletion of an API addition |
 
-`GET /v1/catalog` expose les déclarations `headers`, y compris `mandatory`,
-`credential` ou `value`, aux clients autorisés. Le client local en déduit les besoins
-de configuration sans exposer inutilement ces déclarations au LLM.
+`GET /v1/catalog` exposes `headers` declarations, including `mandatory`,
+`credential`, or `value`, to authorized clients. The local client uses them to determine
+configuration requirements without unnecessarily exposing these declarations to the LLM.
 
-Le serveur vérifie les access tokens du catalogue : signature RS256, issuer,
-audience, expiration, `nbf`, sujet et type `Bearer`. Aucun scope personnalisé n’est imposé.
+The server validates catalog access tokens: RS256 signature, issuer,
+audience, expiration, `nbf`, subject, and `Bearer` type. No custom scope is required.
