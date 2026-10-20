@@ -102,7 +102,7 @@ In the TOML file on the user's machine:
 
 ```toml
 catalog_url = "http://127.0.0.1:18080"
-allow_loopback_http = true
+allow_insecure_http = true
 ```
 
 To check public definitions:
@@ -112,9 +112,9 @@ curl --fail http://127.0.0.1:18080/v1/catalog
 ```
 
 The TOML flag is enough to reach the catalog through this port forwarding session.
-`security.allowLoopbackHttp` in the chart applies to **declared MCP endpoints**:
-enable it only if those definitions also use local HTTP.
-It never allows an arbitrary remote HTTP endpoint.
+`security.allowInsecureHttp` in the chart applies to **declared MCP endpoints**:
+enable it if those definitions use HTTP, whether local or remote.
+The local client must also enable `allow_insecure_http` to use those definitions.
 
 ## Exposing the catalog over HTTPS
 

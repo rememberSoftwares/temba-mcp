@@ -56,4 +56,4 @@ persistence:
   size: 100Mi
   storageClass: ''
 security:
-  allowLoopbackHttp: true
+  allowInsecureHttp: true

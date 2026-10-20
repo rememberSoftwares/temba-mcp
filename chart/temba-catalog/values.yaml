@@ -27,10 +27,10 @@ adminApi:
   tokenKey: token
 
 security:
-  # Développement : accepte http://localhost:PORT/mcp ou http://127.0.0.1:PORT/mcp.
-  # Refuse toujours http://serveur-distant/mcp. Ne configure pas l'Ingress.
-  # Pour le port-forward du catalogue, utiliser allow_loopback_http dans le TOML client.
-  allowLoopbackHttp: false
+  # Accepte les endpoints MCP et origines OAuth en HTTP, locaux ou distants.
+  # Le client doit aussi activer allow_insecure_http. Ne configure pas l'Ingress.
+  # Pour le port-forward du catalogue, utiliser allow_insecure_http dans le TOML client.
+  allowInsecureHttp: false
   networkPolicy:
     # Refus par défaut en entrée/sortie, puis autorisations explicites ci-dessous.
     enabled: true

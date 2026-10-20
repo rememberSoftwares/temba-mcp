@@ -64,14 +64,21 @@ catalog:
   servers:
     - id: service
       endpoint: https://mcp.example.com/mcp
-      oauth:
-        allowedOrigins:
-          - https://identity.example.com
+      oauth: {}
 ```
 
 The client discovers the provider and uses the browser with PKCE S256.
-The MCP server's origin is implicitly allowed. Any additional OAuth
-provider origin must be declared in `allowedOrigins`, using HTTPS.
+With `oauth: {}`, the client automatically discovers the provider announced by the MCP.
+Additional destinations must resolve only to public IP addresses. HTTPS is required
+unless the local client explicitly sets `allow_insecure_http = true`.
+Private, loopback, link-local, and reserved destinations are blocked, including during
+token requests and refreshes. The configured MCP origin remains implicitly allowed.
+
+For explicit control, provide a nonempty `allowedOrigins` list. Only those origins
+and the MCP origin are then allowed. An absent or empty list enables automatic discovery.
+Use an explicit list for an identity provider on a private network, or on another
+port of the MCP host. Adding an MCP in automatic mode also trusts the public OAuth
+provider it announces.
 
 For a provider without dynamic client registration (DCR), add:
 
@@ -141,7 +148,11 @@ Choose one `access` rule per entry:
 | --- | --- |
 | `public: true` | Everyone, even without a catalog connection |
 | `authenticated: true` | All users authenticated with the catalog |
-| `groupsAnyOf: ["/team-a", "/team-b"]` | Members of at least one group |
+| `groupsAnyOf: ["team-a", "team-b"]` | Members of at least one group |
+
+The initial `/` is optional in `groupsAnyOf`: `team-a` and `/team-a` are equivalent.
+Nested paths remain exact: `teams/team-a` means `/teams/team-a`, not `/team-a`.
+Matching is case-sensitive. Keep the Keycloak group mapper’s **Full group path** enabled.
 
 Rules apply to **all tools of an MCP server**, not to the service operations
 it subsequently authorizes. Knowing an MCP server's address directly does not

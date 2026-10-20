@@ -33,11 +33,313 @@ cd ./chart/temba-catalog
 helm upgrade --install temba chart/temba-catalog
 ```
 
+
+* Opencode MCP config to add Temba (or any other LLM client like Codex or Claude Code):
+```json
+"mcp": {
+    "temba": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "--from",
+        "/home/elancelot/Documents/leTigre/dynmcp/dist/temba_client-1.4.9-py3-none-manylinux_2_34_x86_64.whl",
+        "temba-client",
+        "--config",
+        "<path-to-your-toml-file>"
+      ],
+      "enabled": true
+    }
+}
+```
+
+
+
+
+## Learn by example
+
+### Adding an unauthenticated MCP to the catalog
+
+Let's add the DeepWiki MCP to the catalog. It does not require any kind of authentication.  
+
+* Temba catalog:  
+```yaml
+catalog:
+  servers:
+  - id: deepwiki
+    description: Public technical documentation tools.
+    endpoint: https://mcp.deepwiki.com/mcp
+    timeoutSeconds: 45
+    access:
+      public: true
+```
+
+* .toml on the client desktop:
+```toml
+catalog_url = "http://127.0.0.1:18080" # URL of the catalog
+# allow_insecure_http = true          # if using an HTTP URL for the catalog
+```
+
+=> Ask your LLM to search something about a Github repo.
+
+### Adding an OIDC MCP to the catalog
+
+Let's add the official Jira MCP that uses an oauth connexion
+
+* Temba catalog:  
+```yaml
+catalog:
+  servers:
+  - id: jira
+    description: Atlassian remote Jira MCP ; sign in using its browser OAuth flow.
+    endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
+    oauth: {}
+    #  allowedOrigins:    # Optional restriction on OAuth destinations announced by this MCP. If unset, public destinations are discovered automatically.
+    #  - https://auth.atlassian.com
+```
+
+* .toml on the client desktop:
+```toml
+catalog_url = "http://127.0.0.1:18080" # URL of the catalog
+# allow_insecure_http = true          # if using an HTTP URL for the catalog
+```
+
+### Sending a custom header
+
+Some MCPs need to recieve somes specific headers to work.  
+Let's say that e have a Gitlab MCP that needs two custom headers :
+* **Non-sensitive** string to scope the MCP to a particular project.
+* **Sensitive** string containing a user defined token.
+
+The non-sensitive header can be set in the catalog directly. On the other hand the sensitive token, being a user defined value, will be set in the client's toml file.
+
+* Temba catalog:  
+```yaml
+catalog:
+  servers:
+  - id: gitlab
+    description: GitLab tools for project and instance configured on the MCP server.
+    endpoint: http://<GITLAB-MCP-URL>/mcp
+    headers:
+
+    - name: X-Gitlab-Project # For non sensitive values 
+      value: <REPO/PROJECT> 
+
+
+    - name: X-Gitlab-Token   # For sensitive values
+      credential: token      # The credential name must match the one in the .toml ; 'token' in this example
+      mandatory: true
+```
+
+* .toml on the client desktop:
+```toml
+[tool.gitlab]                                      # The string after 'tool' must match the 'id' in the catalog 
+expected_endpoint = "http://127.0.0.1:18082/mcp"
+[tool.gitlab.headers]
+token = "glpat-<SECRET-TOKEN-OF-USER>"             # Note the 'token' key that must be identical to the one in the catalog (cf 'credential' above)
+```
+
+If you don't want to store the secret inside the toml, you can use the ENV like so:
+```
+token = {env = <ENV_KEY_NAME>}"
+```
+:warning: Note that some LLM clients may not forward local ENV to their subprocess.
+
+
+### Partitioning tools using labels
+
+You can add labels on MCPs. These MCPs will only be available to clients with the same labels.  
+
+Let's add a Gitlab and Jira MCP. The Gitlab MCP is for developpers and use the label "dev". The jira MCP is for product managers and use the labels "pm". 
+
+* Temba catalog:  
+```yaml
+catalog:
+  servers:
+  - id: gitlab
+    description: GitLab tools for project and instance configured on the MCP server.
+    endpoint: http://<GITLAB-MCP-URL>/mcp
+  - id: jira
+    description: Atlassian remote Jira MCP ; sign in using its browser OAuth flow.
+    endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
+    oauth: {}
+```
+
+* .toml on the client desktop for a developer:
+```toml
+labels = ["dev"]
+
+...
+```
+=> This client can discover the Gitlab MCP but not Jira.  
+
+* .toml on the client desktop for a product manager:  
+```toml
+labels = ["pm"]
+
+...
+```
+=> This client can discover the Jira MCP but not Gitlab  
+
+:warning: Labels are not a security feature. It's a simple way to partition tools but if you need true separation then use the Keycloak feature (see bellow).  
+
+
+### Partitioning tools using Keycloak
+
+The Temba MCP supports OIDC. This allows to assign tools to users using Keycloak groups.
+
+#### 1. Configure the Keycloak client
+
+In your chosen realm (the space containing your users), create a new client: **Clients → temba**, or create an OpenID Connect client named `temba`.
+
+- **Client authentication**: Off; **Standard flow**: On.
+- **Require PKCE**: On, with method **S256** if the choice is offered.
+- **Valid redirect URIs**: `http://127.0.0.1:19877/oauth/callback`.
+- Root URL, Home URL, Web origins, and logout URLs can remain empty.
+
+:information_source: After login, Keycloak instructs the user's browser to open the redirect URI. The browser connects to the local Temba client on the same machine; Kubernetes is not involved in this callback. The port must match catalogueAuth.callbackPort.
+
+#### 2. Add the two mappers
+
+A **mapper** adds information to the authentication token sent to Temba.
+
+Open **Clients → temba → Client scopes → temba-dedicated → Mappers → Add mapper → By configuration**. Create and save:
+
+| Mapper type | Fields to fill in |
+|---|---|
+| **Group Membership** | Name: `temba-groups`; Token Claim Name: `groups`; Full group path: **On**; Add to access token: **On** |
+| **Audience** | Name: `temba-audience`; Included Client Audience: **empty**; Included Custom Audience: `temba-mcp`; Add to access token: **On**; Add to ID token: **Off** |
+
+**Groups** indicate what the user can see. The **audience** indicates that the token is intended for the Temba catalog. No special `temba:use` scope is requested.
+
+If the dedicated scope does not appear, put these mappers in a client scope attached to `temba` as **Default**, so they are always applied.
+
+#### 3. Create groups and assign users
+
+1. **Groups → Create group**: create `team-a` at the top level. Its path will be `/team-a`. Repeat for `team-b` (`/team-b`).
+2. **Users → user → Groups → Join group**: select one or more of these groups.
+
+The mapper passes along group memberships; it does not add users to groups.
+
+#### 4. Configure the Helm override
+
+Enable catalog authentication:
+
+```yaml
+catalogueAuth:
+  enabled: true
+  issuer: https://keycloak.example.com/realms/my-realm
+  clientId: temba
+  audience: temba-mcp
+  callbackPort: 19877
+```
+
+In each MCP server definition, choose **only one** rule:
+
+| Rule | Who can see the MCP server? |
+|---|---|
+| `access: {public: true}` | Everyone, without a catalog connection |
+| `access: {authenticated: true}` | All users connected to the catalog |
+| `access: {groupsAnyOf: ["team-a"]}` | Members of this group |
+| `access: {groupsAnyOf: ["team-a", "team-b"]}` | Members of either team |
+
+:information_source: Without `access`, the MCP server is public. The initial `/` is optional in catalog rules: `team-a` and `/team-a` are equivalent; `teams/team-a` means `/teams/team-a`. Paths and case must otherwise match exactly: `team-a/child` does not match `team-a`. Keep **Full group path: On** in the Keycloak mapper so nested groups remain distinct.
+
+
+**Back to the catalog !**
+
+Let's add a Gitlab and Jira MCP. The Gitlab MCP is for users part of `team-a`. The jira MCP is for users part of `team-b`. 
+
+* Temba catalog:  
+```yaml
+catalog:
+  servers:
+  - id: gitlab
+    description: GitLab tools for project and instance configured on the MCP server.
+    endpoint: http://<GITLAB-MCP-URL>/mcp
+  - id: jira
+    description: Atlassian remote Jira MCP ; sign in using its browser OAuth flow.
+    endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
+    oauth: {}
+```
+
+* .toml on the client desktop for a developer:
+```toml
+labels = ["dev"]
+
+...
+```
+=> This client can discover the Gitlab MCP but not Jira.  
+
+* .toml on the client desktop for a product manager:  
+```toml
+labels = ["pm"]
+
+...
+```
+=> This client can discover the Jira MCP but not Gitlab  
+
+
 #### Configuring the catalog
 
-This walkthrough assumes a catalog is already deployed and you know its URL.
+The catalog is a list of remote MCPs that follows this structure:
 
+```yaml
+catalog:
+  servers:
+  - id: <some-unique-id>                 # ie gitlab
+    description: <description of what this MCP does> # ie Gitlab management tools for MR and users.
+    endpoint: http://127.0.0.1:18082/mcp # Remote MCP URL must be accessible from the computer
+    headers:                             # Optionnal headers (see Setting headers)
+    - name: X-<Heeader-Name>
+      credential: <some-key>             # Optionnal setting that takes the header value from the client's .toml config 
+      mandatory: true
+    oauth:                               # Optionnal setting to add OIDC MCPs (ie official Jira) 
+      allowedOrigins:                    # Optional restriction; omit or use [] for automatic public OAuth discovery.
+        - https://auth.example.com
+      clientId: my-client
+      scopes:
+        - openid
+      callbackPort: 19878
+    labels: ["some-label"]               # Optionnal setting to distribute tools to clients that have the same label in their .toml. (See Using labels)
+    access:                              # Use Keycloak to manage tools per team (see Using OIDC for catalog access)
+      groupsAnyOf:
+      - <group-name>                     # User's registered to this group in keycloak will have access to this tool
+```
 
+#### Catalog config examples:
+
+* Example with a Gitlab MCP using only a header as token :
+
+```yaml
+catalog:
+  servers:
+  - id: gitlab
+    description: GitLab tools for the dev group; project and instance configured on the MCP server. Requires a client-provided raw GitLab token.
+    endpoint: http://gtlab-mcp/mcp # Change this to target your own Gitlab MCP 
+    headers:
+    - name: X-Gitlab-Token         # This is the header name that this Gitlab MCP awaits
+      credential: token            # The token is set under the key'token' in the client's .toml config. (see Setting headers)
+      mandatory: true
+    access:
+      groupsAnyOf:
+      - dev                        # If the user is in the group keycloak group 'dev', this tool will be made available to him
+```
+
+* Example with the official Jira MCP using OIDC (to Atlasian itself)
+
+``` yaml
+catalog:
+  servers:
+  - id: jira
+    description: Atlassian remote Jira MCP for the project managers group; sign in using its browser OAuth flow.
+    endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
+    oauth:
+      allowedOrigins:
+      - https://auth.atlassian.com
+    access:
+      groupsAnyOf:
+      - /pm
+```
 
 ### 1. Get the client
 

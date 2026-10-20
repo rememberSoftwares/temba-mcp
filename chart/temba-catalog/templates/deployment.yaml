@@ -55,7 +55,7 @@ spec:
             - {name: CATALOGUE_AUTH_CALLBACK_PORT, value: {{ .Values.catalogueAuth.callbackPort | quote }}}
             - {name: CATALOGUE_AUTH_JWKS_URI, value: {{ .Values.catalogueAuth.jwksUri | quote }}}
             - {name: CATALOGUE_AUTH_TOKEN_ENDPOINT, value: {{ .Values.catalogueAuth.tokenEndpoint | quote }}}
-            - {name: ALLOW_INSECURE_HTTP, value: {{ .Values.security.allowLoopbackHttp | quote }}}
+            - {name: ALLOW_INSECURE_HTTP, value: {{ .Values.security.allowInsecureHttp | quote }}}
             - {name: ADMIN_READ_ONLY, value: {{ .Values.adminApi.readOnly | quote }}}
             {{- if .Values.persistence.enabled }}
             - {name: CATALOG_ADDITIONS_PATH, value: /var/lib/temba/additions.json}

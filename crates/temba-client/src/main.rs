@@ -1,6 +1,7 @@
 mod config;
 mod local_catalog;
 mod oauth;
+mod oauth_network;
 mod search;
 mod transport;
 use anyhow::{Result, ensure};
@@ -237,7 +238,7 @@ impl Local {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let mut catalog: Catalog = temba_core::http_json(response).await?;
-        catalog.validate(self.config.allow_loopback_http)?;
+        catalog.validate(self.config.allow_insecure_http)?;
         catalog
             .servers
             .retain(|s| s.labels.iter().all(|l| self.config.labels.contains(l)));
@@ -529,13 +530,11 @@ impl Local {
                 return Err(error);
             }
         };
-        let mut origins = oauth.allowed_origins.clone();
-        origins.push(e.definition.endpoint.clone());
-        let provider = oauth::discover(
+        let (provider, oauth_http) = oauth::discover_remote(
             &self.http,
             &e.definition.endpoint,
-            &origins,
-            self.config.allow_loopback_http,
+            &oauth.allowed_origins,
+            self.config.allow_insecure_http,
             headers,
         )
         .await
@@ -549,7 +548,7 @@ impl Local {
             }
         })?;
         let pending = oauth::Pending::new(
-            self.http.clone(),
+            oauth_http,
             provider,
             oauth.client_id.clone(),
             oauth.scopes.clone(),
@@ -981,7 +980,7 @@ impl ServerHandler for Handler {
         let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to a remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. When a connection result is authenticated or ready, continue the original request immediately without asking the user to retry. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
         if self.0.config.local_catalog.enabled {
             let instructions = info.instructions.clone().unwrap_or_default();
-            info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM. Local registration, scoped search and connection do not require catalog authentication. OAuth origin approval belongs to each MCP definition: for a local entry, use definition.oauth.allowedOrigins in add_mcp, not central server configuration. A registration can be disconnected and recreated with a corrected definition.", instructions))
+            info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM. Local registration, scoped search and connection do not require catalog authentication. OAuth providers are discovered automatically over public destinations when definition.oauth.allowedOrigins is absent or empty. A nonempty list restricts provider origins for that MCP. A registration can be disconnected and recreated with a corrected definition.", instructions))
         } else {
             info
         }
@@ -994,7 +993,7 @@ impl ServerHandler for Handler {
         let mut tools=vec![Tool::new("tool_search","Search central tools and remote MCP connection states. To include ephemeral local MCPs, supply their secret IDs in local_ids. Local MCPs are never enumerated without their IDs. Catalog authentication is automatic; catalog.status reports public, auth_in_progress, loading, authenticated or failure. catalog_connect_tool is returned only to retry a failed catalog login.",json!({"type":"object","properties":{"query":{"type":"string"},"local_ids":{"type":"array","items":{"type":"string"},"maxItems":64}},"required":["query"],"additionalProperties":false}).as_object().unwrap().clone()),Tool::new("call_tool","Call a tool_id returned by tool_search. __catalog__.__temba_connect__ authenticates only to the Temba catalog; <server>.__temba_connect__ connects only to that visible remote MCP. Report the returned target and status accurately.",json!({"type":"object","properties":{"tool_id":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_id"],"additionalProperties":false}).as_object().unwrap().clone())];
         if self.0.config.local_catalog.enabled {
             tools.push(Tool::new("add_mcp",
-                "Register an ephemeral MCP in local RAM and return a secret local_id. Supply a definition using endpoint, oauth and header declarations, and optional private header values keyed by credential reference. No central modification or file persistence. Only callers presenting local_id can discover/use this registration. OAuth authorization is independent of catalog authentication. Declare trusted external provider origins in definition.oauth.allowedOrigins. If that field was omitted, disconnect and register a corrected local definition; do not request central server changes. OAuth authorization is a separate browser action. Never publish another conversation's local_id.",
+                "Register an ephemeral MCP in local RAM and return a secret local_id. Supply a definition using endpoint, oauth and header declarations, and optional private header values keyed by credential reference. No central modification or file persistence. Only callers presenting local_id can discover/use this registration. OAuth authorization is independent of catalog authentication. Omit definition.oauth.allowedOrigins or use an empty list for automatic public discovery; provide a nonempty list to restrict trusted provider origins. OAuth authorization is a separate browser action. Never publish another conversation's local_id.",
                 json!({
                     "type":"object",
                     "properties":{
@@ -1007,9 +1006,9 @@ impl ServerHandler for Handler {
                                 "endpoint":{"type":"string"},
                                 "oauth":{
                                     "type":"object",
-                                    "description":"This MCP's OAuth settings, independent of catalog login. An external identity provider must be explicitly listed in allowedOrigins.",
+                                    "description":"This MCP's OAuth settings, independent of catalog login. Empty settings enable automatic public provider discovery.",
                                     "properties":{
-                                        "allowedOrigins":{"type":"array","items":{"type":"string","format":"uri"},"description":"Trusted HTTPS authorization-server origins. The MCP endpoint origin is already allowed."},
+                                        "allowedOrigins":{"type":"array","items":{"type":"string","format":"uri"},"description":"Optional restriction to trusted OAuth origins. Absent or empty enables automatic public discovery. The MCP endpoint origin is always allowed."},
                                         "clientId":{"type":["string","null"]},
                                         "scopes":{"type":"array","items":{"type":"string"}},
                                         "callbackPort":{"type":"integer","minimum":0,"maximum":65535}
@@ -1129,7 +1128,7 @@ async fn main() -> Result<()> {
     let background = local.clone();
     let task = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(background.config.refresh_seconds)).await;
+            tokio::time::sleep(Duration::from_secs(background.config.refresh_minutes * 60)).await;
             background.refresh_in_background().await;
         }
     });
@@ -1247,7 +1246,7 @@ mod integration_tests {
     async fn tokens_are_isolated_and_endpoint_changes_drop_sessions() {
         let (a, secure, ta) = mock().await;
         let (b, public, tb) = mock().await;
-        let mut config:config::Config=toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[tool.secure]\nexpected_endpoint='{a}'\n[tool.secure.headers]\napi_token={{env='PATH'}}")).unwrap();
+        let mut config:config::Config=toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[tool.secure]\nexpected_endpoint='{a}'\n[tool.secure.headers]\napi_token={{env='PATH'}}")).unwrap();
         config.validate().unwrap();
         let local = local(config);
         let definition = |id: &str, url: &str, auth: Value| {
@@ -1307,7 +1306,7 @@ mod integration_tests {
     #[tokio::test]
     async fn oauth_plus_multiple_headers_are_sent_only_to_the_approved_mcp() {
         let (url, upstream, server) = mock().await;
-        let mut config: config::Config = toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[tool.combined]\nexpected_endpoint='{url}'\n[tool.combined.headers]\napi_key={{env='PATH'}}\ntenant='Bearer complete-tenant-value'")).unwrap();
+        let mut config: config::Config = toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[tool.combined]\nexpected_endpoint='{url}'\n[tool.combined.headers]\napi_key={{env='PATH'}}\ntenant='Bearer complete-tenant-value'")).unwrap();
         config.validate().unwrap();
         let local = local(config);
         let mut definition: Server = serde_json::from_value(json!({"id":"combined","endpoint":url,"oauth":{},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-Tenant","credential":"tenant"},{"name":"X-App","value":"temba"}]})).unwrap();
@@ -1350,7 +1349,7 @@ mod integration_tests {
     async fn missing_optional_headers_are_omitted_and_mandatory_headers_block_before_network() {
         let (url, upstream, server) = mock().await;
         let config: config::Config =
-            toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[tool.mandatory]\nexpected_endpoint='{url}'\n[tool.mandatory.headers]\nprovided='private-supplied-header'")).unwrap();
+            toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[tool.mandatory]\nexpected_endpoint='{url}'\n[tool.mandatory.headers]\nprovided='private-supplied-header'")).unwrap();
         let local = local(config);
         let mut definition: Server = serde_json::from_value(json!({
             "id":"optional","endpoint":url,"headers":[
@@ -1429,7 +1428,7 @@ mod integration_tests {
         let (a, upstream_a, task_a) = mock().await;
         let (b, upstream_b, task_b) = mock().await;
         let mut config: config::Config = toml::from_str(
-            "catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[local_catalog]\nenabled=true\nidle_timeout_seconds=60\nmax_servers=2"
+            "catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[local_catalog]\nenabled=true\nidle_timeout_seconds=60\nmax_servers=2"
         ).unwrap();
         config.validate().unwrap();
         let local = local(config);
@@ -1669,7 +1668,7 @@ mod integration_tests {
         );
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let config =
-            toml::from_str(&format!("catalog_url='{base}'\nallow_loopback_http=true")).unwrap();
+            toml::from_str(&format!("catalog_url='{base}'\nallow_insecure_http=true")).unwrap();
         let local = local(config);
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
@@ -1705,7 +1704,7 @@ mod integration_tests {
             );
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let config =
-            toml::from_str(&format!("catalog_url='{base}'\nallow_loopback_http=true")).unwrap();
+            toml::from_str(&format!("catalog_url='{base}'\nallow_insecure_http=true")).unwrap();
         let local = local(config);
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
@@ -1732,7 +1731,7 @@ mod integration_tests {
     #[tokio::test]
     async fn cleared_session_is_detected_on_tool_search_before_the_next_timer_tick() {
         let config =
-            toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true").unwrap();
+            toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true").unwrap();
         let local = local(config);
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
@@ -1899,7 +1898,7 @@ mod integration_tests {
             })).with_state(state);
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         for authenticated_catalog in [false, true] {
-            let config = toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_loopback_http=true\n[local_catalog]\nenabled=true").unwrap();
+            let config = toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[local_catalog]\nenabled=true").unwrap();
             let local = local(config);
             if authenticated_catalog {
                 *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
@@ -1916,7 +1915,7 @@ mod integration_tests {
                 "public"
             };
             let definition =
-                serde_json::from_value(json!({"id":"jira-temp","endpoint":endpoint,"oauth":{}}))
+                serde_json::from_value(json!({"id":"jira-temp","endpoint":endpoint,"oauth":{"allowedOrigins":["https://unrelated.example"]}}))
                     .unwrap();
             let registered = local
                 .add_personal(definition, BTreeMap::new())
@@ -2005,7 +2004,7 @@ mod integration_tests {
             ),
         ] {
             let mut config: config::Config = toml::from_str(&format!(
-                "catalog_url='{base}'\nallow_loopback_http=true\nlabels={labels}"
+                "catalog_url='{base}'\nallow_insecure_http=true\nlabels={labels}"
             ))
             .unwrap();
             config.validate().unwrap();
@@ -2047,7 +2046,7 @@ mod integration_tests {
         );
         let tc = tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
         let mut config: config::Config = toml::from_str(&format!(
-            "catalog_url='{base}'\nallow_loopback_http=true\nlabels=['allowed']"
+            "catalog_url='{base}'\nallow_insecure_http=true\nlabels=['allowed']"
         ))
         .unwrap();
         config.validate().unwrap();

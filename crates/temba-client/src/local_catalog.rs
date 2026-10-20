@@ -40,7 +40,7 @@ impl Local {
             return Err(RegistrationError("Local catalog is disabled.").into());
         }
         definition
-            .validate(self.config.allow_loopback_http)
+            .validate(self.config.allow_insecure_http)
             .map_err(|_| {
                 RegistrationError(
                     "Invalid local MCP definition; check endpoint, OAuth and header declarations.",
@@ -108,7 +108,7 @@ impl Local {
             "status":status,
             "connect_tool_id":format!("{id}.__temba_connect__"),
             "idle_timeout_seconds":self.config.local_catalog.idle_timeout_seconds,
-            "hint":"Keep local_id in this conversation. Pass local_ids:[local_id] to tool_search to discover its tools, then use their returned tool_id with call_tool. Local entries are not listed without their ID. For auth_required, use connect_tool_id to start this MCP's OAuth flow. For connecting, search again; do not report ready until confirmed. Catalog authentication is not required for this local registration. A provider on another origin must be declared in definition.oauth.allowedOrigins; if omitted, disconnect and register a corrected definition. Nothing is saved to the central catalog or a local file."
+            "hint":"Keep local_id in this conversation. Pass local_ids:[local_id] to tool_search to discover its tools, then use their returned tool_id with call_tool. Local entries are not listed without their ID. For auth_required, use connect_tool_id to start this MCP's OAuth flow. For connecting, search again; do not report ready until confirmed. Catalog authentication is not required for this local registration. OAuth providers are discovered automatically over public destinations unless definition.oauth.allowedOrigins contains an explicit restriction. Nothing is saved to the central catalog or a local file."
         }))
     }
 

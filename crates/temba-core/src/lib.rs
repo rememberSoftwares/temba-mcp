@@ -34,8 +34,31 @@ pub struct Access {
     pub public: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub authenticated: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_group_paths",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub groups_any_of: Vec<String>,
+}
+// Normalize catalog rules only; verified token claims must retain their full paths.
+fn deserialize_group_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|group| {
+            if group.is_empty() || group.trim() != group || group.contains(['\r', '\n']) {
+                return Err(serde::de::Error::custom("Access groups must be nonempty paths without surrounding whitespace or line breaks"));
+            }
+            Ok(if group.starts_with('/') {
+                group
+            } else {
+                format!("/{group}")
+            })
+        })
+        .collect()
 }
 fn is_false(value: &bool) -> bool {
     !value
@@ -150,7 +173,7 @@ impl Server {
         }
         if let Some(oauth) = &self.oauth {
             for origin in &oauth.allowed_origins {
-                endpoint(origin, false)?;
+                endpoint(origin, allow_http)?;
             }
         }
         ensure!(self.headers.len() <= 32, "Too many headers");
@@ -198,7 +221,7 @@ impl Server {
         Ok(())
     }
 }
-pub fn endpoint(value: &str, allow_loopback_http: bool) -> Result<Url> {
+pub fn endpoint(value: &str, allow_insecure_http: bool) -> Result<Url> {
     let u = Url::parse(value)?;
     ensure!(
         u.host_str().is_some()
@@ -207,10 +230,9 @@ pub fn endpoint(value: &str, allow_loopback_http: bool) -> Result<Url> {
             && u.fragment().is_none(),
         "URL must have a host and no credentials or fragment"
     );
-    let local = matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     ensure!(
-        u.scheme() == "https" || (allow_loopback_http && local && u.scheme() == "http"),
-        "HTTPS required; HTTP development is loopback only"
+        u.scheme() == "https" || (allow_insecure_http && u.scheme() == "http"),
+        "HTTPS required unless insecure HTTP is explicitly enabled"
     );
     for (key, _) in u.query_pairs() {
         if [
@@ -287,7 +309,6 @@ mod tests {
             r#"{"groupsAnyOf":[]}"#,
             r#"{"public":true,"groupsAnyOf":["/X"]}"#,
             r#"{"public":true,"authenticated":true}"#,
-            r#"{"groupsAnyOf":["X"]}"#,
         ] {
             let rule: Access = serde_json::from_str(invalid).unwrap();
             assert!(rule.validate().is_err(), "accepted {invalid}");
@@ -299,6 +320,61 @@ mod tests {
         assert!(rule.allows(Some(&["/X".into()])));
         assert!(rule.allows(Some(&["/Y".into()])));
         assert!(!rule.allows(Some(&["/X/subgroup".into(), "/x".into()])));
+    }
+    #[test]
+    fn group_shorthand_is_canonical_and_preserves_hierarchy_and_case() {
+        let short: Access =
+            serde_json::from_str(r#"{"groupsAnyOf":["dev","equipes/dev"]}"#).unwrap();
+        let full: Access =
+            serde_json::from_str(r#"{"groupsAnyOf":["/dev","/equipes/dev"]}"#).unwrap();
+        short.validate().unwrap();
+        assert_eq!(short, full);
+        assert_eq!(
+            serde_json::to_value(&short).unwrap(),
+            serde_json::json!({"groupsAnyOf":["/dev","/equipes/dev"]})
+        );
+        assert!(short.allows(Some(&["/dev".into()])));
+        assert!(short.allows(Some(&["/equipes/dev".into()])));
+        assert!(!short.allows(Some(&[
+            "dev".into(),
+            "/Dev".into(),
+            "/other/dev".into(),
+            "/dev/child".into()
+        ])));
+        let nested: Access = serde_json::from_str(r#"{"groupsAnyOf":["equipes/dev"]}"#).unwrap();
+        assert!(!nested.allows(Some(&["/dev".into()])));
+        for invalid in [
+            "",
+            " ",
+            " dev",
+            "dev ",
+            " /dev",
+            "dev\n",
+            "de\rv",
+            "/",
+            &"x".repeat(1024),
+        ] {
+            let parsed =
+                serde_json::from_value::<Access>(serde_json::json!({"groupsAnyOf":[invalid]}));
+            assert!(
+                parsed.is_err() || parsed.unwrap().validate().is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+    #[test]
+    fn equivalent_group_syntax_produces_the_same_catalog_revision() {
+        let mut short: Catalog = serde_json::from_value(serde_json::json!({"servers":[{
+            "id":"service", "endpoint":"https://example.com/mcp", "access":{"groupsAnyOf":["dev"]}
+        }]}))
+        .unwrap();
+        let mut full: Catalog = serde_json::from_value(serde_json::json!({"servers":[{
+            "id":"service", "endpoint":"https://example.com/mcp", "access":{"groupsAnyOf":["/dev"]}
+        }]}))
+        .unwrap();
+        short.validate(false).unwrap();
+        full.validate(false).unwrap();
+        assert_eq!(short.revision, full.revision);
     }
     #[test]
     fn catalog_rejects_secrets_and_duplicates() {
@@ -374,12 +450,26 @@ mod tests {
     fn credentials_and_insecure_destinations_rejected() {
         for u in [
             "https://user:pass@host/mcp",
-            "http://host/mcp",
             "https://host/mcp?access_token=abc",
         ] {
             assert!(endpoint(u, true).is_err());
         }
-        assert!(endpoint("http://127.0.0.1:8080/mcp", true).is_ok());
+        for url in [
+            "http://127.0.0.1:8080/mcp",
+            "http://192.168.1.20:30080/mcp",
+            "http://mcp.internal/mcp",
+        ] {
+            assert!(endpoint(url, true).is_ok());
+            assert!(endpoint(url, false).is_err());
+        }
+        assert!(endpoint("ftp://host/mcp", true).is_err());
+        let mut server: Server = serde_json::from_value(serde_json::json!({
+            "id":"service", "endpoint":"https://mcp.example/mcp",
+            "oauth":{"allowedOrigins":["http://identity.internal"]}
+        }))
+        .unwrap();
+        assert!(server.validate(false).is_err());
+        server.validate(true).unwrap();
         assert!(endpoint("https://host/mcp?tools=all", false).is_ok());
         assert!(https_override("https://other.test/token", "https://issuer.test/realm").is_err());
     }

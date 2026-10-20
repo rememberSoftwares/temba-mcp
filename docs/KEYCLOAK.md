@@ -56,10 +56,10 @@ In each MCP server definition, choose **only one** rule:
 |---|---|
 | `access: {public: true}` | Everyone, without a catalog connection |
 | `access: {authenticated: true}` | All users connected to the catalog |
-| `access: {groupsAnyOf: ["/team-a"]}` | Members of this group |
-| `access: {groupsAnyOf: ["/team-a", "/team-b"]}` | Members of either team |
+| `access: {groupsAnyOf: ["team-a"]}` | Members of this group |
+| `access: {groupsAnyOf: ["team-a", "team-b"]}` | Members of either team |
 
-Without `access`, the MCP server is public. Paths must match exactly, including case. The group `/team-a/child` does not automatically match `/team-a`.
+Without `access`, the MCP server is public. The initial `/` is optional in catalog rules: `team-a` and `/team-a` are equivalent; `teams/team-a` means `/teams/team-a`. Paths and case must otherwise match exactly: `team-a/child` does not match `team-a`. Keep **Full group path: On** in the Keycloak mapper so nested groups remain distinct.
 
 The MCP server's own authentication (`oauth` block and/or `headers` list) remains independent of these rules. Disabling `catalogueAuth.enabled` makes protected entries invisible to everyone.
 

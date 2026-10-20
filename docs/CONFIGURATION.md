@@ -1,14 +1,15 @@
 # Catalog options
 
-## HTTP on the development machine
+## Allowing HTTP in development
 
-HTTPS is required by default. `allowLoopbackHttp` allows an exception for a local address:
+HTTPS is required by default. `security.allowInsecureHttp` permits HTTP in declared
+MCP endpoints and OAuth origins, whether local or remote:
 
-| MCP server URL | With `security.allowLoopbackHttp: true` |
+| MCP server URL | With `security.allowInsecureHttp: true` |
 |---|---|
 | `http://localhost:9000/mcp` | Accepted |
 | `http://127.0.0.1:9000/mcp` | Accepted |
-| `http://mcp.entreprise/mcp` | Rejected |
+| `http://mcp.entreprise/mcp` | Accepted |
 | `https://mcp.entreprise/mcp` | Accepted even without the option |
 
 The MCP server address is used by the **client on the user's machine**. A localhost address therefore refers to an MCP server on that machine, not a service in Kubernetes.
@@ -17,10 +18,19 @@ This option configures neither the Ingress nor Keycloak certificates. To reach *
 
 ```toml
 catalog_url = "http://127.0.0.1:18080"
-allow_loopback_http = true
+allow_insecure_http = true
 ```
 
-The chart's `security.allowLoopbackHttp` can remain `false` if all remote MCP servers use HTTPS.
+The chart flag controls which definitions the server accepts. The TOML flag controls
+which destinations the local client accepts. Enable both if MCP definitions use HTTP;
+only the TOML flag is needed for an HTTP catalog with HTTPS MCP definitions.
+Neither flag configures TLS termination on the Ingress or disables HTTPS certificate checks.
+OAuth destination approval (`oauth.allowedOrigins`) is independent: private destinations
+announced automatically remain blocked even when HTTP is enabled.
+
+When upgrading, replace `security.allowLoopbackHttp` with `security.allowInsecureHttp`
+in Helm overrides, and `allow_localhost_http` or `allow_loopback_http` with
+`allow_insecure_http` in TOML. The new flags also permit remote HTTP.
 
 ## Kubernetes networking
 

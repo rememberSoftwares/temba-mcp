@@ -1,6 +1,6 @@
 catalog_url = "http://127.0.0.1:18080"
-allow_loopback_http = true
-refresh_seconds = 60
+allow_insecure_http = true
+refresh_minutes = 60
 search_limit = 5
 # Opt into labelled MCPs; [] includes only MCPs without labels.
 labels = []

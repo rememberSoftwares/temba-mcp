@@ -15,7 +15,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use temba_core::endpoint;
 use tokio::{
     net::TcpListener,
     sync::{Mutex, oneshot},
@@ -52,23 +51,9 @@ impl std::fmt::Display for OriginNotAllowed {
     }
 }
 impl std::error::Error for OriginNotAllowed {}
+#[cfg(test)]
 fn trusted(value: &str, origins: &[String], allow_http: bool) -> Result<Url> {
-    let u = endpoint(value, allow_http)?;
-    if !origins
-        .iter()
-        .any(|v| endpoint(v, allow_http).is_ok_and(|o| o.origin() == u.origin()))
-    {
-        return Err(OriginNotAllowed(u.origin().ascii_serialization()).into());
-    }
-    Ok(u)
-}
-pub async fn metadata(
-    http: &reqwest::Client,
-    issuer: &str,
-    origins: &[String],
-    allow_http: bool,
-) -> Result<Provider> {
-    metadata_override(http, issuer, origins, allow_http, None).await
+    super::oauth_network::Policy::restricted(origins, allow_http).url(value)
 }
 pub async fn metadata_override(
     http: &reqwest::Client,
@@ -77,7 +62,16 @@ pub async fn metadata_override(
     allow_http: bool,
     token_override: Option<&str>,
 ) -> Result<Provider> {
-    let u = trusted(issuer, origins, allow_http)?;
+    let policy = super::oauth_network::Policy::restricted(origins, allow_http);
+    metadata_with_policy(http, issuer, &policy, token_override).await
+}
+async fn metadata_with_policy(
+    http: &reqwest::Client,
+    issuer: &str,
+    policy: &super::oauth_network::Policy,
+    token_override: Option<&str>,
+) -> Result<Provider> {
+    let u = policy.validate(issuer).await?;
     let path = u.path().trim_end_matches('/');
     let candidates = [
         format!(
@@ -120,18 +114,24 @@ pub async fn metadata_override(
                 m[name].as_str()
             }
             .ok_or_else(|| anyhow::anyhow!("Missing OAuth metadata"))?;
-            trusted(s, origins, allow_http)?;
+            policy.url(s)?;
             Ok(s.to_owned())
+        };
+        let authorize = field("authorization_endpoint")?;
+        let token = field("token_endpoint")?;
+        policy.validate(&authorize).await?;
+        policy.validate(&token).await?;
+        let registration = match m["registration_endpoint"].as_str() {
+            Some(uri) if policy.validate(uri).await.is_ok() => Some(uri.to_owned()),
+            _ => None,
         };
         return Ok(Provider {
             issuer: issuer.to_owned(),
-            authorize: field("authorization_endpoint")?,
-            token: field("token_endpoint")?,
+            authorize,
+            token,
             // An unusable DCR endpoint must not break a pre-registered client.
-            // Never retain or call a registration URL outside the approved origins.
-            registration: m["registration_endpoint"]
-                .as_str()
-                .and_then(|s| trusted(s, origins, allow_http).ok().map(|_| s.to_owned())),
+            // Never retain or call a registration URL rejected by the selected policy.
+            registration,
             require_iss: m["authorization_response_iss_parameter_supported"]
                 .as_bool()
                 .unwrap_or(false),
@@ -142,14 +142,44 @@ pub async fn metadata_override(
     }
     bail!("OAuth metadata unavailable")
 }
-pub async fn discover(
+#[cfg(test)]
+async fn discover(
     http: &reqwest::Client,
     resource: &str,
     origins: &[String],
     allow_http: bool,
     headers: reqwest::header::HeaderMap,
 ) -> Result<Provider> {
-    let u = endpoint(resource, allow_http)?;
+    let policy = super::oauth_network::Policy::restricted(origins, allow_http);
+    discover_with_policy(http, resource, &policy, headers).await
+}
+
+pub async fn discover_remote(
+    http: &reqwest::Client,
+    resource: &str,
+    allowed_origins: &[String],
+    allow_http: bool,
+    headers: reqwest::header::HeaderMap,
+) -> Result<(Provider, reqwest::Client)> {
+    let policy = if allowed_origins.is_empty() {
+        super::oauth_network::Policy::automatic(resource, allow_http)?
+    } else {
+        let mut origins = allowed_origins.to_vec();
+        origins.push(resource.to_owned());
+        super::oauth_network::Policy::restricted(&origins, allow_http)
+    };
+    let oauth_http = policy.client(http)?;
+    let provider = discover_with_policy(&oauth_http, resource, &policy, headers).await?;
+    Ok((provider, oauth_http))
+}
+
+async fn discover_with_policy(
+    http: &reqwest::Client,
+    resource: &str,
+    policy: &super::oauth_network::Policy,
+    headers: reqwest::header::HeaderMap,
+) -> Result<Provider> {
+    let u = policy.url(resource)?;
     // No OAuth bearer yet. Extra headers are bound to this exact MCP resource only.
     let r = http
         .get(resource)
@@ -173,7 +203,7 @@ pub async fn discover(
             u.path()
         )
     });
-    trusted(&uri, origins, allow_http)?;
+    policy.validate(&uri).await?;
     let r = http
         .get(&uri)
         .timeout(Duration::from_secs(15))
@@ -184,7 +214,7 @@ pub async fn discover(
         let declared = m["resource"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing OAuth resource identifier"))?;
-        let d = endpoint(declared, allow_http)?;
+        let d = policy.url(declared)?;
         ensure!(
             d.origin() == u.origin() && d.path() == u.path(),
             "OAuth metadata describes another resource"
@@ -194,9 +224,9 @@ pub async fn discover(
             .and_then(|a| a.first())
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Missing authorization server"))?;
-        return metadata(http, issuer, origins, allow_http).await;
+        return metadata_with_policy(http, issuer, policy, None).await;
     }
-    metadata(http, &u.origin().ascii_serialization(), origins, allow_http).await
+    metadata_with_policy(http, &u.origin().ascii_serialization(), policy, None).await
 }
 struct Tokens {
     access: Zeroizing<String>,
@@ -785,6 +815,59 @@ mod flow_tests {
         rt.abort();
     }
     #[tokio::test]
+    async fn automatic_discovery_keeps_resource_origin_and_blocks_private_provider_endpoints() {
+        for token_destination in [
+            None,
+            Some("https://10.0.0.1/token"),
+            Some("https://localhost/token"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let resource = format!("{base}/mcp");
+            let resource_metadata = json!({"resource":resource,"authorization_servers":[base]});
+            let metadata = json!({
+                "issuer":base,"authorization_endpoint":format!("{base}/authorize"),
+                "token_endpoint":token_destination.map(str::to_owned).unwrap_or_else(|| format!("{base}/token")),
+                "registration_endpoint":format!("{base}/register"),
+                "code_challenge_methods_supported":["S256"]
+            });
+            let router = Router::new()
+                .route("/mcp", get(|| async { StatusCode::UNAUTHORIZED }))
+                .route(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    get(move || {
+                        let m = resource_metadata.clone();
+                        async move { Json(m) }
+                    }),
+                )
+                .route(
+                    "/.well-known/oauth-authorization-server",
+                    get(move || {
+                        let m = metadata.clone();
+                        async move { Json(m) }
+                    }),
+                );
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let result = discover_remote(
+                &reqwest::Client::new(),
+                &resource,
+                &[],
+                true,
+                Default::default(),
+            )
+            .await;
+            if token_destination.is_none() {
+                let (provider, _) = result.unwrap();
+                assert_eq!(provider.issuer, base);
+                assert_eq!(provider.token, format!("{base}/token"));
+            } else {
+                assert!(result.is_err());
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn endpoint_override_precedes_discovery_validation() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -799,7 +882,11 @@ mod flow_tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let origins = vec![base.clone()];
-        assert!(super::metadata(&http, &base, &origins, true).await.is_err());
+        assert!(
+            metadata_override(&http, &base, &origins, true, None)
+                .await
+                .is_err()
+        );
         let override_uri = format!("{base}/token");
         let p = metadata_override(&http, &base, &origins, true, Some(&override_uri))
             .await

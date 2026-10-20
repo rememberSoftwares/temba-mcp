@@ -9,11 +9,11 @@ pub struct Config {
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default = "refresh")]
-    pub refresh_seconds: u64,
+    pub refresh_minutes: u64,
     #[serde(default = "limit")]
     pub search_limit: usize,
     #[serde(default)]
-    pub allow_loopback_http: bool,
+    pub allow_insecure_http: bool,
     #[serde(default)]
     pub tool: BTreeMap<String, ToolConfig>,
     #[serde(default)]
@@ -73,11 +73,15 @@ fn limit() -> usize {
 }
 impl Config {
     pub fn validate(&mut self) -> Result<()> {
-        let u = temba_core::endpoint(&self.catalog_url, self.allow_loopback_http)?;
+        let u = temba_core::endpoint(&self.catalog_url, self.allow_insecure_http)?;
         ensure!(u.query().is_none(), "Catalog URL cannot have a query");
         ensure!(
-            (10..=3600).contains(&self.refresh_seconds) && (1..=50).contains(&self.search_limit),
-            "Invalid refresh/search limits"
+            (1..=1440).contains(&self.refresh_minutes),
+            "refresh_minutes must be between 1 and 1440 minutes"
+        );
+        ensure!(
+            (1..=50).contains(&self.search_limit),
+            "search_limit must be between 1 and 50"
         );
         self.catalog_url = self.catalog_url.trim_end_matches('/').to_owned();
         self.labels = self
@@ -91,7 +95,7 @@ impl Config {
             "Invalid local catalog limits"
         );
         for tool in self.tool.values() {
-            temba_core::endpoint(&tool.expected_endpoint, self.allow_loopback_http)?;
+            temba_core::endpoint(&tool.expected_endpoint, self.allow_insecure_http)?;
             ensure!(tool.headers.len() <= 32, "Too many local header mappings");
             for header in tool.headers.values() {
                 match header {
@@ -113,6 +117,39 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refresh_defaults_to_one_hour_and_accepts_one_minute_to_one_day() {
+        let mut config: Config =
+            toml::from_str("catalog_url='https://catalog.example.com'").unwrap();
+        assert_eq!(config.refresh_minutes, 60);
+        assert!(!config.allow_insecure_http);
+        for minutes in [1, 60, 1440] {
+            config.refresh_minutes = minutes;
+            config.validate().unwrap();
+        }
+        for minutes in [0, 1441, u64::MAX] {
+            config.refresh_minutes = minutes;
+            assert!(config.validate().is_err());
+        }
+    }
+    #[test]
+    fn insecure_http_is_opt_in_for_local_and_remote_destinations() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "[::1]",
+            "192.168.1.10",
+            "example.com",
+        ] {
+            let mut config: Config = toml::from_str(&format!(
+                "catalog_url='http://{host}:18080'\nallow_insecure_http=true"
+            ))
+            .unwrap();
+            config.validate().unwrap();
+            config.allow_insecure_http = false;
+            assert!(config.validate().is_err());
+        }
+    }
     #[test]
     fn strings_are_literal_and_environment_references_are_explicit() {
         let mut config: Config = toml::from_str(

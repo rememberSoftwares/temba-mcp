@@ -256,9 +256,9 @@ mod api_tests {
         let mut catalog: Catalog = serde_json::from_value(json!({"schemaVersion":2,"servers":[
             {"id":"everyone","endpoint":"https://example.com/public","access":{"public":true},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-App","value":"temba"}]},
             {"id":"signed-in","endpoint":"https://example.com/auth","access":{"authenticated":true}},
-            {"id":"only-x","endpoint":"https://example.com/x","access":{"groupsAnyOf":["/X"]}},
+            {"id":"only-x","endpoint":"https://example.com/x","access":{"groupsAnyOf":["X"]}},
             {"id":"only-y","endpoint":"https://example.com/y","access":{"groupsAnyOf":["/Y"]}},
-            {"id":"x-or-y","endpoint":"https://example.com/xy","access":{"groupsAnyOf":["/X","/Y"]}}
+            {"id":"x-or-y","endpoint":"https://example.com/xy","access":{"groupsAnyOf":["X","/Y"]}}
         ]}))
         .unwrap();
         catalog.validate(false).unwrap();
@@ -291,7 +291,10 @@ mod api_tests {
                 Some(vec!["/X", "/Y"]),
                 vec!["everyone", "signed-in", "only-x", "only-y", "x-or-y"],
             ),
-            (Some(vec!["/X/subgroup"]), vec!["everyone", "signed-in"]),
+            (
+                Some(vec!["/X/subgroup", "/other/X", "X", "/x"]),
+                vec!["everyone", "signed-in"],
+            ),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert("x-groups", HeaderValue::from_static("/X,/Y"));
@@ -311,6 +314,16 @@ mod api_tests {
             let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
                 .unwrap();
+            let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            for server in raw["servers"].as_array().unwrap() {
+                if let Some(groups) = server["access"]["groupsAnyOf"].as_array() {
+                    assert!(
+                        groups
+                            .iter()
+                            .all(|group| group.as_str().unwrap().starts_with('/'))
+                    );
+                }
+            }
             let parsed: Catalog = serde_json::from_slice(&bytes).unwrap();
             let declarations = &parsed
                 .servers

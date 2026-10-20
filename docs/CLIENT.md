@@ -9,7 +9,7 @@ It is read when the process starts.
 ```toml
 catalog_url = "https://catalogue.example.com"
 labels = []
-refresh_seconds = 60
+refresh_minutes = 60
 search_limit = 5
 ```
 
@@ -17,15 +17,21 @@ search_limit = 5
 | --- | --- | --- |
 | `catalog_url` | REST catalog URL, without an `/mcp` or `/v1/catalog` suffix | Required |
 | `labels` | Labels of the MCP servers you choose to include | `[]`: MCP servers without labels |
-| `refresh_seconds` | Central catalog refresh interval, between 10 and 3,600 seconds | `60` |
+| `refresh_minutes` | Central catalog refresh interval, between 1 and 1,440 minutes (24 hours) | `60` |
 | `search_limit` | Maximum number of tools returned per search, between 1 and 50 | `5` |
-| `allow_loopback_http` | Allows HTTP for loopback addresses during development | `false` |
+| `allow_insecure_http` | Allows unencrypted HTTP for local and remote destinations; HTTPS certificate checks remain enabled | `false` |
+
+If upgrading an existing TOML, replace `allow_loopback_http` or `allow_localhost_http`
+with `allow_insecure_http`. This now permits remote HTTP too. OAuth destination
+approval remains separate: it does not authorize automatically discovered private destinations.
+Replace `refresh_seconds` with `refresh_minutes`, dividing the old value by 60.
+For example, `refresh_seconds = 3600` becomes `refresh_minutes = 60`.
 
 For a catalog accessed through port forwarding:
 
 ```toml
 catalog_url = "http://127.0.0.1:18080"
-allow_loopback_http = true
+allow_insecure_http = true
 ```
 
 Remote MCP servers must be reachable **from the user's machine**.
@@ -225,19 +231,18 @@ Declare external providers' HTTPS origins in **the local definition**:
   "definition": {
     "id": "temporary-service",
     "endpoint": "https://mcp.example.com/mcp",
-    "oauth": {
-      "allowedOrigins": ["https://identity.example.com"]
-    }
+    "oauth": {}
   }
 }
 ```
 
-The MCP server's origin is already allowed. `allowedOrigins` allows additional OAuth
-destinations; this field does not enable Temba catalog authentication.
-It prevents an MCP server from choosing an undeclared provider.
+An absent or empty `oauth.allowedOrigins` enables automatic discovery of public
+OAuth destinations. HTTPS is required unless `allow_insecure_http = true`. A nonempty list restricts discovery to those origins and the
+configured MCP origin. Private destinations require explicit approval.
+This setting is independent of Temba catalog authentication.
 
-If an origin was omitted, disconnect the registration and run `add_mcp` again with
-the corrected definition. No change to the central catalog is needed.
+To change an explicit restriction, disconnect the registration and run `add_mcp`
+again with the corrected definition. No change to the central catalog is needed.
 
 ### Lifetime and scope
 
