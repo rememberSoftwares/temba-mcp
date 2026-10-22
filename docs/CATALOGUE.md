@@ -254,6 +254,10 @@ The volume contains neither OAuth tokens nor users' private headers.
 | `POST /v1/admin/servers` | Persistent addition if writes are enabled |
 | `DELETE /v1/admin/servers/{id}` | Persistent deletion of an API addition |
 
+Users can inspect these definitions with `temba-client catalog` or `temba-client catalog --json`;
+the command handles catalog login and lists all authorized entries before local label filtering.
+See [the client guide](CLIENT.md#inspecting-the-catalog).
+
 `GET /v1/catalog` exposes `headers` declarations, including `mandatory`,
 `credential`, or `value`, to authorized clients. The local client uses them to determine
 configuration requirements without unnecessarily exposing these declarations to the LLM.

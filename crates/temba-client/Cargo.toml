@@ -1,6 +1,6 @@
 [package]
 name = "temba-client"
-version = "1.4.9"
+version = "1.4.12"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -29,3 +29,6 @@ http = "1"
 sse-stream = "0.2.4"
 
 getrandom = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

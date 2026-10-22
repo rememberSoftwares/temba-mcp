@@ -1,3 +1,4 @@
+mod catalog;
 mod config;
 mod local_catalog;
 mod oauth;
@@ -5,7 +6,7 @@ mod oauth_network;
 mod search;
 mod transport;
 use anyhow::{Result, ensure};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rmcp::{
     ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt,
     model::*,
@@ -52,11 +53,27 @@ where
 #[derive(Parser)]
 #[command(
     version,
-    about = "Local stdio MCP; upstream credentials stay in this process"
+    about = "Local MCP client and catalog CLI; OAuth credentials stay in memory"
 )]
 struct Args {
-    #[arg(long, env = "TEMBA_CONFIG", default_value = "temba.toml")]
+    #[arg(
+        long,
+        env = "TEMBA_CONFIG",
+        default_value = "temba.toml",
+        global = true
+    )]
     config: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+#[derive(Subcommand)]
+enum Command {
+    /// List all MCP definitions visible to your user, before local label filtering.
+    Catalog {
+        /// Print the complete catalog as JSON instead of terminal text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 struct Entry {
     retired: AtomicBool,
@@ -166,23 +183,7 @@ impl Entry {
 }
 impl Local {
     async fn bootstrap(&self) -> Result<()> {
-        let r = self
-            .http
-            .get(format!("{}/v1/bootstrap", self.config.catalog_url))
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await?
-            .error_for_status()?;
-        let r: Value = temba_core::http_json(r).await?;
-        ensure!(r["schemaVersion"] == 2, "Unsupported bootstrap version");
-        let auth: Option<oauth::CatalogAuth> = serde_json::from_value(r["catalogueAuth"].clone())?;
-        if let Some(a) = &auth {
-            temba_core::endpoint(&a.issuer, false)?;
-            ensure!(!a.client_id.is_empty(), "Catalog OAuth clientId required");
-            if !a.token_endpoint.is_empty() {
-                temba_core::https_override(&a.token_endpoint, &a.issuer)?;
-            }
-        }
+        let auth = catalog::bootstrap(&self.http, &self.config.catalog_url).await?;
         let mut status = self.catalog_status.write().await;
         if auth.is_none() {
             *status = "public";
@@ -671,23 +672,7 @@ impl Local {
             .await
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Catalog authentication is disabled"))?;
-        let provider = oauth::metadata_override(
-            &self.http,
-            &auth.issuer,
-            std::slice::from_ref(&auth.issuer),
-            false,
-            (!auth.token_endpoint.is_empty()).then_some(auth.token_endpoint.as_str()),
-        )
-        .await?;
-        let pending = oauth::Pending::new(
-            self.http.clone(),
-            provider,
-            Some(auth.client_id),
-            vec!["openid".into()],
-            None,
-            auth.callback_port,
-        )
-        .await?;
+        let pending = auth.pending(&self.http).await?;
         let url = pending.url.clone();
         let local = self.clone();
         *task = Some(tokio::spawn(async move {
@@ -820,7 +805,7 @@ impl Local {
                     _ => "Catalog login is managed automatically by the client; no technical choice is required from the user."
                 }
             },
-            "hint":"Only listed servers are currently visible. A missing MCP may be unavailable or filtered by catalog permissions or local labels; do not infer the reason or invent its tool_id. Catalog login is separate from remote MCP login. Local registrations require their secret local_ids; unknown or expired IDs expose no tools and must be registered again."
+            "hint":"Only listed servers are currently visible. A missing MCP may be unavailable or filtered by catalog permissions or local labels; do not infer the reason or invent its tool_id. Catalog login is separate from remote MCP login. Local registrations require their secret local_ids; unknown or disconnected IDs expose no tools and must be registered again."
         })
     }
     async fn call(
@@ -862,7 +847,7 @@ impl Local {
         let e = if server.starts_with("__local_") {
             self.personal_entry(server)
                 .await
-                .ok_or_else(|| anyhow::anyhow!("Unknown, expired or unavailable server"))?
+                .ok_or_else(|| anyhow::anyhow!("Unknown or unavailable server"))?
         } else {
             self.ensure_catalog_login().await;
             match self.servers.read().await.get(server).cloned() {
@@ -870,7 +855,7 @@ impl Local {
                 None if *self.catalog_status.read().await == "auth_in_progress" => {
                     return Ok(result(catalog_login_response(None)));
                 }
-                None => return Err(anyhow::anyhow!("Unknown, expired or unavailable server")),
+                None => return Err(anyhow::anyhow!("Unknown or unavailable server")),
             }
         };
         if name == "__temba_connect__" {
@@ -1111,6 +1096,9 @@ async fn main() -> Result<()> {
     })?;
     drop(source);
     config.validate()?;
+    if let Some(Command::Catalog { json }) = args.command {
+        return catalog::run(&config, json).await;
+    }
     let local = Arc::new(Local {
         config,
         http: http()?,
@@ -1132,25 +1120,11 @@ async fn main() -> Result<()> {
             background.refresh_in_background().await;
         }
     });
-    let sweep = if local.config.local_catalog.enabled {
-        let owner = local.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                owner.expire_personal().await;
-            }
-        }))
-    } else {
-        None
-    };
     let service = Handler(local.clone())
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;
     task.abort();
-    if let Some(sweep) = sweep {
-        sweep.abort();
-    }
     if let Some(t) = local.catalog_login.lock().await.take() {
         t.abort();
     }
@@ -1169,6 +1143,42 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    #[test]
+    fn catalog_cli_is_optional_and_config_works_before_or_after_subcommand() {
+        let args = Args::try_parse_from(["temba-client", "--config", "custom.toml"]).unwrap();
+        assert_eq!(args.config, "custom.toml");
+        assert!(args.command.is_none());
+        for input in [
+            vec![
+                "temba-client",
+                "--config",
+                "custom.toml",
+                "catalog",
+                "--json",
+            ],
+            vec![
+                "temba-client",
+                "catalog",
+                "--json",
+                "--config",
+                "custom.toml",
+            ],
+        ] {
+            let args = Args::try_parse_from(input).unwrap();
+            assert_eq!(args.config, "custom.toml");
+            assert!(matches!(
+                args.command,
+                Some(Command::Catalog { json: true })
+            ));
+        }
+        assert!(matches!(
+            Args::try_parse_from(["temba-client", "catalog"])
+                .unwrap()
+                .command,
+            Some(Command::Catalog { json: false })
+        ));
+        assert!(Args::try_parse_from(["temba-client", "--json"]).is_err());
+    }
     use axum::{
         Json, Router,
         extract::State,
@@ -1424,11 +1434,11 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn personal_ids_isolate_headers_and_expiration_and_disconnect_clear_secrets() {
+    async fn personal_ids_isolate_headers_and_disconnect_clears_secrets() {
         let (a, upstream_a, task_a) = mock().await;
         let (b, upstream_b, task_b) = mock().await;
         let mut config: config::Config = toml::from_str(
-            "catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[local_catalog]\nenabled=true\nidle_timeout_seconds=60\nmax_servers=2"
+            "catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[local_catalog]\nenabled=true\nmax_servers=2"
         ).unwrap();
         config.validate().unwrap();
         let local = local(config);
@@ -1513,10 +1523,10 @@ mod integration_tests {
         assert_eq!(ea.label(), "same-label"); // diagnostics never use the secret ID
         let session = oauth::Session::test_session("test-session");
         ea.state.write().await.session = Some(session.clone());
-        *ea.personal.as_ref().unwrap().last_used.lock().await =
-            Instant::now() - Duration::from_secs(61);
-        assert!(local.call(&format!("{id_a}.echo"), None).await.is_err());
-        local.expire_personal().await;
+        local
+            .call(&format!("{id_a}.__temba_disconnect__"), None)
+            .await
+            .unwrap();
         assert!(local.personal.read().await.get(&id_a).is_none());
         assert!(
             ea.personal
@@ -1545,6 +1555,46 @@ mod integration_tests {
         );
         task_a.abort();
         task_b.abort();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn personal_registration_survives_a_week_of_inactivity() {
+        let config: config::Config = toml::from_str(
+            "catalog_url='https://catalog.example.com'\n[local_catalog]\nenabled=true",
+        )
+        .unwrap();
+        let local = local(config);
+        let definition = serde_json::from_value(json!({
+            "id":"temporary-service", "endpoint":"https://mcp.example.com/mcp", "oauth":{},
+            "headers":[{"name":"X-Key","credential":"api_key","mandatory":true}]
+        }))
+        .unwrap();
+        let added = local
+            .add_personal(
+                definition,
+                BTreeMap::from([("api_key".into(), "local-secret".into())]),
+            )
+            .await
+            .unwrap();
+        let id = added["local_id"].as_str().unwrap();
+        tokio::time::advance(Duration::from_secs(7 * 24 * 3600)).await;
+        let entry = local.personal_entry(id).await.unwrap();
+        assert_eq!(
+            local.credential_headers(&entry).unwrap()["x-key"],
+            "local-secret"
+        );
+        let result = local.search("", &[id.to_owned()]).await;
+        assert!(
+            result["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["status"] == "auth_required")
+        );
+        local
+            .call(&format!("{id}.__temba_disconnect__"), None)
+            .await
+            .unwrap();
+        assert!(local.personal_entry(id).await.is_none());
     }
     #[tokio::test]
     async fn personal_registration_is_optional_and_does_not_reuse_toml_headers() {

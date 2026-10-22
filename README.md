@@ -1,17 +1,17 @@
 # Temba
 
-**A shared MCP catalog. Connections that stay on your machine.**
-
-Temba is a catalog of MCP servers that let LLMs discover and call tools.
+STOP WASTING TOKENS with MCP server that you won't use!  
+Temba is a **catalog** of MCP servers that let LLMs discover and use tools only when it needs them.  
 
 [Getting started](#getting-started) · [Deploying the catalog](#deploying-the-catalog) · [Documentation](#documentation)
 
 ## Why Temba?
 
-- **One catalog for every team** : Use keycloak groups to assign tools to your organisation's teams.
+- **Don't waste tokens** : The catalog's search feature prevents loading all your MCPs in the context from the start.
+- **Manage tools access using Keycloak** : Use keycloak groups to assign tools to users.
 - **Simple catalog management** : Use Infra As Code or REST API to manage catalog entries.
 - **Secured by design** : OIDC sessions from remote MCPs stays on the machine.
-- **Dynamic MCP registration** : Optionnally let the LLM register MCPs it finds to its catalog.
+- **Dynamic MCP registration** : Optionnally let the LLM register MCPs it finds to its own catalog.
 
 ## How it works
 
@@ -21,8 +21,8 @@ Temba is a catalog of MCP servers that let LLMs discover and call tools.
 ## Getting started
 
 Temba is made of two components :
-* The server side catalog installed using Helm.
-* The local MCP tool that connects to the catalog.
+* The server side catalog installed on Kubernetes using Helm.
+* The local MCP tool that connects to the catalog used by the client (Opencode, Codex, Claude Code, etc)
 
 ### Installing the catalog
 
@@ -33,29 +33,100 @@ cd ./chart/temba-catalog
 helm upgrade --install temba chart/temba-catalog
 ```
 
+### 1. Get the client
 
-* Opencode MCP config to add Temba (or any other LLM client like Codex or Claude Code):
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), which provides the
+`uvx` command. You do not need to install Rust, Cargo, or a compiler.
+
+Then get the **Temba wheel for your system** from your administrator
+or from the [CI artifacts](.github/workflows/ci.yaml). This `.whl` file contains
+the precompiled Rust binary.
+
+CI targets Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64.
+**The package is not yet published to a registry**: use a wheel file for now.
+
+### 2. Create your configuration
+
+Copy [temba.example.toml](temba.example.toml) to a file named `temba.toml`, then set
+the catalog URL. These two lines are enough to get started:
+
+```toml
+catalog_url = "https://catalogue.example.com"
+labels = []
+```
+
+Inspect the catalog to find MCP IDs, endpoints, labels and required headers:
+
+```sh
+uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml catalog
+```
+
+Add `--json` for JSON output. If the catalog is protected, Temba opens the browser
+for login. See [inspecting the catalog](docs/CLIENT.md#inspecting-the-catalog).
+
+### 3. Connect Temba to your AI client
+
+The client must launch the following command as a **local MCP server**:
+
+```sh
+uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml
+```
+
+Replace both paths with the paths to your wheel and configuration file.
+Use absolute paths: the AI client's working directory may change from one project to another.
+
+<details>
+<summary>OpenCode configuration example</summary>
+
+Add a local MCP entry to your OpenCode configuration:
+
 ```json
-"mcp": {
+{
+  "mcp": {
     "temba": {
       "type": "local",
       "command": [
         "uvx",
         "--from",
-        "/home/elancelot/Documents/leTigre/dynmcp/dist/temba_client-1.4.9-py3-none-manylinux_2_34_x86_64.whl",
+        "/absolute/path/to/client.whl",
         "temba-client",
         "--config",
-        "<path-to-your-toml-file>"
+        "/absolute/path/to/temba.toml"
       ],
       "enabled": true
     }
+  }
 }
 ```
 
+</details>
+
+For another MCP client, use the same command in its configuration format.
+To check only that the binary is installed, run:
+
+```sh
+uvx --from /absolute/path/to/client.whl temba-client --help
+```
+
+### 4. Make your first request
+
+Launch your AI client and try asking:
+
+> List the services you have access to.
+
+The assistant uses `tool_search` to discover tools, then `call_tool` to execute them.
+
+If authentication is required, Temba opens the browser **when you use the service**.
+An existing SSO session may authorize the connection immediately: Temba briefly waits
+for the result and continues with the request. If you still need to take action, the assistant lets you know.
+
+> Changed the TOML file, environment variables, or client version?
+> Restarting the UI of your AI client may not restart the process in charge of loading MCPs.
+> For instance, opencode needs "opencode service restart".
 
 
 
-## Learn by example
+## The catalog : Learn by example
 
 ### Adding an unauthenticated MCP to the catalog
 
@@ -79,7 +150,7 @@ catalog_url = "http://127.0.0.1:18080" # URL of the catalog
 # allow_insecure_http = true          # if using an HTTP URL for the catalog
 ```
 
-=> Ask your LLM to search something about a Github repo.
+=> Ask your LLM to search something about a specific Github repo.
 
 ### Adding an OIDC MCP to the catalog
 
@@ -247,7 +318,7 @@ In each MCP server definition, choose **only one** rule:
 
 **Back to the catalog !**
 
-Let's add a Gitlab and Jira MCP. The Gitlab MCP is for users part of `team-a`. The jira MCP is for users part of `team-b`. 
+Let's add a Gitlab and Jira MCP. The Gitlab MCP is for users part of group `team-a`. The jira MCP is for users part of group `team-b`. 
 
 * Temba catalog:  
 ```yaml
@@ -262,250 +333,32 @@ catalog:
     oauth: {}
 ```
 
-* .toml on the client desktop for a developer:
+* .toml on the client desktop:
 ```toml
-labels = ["dev"]
-
-...
+catalog_url = "http://127.0.0.1:18080" # URL of the catalog
+# allow_insecure_http = true           # if using an HTTP URL for the catalog
 ```
-=> This client can discover the Gitlab MCP but not Jira.  
 
-* .toml on the client desktop for a product manager:  
-```toml
-labels = ["pm"]
-
-...
-```
-=> This client can discover the Jira MCP but not Gitlab  
+=> Depending on the user's group, it will access either one of the tools or both if the user is present in both groups.  
 
 
-#### Configuring the catalog
+## Let the LLM manage the catalog
 
-The catalog is a list of remote MCPs that follows this structure:
+We're about to live in a world where LLMs will do a lot of our work. To do so, they need to interact with many services, therefore many MCPs will be needed...
+And because you can't know for sure which one will be required, the best solution is to let the LLM add them to the catalog itself.
+
+Enable the feature in your .toml file:  
 
 ```yaml
-catalog:
-  servers:
-  - id: <some-unique-id>                 # ie gitlab
-    description: <description of what this MCP does> # ie Gitlab management tools for MR and users.
-    endpoint: http://127.0.0.1:18082/mcp # Remote MCP URL must be accessible from the computer
-    headers:                             # Optionnal headers (see Setting headers)
-    - name: X-<Heeader-Name>
-      credential: <some-key>             # Optionnal setting that takes the header value from the client's .toml config 
-      mandatory: true
-    oauth:                               # Optionnal setting to add OIDC MCPs (ie official Jira) 
-      allowedOrigins:                    # Optional restriction; omit or use [] for automatic public OAuth discovery.
-        - https://auth.example.com
-      clientId: my-client
-      scopes:
-        - openid
-      callbackPort: 19878
-    labels: ["some-label"]               # Optionnal setting to distribute tools to clients that have the same label in their .toml. (See Using labels)
-    access:                              # Use Keycloak to manage tools per team (see Using OIDC for catalog access)
-      groupsAnyOf:
-      - <group-name>                     # User's registered to this group in keycloak will have access to this tool
-```
-
-#### Catalog config examples:
-
-* Example with a Gitlab MCP using only a header as token :
-
-```yaml
-catalog:
-  servers:
-  - id: gitlab
-    description: GitLab tools for the dev group; project and instance configured on the MCP server. Requires a client-provided raw GitLab token.
-    endpoint: http://gtlab-mcp/mcp # Change this to target your own Gitlab MCP 
-    headers:
-    - name: X-Gitlab-Token         # This is the header name that this Gitlab MCP awaits
-      credential: token            # The token is set under the key'token' in the client's .toml config. (see Setting headers)
-      mandatory: true
-    access:
-      groupsAnyOf:
-      - dev                        # If the user is in the group keycloak group 'dev', this tool will be made available to him
-```
-
-* Example with the official Jira MCP using OIDC (to Atlasian itself)
-
-``` yaml
-catalog:
-  servers:
-  - id: jira
-    description: Atlassian remote Jira MCP for the project managers group; sign in using its browser OAuth flow.
-    endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
-    oauth:
-      allowedOrigins:
-      - https://auth.atlassian.com
-    access:
-      groupsAnyOf:
-      - /pm
-```
-
-### 1. Get the client
-
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/), which provides the
-`uvx` command. You do not need to install Rust, Cargo, or a compiler.
-
-Then get the **Temba wheel for your system** from your administrator
-or from the [CI artifacts](.github/workflows/ci.yaml). This `.whl` file contains
-the precompiled Rust binary.
-
-CI targets Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64.
-**The package is not yet published to a registry**: use a wheel file for now.
-
-### 2. Create your configuration
-
-Copy [temba.example.toml](temba.example.toml) to a file named `temba.toml`, then set
-the catalog URL. These two lines are enough to get started:
-
-```toml
-catalog_url = "https://catalogue.example.com"
-labels = []
-```
-
-`labels = []` shows MCP servers without labels. If your team uses labels to
-make some MCP servers optional, add the ones you want:
-
-```toml
-labels = ["support", "documentation"]
-```
-
-MCP servers without labels remain visible. If an MCP server has multiple labels,
-all of them must appear in this list.
-
-### 3. Connect Temba to your AI client
-
-The client must launch the following command as a **local MCP server**:
-
-```sh
-uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml
-```
-
-Replace both paths with the paths to your wheel and configuration file.
-Use absolute paths: the AI client's working directory may change from one project to another.
-
-<details>
-<summary>OpenCode configuration example</summary>
-
-Add a local MCP entry to your OpenCode configuration:
-
-```json
-{
-  "mcp": {
-    "temba": {
-      "type": "local",
-      "command": [
-        "uvx",
-        "--from",
-        "/absolute/path/to/client.whl",
-        "temba-client",
-        "--config",
-        "/absolute/path/to/temba.toml"
-      ],
-      "enabled": true
-    }
-  }
-}
-```
-
-</details>
-
-For another MCP client, use the same command in its configuration format.
-To check only that the binary is installed, run:
-
-```sh
-uvx --from /absolute/path/to/client.whl temba-client --help
-```
-
-### 4. Make your first request
-
-Launch your AI client and try asking:
-
-> List the services you have access to.
-
-The assistant uses `tool_search` to discover tools, then `call_tool` to execute them.
-You do not need to handle their identifiers manually.
-
-If authentication is required, Temba opens the browser **when you use the service**.
-An existing SSO session may authorize the connection immediately: Temba briefly waits
-for the result and continues with the request. If you still need to take action, the assistant lets you know.
-
-> Changed the TOML file, environment variables, or client version?
-> **Restart the Temba process.** With a persistent AI server such as `opencode serve`,
-> restarting only the interface may not reload the MCP servers.
-
-## Connecting to MCP servers
-
-Authentication methods can be combined:
-
-| The MCP server requires… | What you configure |
-| --- | --- |
-| No credentials | Nothing else on the user side |
-| A token or private headers | Their values in your TOML file or the Temba process environment |
-| An OAuth / OIDC connection | Authorization in the browser; the session stays in RAM |
-| OAuth and additional headers | Both mechanisms together |
-
-For a static token, the administrator declares the expected header in the catalog.
-You provide its value locally. For example:
-
-```toml
-[tool.service]
-expected_endpoint = "https://mcp.example.com/mcp"
-
-[tool.service.headers]
-api_token = { env = "SERVICE_TOKEN" }
-```
-
-The `service` identifier, `api_token` reference, and URL must match the catalog
-definition. A direct value such as `api_token = "Bearer …"` also works; keep
-that file private. Temba sends the full value without adding a prefix.
-
-The [client configuration guide](docs/CLIENT.md) explains headers, labels, and the connection flow.
-
-### Do you need Keycloak?
-
-**No, Keycloak is optional.** It controls who can see entries in the shared catalog.
-Authentication with a remote MCP server remains independent: a public catalog can contain OAuth MCP servers.
-
-To restrict MCP servers to teams, follow the [step-by-step Keycloak tutorial](docs/KEYCLOAK.md).
-Labels provide convenient local filtering; Keycloak groups control visibility on the server.
-
-## Adding an MCP server for a temporary need
-
-The local catalog lets the assistant add an MCP server itself without changing the team's catalog.
-Enable it in your TOML file to expose the third tool, `add_mcp`:
-
-```toml
 [local_catalog]
 enabled = true
-idle_timeout_seconds = 1800
-max_servers = 16
+max_servers = 16  # Limit the number of MCPs the server can add
 ```
 
-The added entry stays **in memory in the local process**. It receives a secret identifier that
-the assistant must provide to find and use it. This also works without authentication to the central catalog.
+To test, ask the LLM to register the official Jira MCP. It will look for it on the internet and add the URL to the catalog.
 
-Each entry expires after **30 minutes without its ID being used**, or when the process stops.
-The default limit is **16 simultaneous entries**. Expiration is useful when an AI server
-keeps the Temba process running across multiple conversations.
+:warning: This is an experimental feature that give LLMs a lot of power. In a near futur this will be very useful but maybe it's also too soon. You should keep an eye on your AI client when using this.
 
-Possession of the identifier grants access to the entry: it does not authenticate a conversation.
-Values provided to `add_mcp` may also appear in the AI client's history.
-
-See the [local addition walkthrough](docs/CLIENT.md#temporary-local-additions) for examples and OAuth rules.
-
-## Deploying the catalog
-
-Do you manage shared MCP servers? Deploy the catalog using a container image and
-the [temba-catalog](chart/temba-catalog) chart. Define the addresses, descriptions,
-and, if needed, authorized groups there.
-
-1. Build the image and make it available to the cluster.
-2. Prepare a Helm values file containing your MCP servers.
-3. Deploy the catalog, then share its URL with users.
-
-The [deployment guide](docs/DEPLOYMENT.md) covers these steps, including a Minikube walkthrough and HTTPS Ingress settings.
-The [catalog guide](docs/CATALOGUE.md) explains how to describe MCP servers and manage persistent additions.
 
 ## Repository layout
 

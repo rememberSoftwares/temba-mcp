@@ -6,7 +6,7 @@ Remote MCP servers must already exist and be accessible from those machines.
 
 The catalog uses a container image and the [temba-catalog](../chart/temba-catalog) chart.
 Catalog and client versions evolve independently: currently,
-the catalog is at **1.3.2** and the client at **1.4.9**.
+the catalog is at **1.3.3** and the client at **1.4.12**.
 
 ## Prerequisites
 
@@ -25,14 +25,14 @@ Also adjust the context and namespace in the commands.
 From the repository root:
 
 ```sh
-nerdctl build -t temba-catalog:1.3.2 .
+nerdctl build -t temba-catalog:1.3.3 .
 ```
 
 In Minikube, explicitly load an image archive:
 
 ```sh
-nerdctl save -o /tmp/temba-catalog-1.3.2.tar temba-catalog:1.3.2
-minikube image load /tmp/temba-catalog-1.3.2.tar
+nerdctl save -o /tmp/temba-catalog-1.3.3.tar temba-catalog:1.3.3
+minikube image load /tmp/temba-catalog-1.3.3.tar
 ```
 
 The image includes the Rust binary. The ConfigMap created by Helm contains only
@@ -45,7 +45,7 @@ Create a `values.local.yaml` file:
 ```yaml
 image:
   repository: temba-catalog
-  tag: "1.3.2"
+  tag: "1.3.3"
 
 catalogueAuth:
   enabled: false
@@ -172,6 +172,9 @@ Old keys are rejected. To update an installation from earlier versions:
 | `headers[].prefix` | Complete value supplied by the client |
 | `[credentials.<id>]` in TOML | `[tool.<id>]` and `[tool.<id>.headers]` |
 | Implicit ENV reference | Explicit `{ env = "VARIABLE" }` object |
+| `allow_loopback_http` / `allow_localhost_http` in TOML | `allow_insecure_http` (also permits remote HTTP) |
+| `refresh_seconds` in TOML | `refresh_minutes`, default `60`, range `1..1440` |
+| `security.allowLoopbackHttp` in Helm | `security.allowInsecureHttp` |
 
 Before using client 1.4.9, update the catalog to 1.3.2 and remove server-level `name` from Helm values, raw catalog files and persisted API definitions. Keep the existing IDs so TOML mappings and tool IDs remain stable. Header `name` fields are unchanged.
 

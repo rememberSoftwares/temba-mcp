@@ -23,14 +23,12 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct LocalCatalog {
     pub enabled: bool,
-    pub idle_timeout_seconds: u64,
     pub max_servers: usize,
 }
 impl Default for LocalCatalog {
     fn default() -> Self {
         Self {
             enabled: false,
-            idle_timeout_seconds: 1800,
             max_servers: 16,
         }
     }
@@ -90,8 +88,7 @@ impl Config {
             .map(|s| s.trim().to_lowercase())
             .collect();
         ensure!(
-            (60..=86400).contains(&self.local_catalog.idle_timeout_seconds)
-                && (1..=64).contains(&self.local_catalog.max_servers),
+            (1..=64).contains(&self.local_catalog.max_servers),
             "Invalid local catalog limits"
         );
         for tool in self.tool.values() {

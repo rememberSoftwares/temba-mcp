@@ -31,6 +31,40 @@ pub struct CatalogAuth {
     #[serde(default)]
     pub token_endpoint: String,
 }
+impl CatalogAuth {
+    pub fn validate(&self) -> Result<()> {
+        temba_core::endpoint(&self.issuer, false)?;
+        ensure!(
+            !self.client_id.is_empty(),
+            "Catalog OAuth clientId required"
+        );
+        if !self.token_endpoint.is_empty() {
+            temba_core::https_override(&self.token_endpoint, &self.issuer)?;
+        }
+        Ok(())
+    }
+
+    pub async fn pending(&self, http: &reqwest::Client) -> Result<Pending> {
+        self.validate()?;
+        let provider = metadata_override(
+            http,
+            &self.issuer,
+            std::slice::from_ref(&self.issuer),
+            false,
+            (!self.token_endpoint.is_empty()).then_some(self.token_endpoint.as_str()),
+        )
+        .await?;
+        Pending::new(
+            http.clone(),
+            provider,
+            Some(self.client_id.clone()),
+            vec!["openid".into()],
+            None,
+            self.callback_port,
+        )
+        .await
+    }
+}
 #[derive(Clone)]
 pub struct Provider {
     pub issuer: String,

@@ -29,7 +29,7 @@ Validation locale possible avec une image construite :
 
 ```sh
 nerdctl run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \
-  --user 10001:10001 -p 18080:8080 temba-catalog:1.3.2
+  --user 10001:10001 -p 18080:8080 temba-catalog:1.3.3
 ```
 
 La consultation du catalogue ne nécessite aucune écriture dans le système de fichiers racine. Les modifications administratives écrivent uniquement les définitions sur le volume prévu à cet effet. L’authentification navigateur et les callbacks OAuth appartiennent au client local ; aucun callback OAuth n’est exposé par ce conteneur.

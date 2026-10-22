@@ -6,7 +6,6 @@ use std::sync::Mutex as StdMutex;
 pub(super) struct Personal {
     pub label: String,
     pub headers: StdMutex<BTreeMap<String, Zeroizing<String>>>,
-    pub last_used: Mutex<Instant>,
 }
 #[derive(Debug)]
 pub(super) struct RegistrationError(pub &'static str);
@@ -75,7 +74,6 @@ impl Local {
                     .map(|(k, v)| (k, Zeroizing::new(v)))
                     .collect(),
             ),
-            last_used: Mutex::new(Instant::now()),
         });
         self.credential_headers(&entry).map_err(|error| {
             if error.is::<MissingHeaders>() {
@@ -88,7 +86,10 @@ impl Local {
         {
             let mut entries = self.personal.write().await;
             if entries.len() >= self.config.local_catalog.max_servers {
-                return Err(RegistrationError("Local catalog limit reached. Disconnect an existing local MCP or wait for expiration.").into());
+                return Err(RegistrationError(
+                    "Local catalog limit reached. Disconnect an existing local MCP to free a slot.",
+                )
+                .into());
             }
             // Never overwrite a registration, even in the event of a random collision.
             if entries.contains_key(&id) {
@@ -107,51 +108,15 @@ impl Local {
             "local_id":id,
             "status":status,
             "connect_tool_id":format!("{id}.__temba_connect__"),
-            "idle_timeout_seconds":self.config.local_catalog.idle_timeout_seconds,
-            "hint":"Keep local_id in this conversation. Pass local_ids:[local_id] to tool_search to discover its tools, then use their returned tool_id with call_tool. Local entries are not listed without their ID. For auth_required, use connect_tool_id to start this MCP's OAuth flow. For connecting, search again; do not report ready until confirmed. Catalog authentication is not required for this local registration. OAuth providers are discovered automatically over public destinations unless definition.oauth.allowedOrigins contains an explicit restriction. Nothing is saved to the central catalog or a local file."
+            "hint":"Keep local_id in this conversation. Pass local_ids:[local_id] to tool_search to discover its tools, then use their returned tool_id with call_tool. Local entries are not listed without their ID. For auth_required, use connect_tool_id to start this MCP's OAuth flow. For connecting, search again; do not report ready until confirmed. Catalog authentication is not required for this local registration. OAuth providers are discovered automatically over public destinations unless definition.oauth.allowedOrigins contains an explicit restriction. This registration stays available until explicitly disconnected or the Temba process stops; inactivity does not remove it. Nothing is saved to the central catalog or a local file."
         }))
     }
 
     pub(super) async fn personal_entry(&self, id: &str) -> Option<Arc<Entry>> {
         let entry = self.personal.read().await.get(id).cloned()?;
-        let personal = entry.personal.as_ref()?;
-        let mut last = personal.last_used.lock().await;
-        if entry.retired.load(Ordering::SeqCst)
-            || last.elapsed() >= Duration::from_secs(self.config.local_catalog.idle_timeout_seconds)
-        {
+        if entry.retired.load(Ordering::SeqCst) {
             return None;
         }
-        *last = Instant::now();
-        drop(last);
         Some(entry)
-    }
-
-    pub(super) async fn expire_personal(&self) {
-        let mut entries = self.personal.write().await;
-        let mut expired = Vec::new();
-        for (id, entry) in entries.iter() {
-            if entry
-                .personal
-                .as_ref()
-                .unwrap()
-                .last_used
-                .lock()
-                .await
-                .elapsed()
-                >= Duration::from_secs(self.config.local_catalog.idle_timeout_seconds)
-            {
-                entry.retired.store(true, Ordering::SeqCst);
-                expired.push(id.clone());
-            }
-        }
-        let removed: Vec<_> = expired
-            .into_iter()
-            .filter_map(|id| entries.remove(&id))
-            .collect();
-        drop(entries);
-        for entry in removed {
-            eprintln!("Local MCP {}: expired", entry.label());
-            entry.close().await;
-        }
     }
 }

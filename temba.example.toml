@@ -15,5 +15,4 @@ labels = []
 # Optional third tool: ephemeral registrations, never saved to disk.
 [local_catalog]
 enabled = false
-idle_timeout_seconds = 1800
 max_servers = 16

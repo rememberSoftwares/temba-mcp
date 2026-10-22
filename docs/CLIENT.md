@@ -38,6 +38,38 @@ Remote MCP servers must be reachable **from the user's machine**.
 A localhost URL refers to that machine, not a Kubernetes pod.
 See [local HTTP and networking](CONFIGURATION.md).
 
+## Inspecting the catalog
+
+List the MCP definitions available to your user before configuring private headers:
+
+```sh
+uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml catalog
+```
+
+The default terminal view shows each MCP's ID, endpoint, labels, access rule,
+OAuth settings, and public or expected private headers. A required private header
+is shown with its TOML reference, for example `tool.service.headers.api_token`.
+Local labels do not filter this list, so you can discover available categories.
+
+For the complete API response as JSON:
+
+```sh
+uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml catalog --json
+```
+
+If the catalog uses Keycloak, the command opens your browser and waits for login.
+It uses its own in-memory session; it does not export or reuse another Temba
+process's token. Browser cookies may make login immediate. Login instructions go
+to stderr, leaving stdout valid JSON for pipes such as `| jq`.
+
+The command contacts only the catalog and its identity provider. It does not
+connect to remote MCPs, send their private headers, or display values from your
+local credentials. Group restrictions still apply. With catalog authentication
+disabled, only public definitions appear. No tokens are saved when the command exits.
+
+Running the binary without a subcommand still starts the stdio MCP server, so
+existing AI client commands remain valid.
+
 ## Selecting MCP servers by label
 
 Labels enable categories of MCP servers without changing your permissions.
@@ -184,15 +216,16 @@ This option, disabled by default, adds the `add_mcp` tool:
 ```toml
 [local_catalog]
 enabled = true
-idle_timeout_seconds = 1800
 max_servers = 16
 ```
 
 | Option | Effect |
 | --- | --- |
 | `enabled` | Exposes or removes the dynamic addition tool |
-| `idle_timeout_seconds` | Registration expiration when its ID is unused: 1,800 seconds by default, between 60 and 86,400 |
 | `max_servers` | Maximum simultaneous local registrations per process: 16 by default, between 1 and 64 |
+
+When upgrading, remove the former `idle_timeout_seconds` option from your TOML.
+Registrations no longer expire due to inactivity.
 
 ### Adding an MCP server with a token
 
@@ -246,10 +279,11 @@ again with the corrected definition. No change to the central catalog is needed.
 
 ### Lifetime and scope
 
-Every search or call presenting a valid ID renews its idle timeout.
-An expired ID is rejected immediately; cleanup every 10 seconds closes
-expired connections and releases credentials held by the client.
-Stopping the process removes all registrations.
+Registrations remain available regardless of inactivity. Pausing a conversation
+does not remove them. Explicitly disconnecting an entry removes its ID, closes
+its connection and clears the private credentials held by the client.
+Stopping the process removes all registrations. OAuth token expiration and refresh
+remain governed by the identity provider.
 
 Two additions with the same name receive separate IDs and connections.
 **Possession of the ID authorizes use** within that process: there is no
