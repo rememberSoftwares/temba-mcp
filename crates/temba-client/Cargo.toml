@@ -1,9 +1,13 @@
 [package]
 name = "temba-client"
-version = "1.4.12"
+version = "2.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "temba"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -18,7 +22,7 @@ zeroize.workspace = true
 temba-core.workspace = true
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "reqwest", "transport-io", "transport-streamable-http-client-reqwest"] }
 open = "5"
-toml = "0.9"
+serde_yaml_ng = "0.10"
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 

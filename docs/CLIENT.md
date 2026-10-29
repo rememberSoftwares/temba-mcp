@@ -1,27 +1,30 @@
 # Configuring the local client
 
 This guide complements the [README getting started guide](../README.md#getting-started).
-The `temba.toml` file belongs on the machine running `temba-client`.
+The `temba.yaml` file belongs on the machine running `temba`.
 It is read when the process starts.
 
 ## Basic settings
 
-```toml
-catalog_url = "https://catalogue.example.com"
-labels = []
-refresh_minutes = 60
-search_limit = 5
+```yaml
+labels: []
+refresh_minutes: 60
+search_limit: 5
+catalogs:
+  - id: team
+    url: https://catalogue.example.com
 ```
 
 | Option | Purpose | Default |
 | --- | --- | --- |
-| `catalog_url` | REST catalog URL, without an `/mcp` or `/v1/catalog` suffix | Required |
+| `catalogs[].id` | Unique local catalog alias; used in tool IDs and credential mappings | Required per catalog |
+| `catalogs[].url` | REST catalog URL, without an `/mcp` or `/v1/catalog` suffix | Required per catalog |
 | `labels` | Labels of the MCP servers you choose to include | `[]`: MCP servers without labels |
-| `refresh_minutes` | Central catalog refresh interval, between 1 and 1,440 minutes (24 hours) | `60` |
-| `search_limit` | Maximum number of tools returned per search, between 1 and 50 | `5` |
+| `refresh_minutes` | Refresh interval for each catalog, between 1 and 1,440 minutes (24 hours) | `60` |
+| `search_limit` | Maximum results per catalog per search, between 1 and 50 | `5` |
 | `allow_insecure_http` | Allows unencrypted HTTP for local and remote destinations; HTTPS certificate checks remain enabled | `false` |
 
-If upgrading an existing TOML, replace `allow_loopback_http` or `allow_localhost_http`
+When migrating an old TOML configuration, replace `allow_loopback_http` or `allow_localhost_http`
 with `allow_insecure_http`. This now permits remote HTTP too. OAuth destination
 approval remains separate: it does not authorize automatically discovered private destinations.
 Replace `refresh_seconds` with `refresh_minutes`, dividing the old value by 60.
@@ -29,9 +32,11 @@ For example, `refresh_seconds = 3600` becomes `refresh_minutes = 60`.
 
 For a catalog accessed through port forwarding:
 
-```toml
-catalog_url = "http://127.0.0.1:18080"
-allow_insecure_http = true
+```yaml
+allow_insecure_http: true
+catalogs:
+  - id: team
+    url: http://127.0.0.1:18080
 ```
 
 Remote MCP servers must be reachable **from the user's machine**.
@@ -43,18 +48,19 @@ See [local HTTP and networking](CONFIGURATION.md).
 List the MCP definitions available to your user before configuring private headers:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml catalog
+uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog
 ```
 
 The default terminal view shows each MCP's ID, endpoint, labels, access rule,
 OAuth settings, and public or expected private headers. A required private header
-is shown with its TOML reference, for example `tool.service.headers.api_token`.
+is shown with its YAML location, for example `catalogs[id=team].tools.service.headers.Authorization`
+or `headersFromEnv`.
 Local labels do not filter this list, so you can discover available categories.
 
-For the complete API response as JSON:
+For JSON containing each catalog’s ID, URL, status and full definitions, plus a `partial` flag:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml catalog --json
+uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog --json
 ```
 
 If the catalog uses Keycloak, the command opens your browser and waits for login.
@@ -68,7 +74,24 @@ local credentials. Group restrictions still apply. With catalog authentication
 disabled, only public definitions appear. No tokens are saved when the command exits.
 
 Running the binary without a subcommand still starts the stdio MCP server, so
-existing AI client commands remain valid.
+AI clients launch `temba` without a subcommand. The old executable name was `temba-client`.
+
+## Multiple catalogs and local serving
+
+Configure `catalogs` entries with distinct IDs. Search returns up to
+`search_limit` results from each source, with IDs such as `team.service.search`.
+A failed catalog is reported through `partial` and `catalogs` without hiding
+results from healthy sources. Sessions, ETags and credentials are isolated.
+Catalog login callbacks sharing a port are queued; background refresh never opens a browser.
+
+`dynamic_catalog` enables the LLM's temporary `add_mcp` tool.
+`local_catalog` instead declares static IaC definitions served by `temba serve`.
+Set `local_catalog.enabled: true` to include it automatically when it has entries;
+no URL needs to be added to `catalogs`. Its reserved catalog ID is `local`.
+`local_catalog.tools` holds its private headers. `listen` defaults to
+`127.0.0.1:8787` and can be omitted. Run `serve` separately; an occupied port
+produces an explicit error. The flag defaults to `false`.
+See [multiple catalogs and the local server](MULTI_CATALOG.md) for the complete setup.
 
 ## Selecting MCP servers by label
 
@@ -76,7 +99,7 @@ Labels enable categories of MCP servers without changing your permissions.
 To include an MCP server, all of its labels must appear in your list.
 MCP servers without labels remain included.
 
-| Labels in the TOML file | MCP servers included, among those allowed by the catalog |
+| Labels in the YAML file | MCP servers included, among those allowed by the catalog |
 | --- | --- |
 | `[]` | Those without any labels |
 | `["support"]` | Those without labels and those labeled only `support` |
@@ -100,39 +123,71 @@ headers:
     credential: tenant
 ```
 
-Your TOML file provides values for **this MCP server identifier**:
+Your YAML maps credentials to **a catalog alias and an MCP server identifier**.
+The examples use catalog alias `team`:
 
-```toml
-[tool.service]
-expected_endpoint = "https://mcp.example.com/mcp"
-
-[tool.service.headers]
-api_token = { env = "SERVICE_TOKEN" }
-tenant = "engineering"
+```yaml
+catalogs:
+  - id: team
+    url: https://catalogue.example.com
+    tools:
+      service:
+        expected_endpoint: https://mcp.example.com/mcp
+        headers:
+          X-Tenant: engineering
+        headersFromEnv:
+          - name: Authorization
+            valueFrom:
+              envVarRef:
+                name: SERVICE_TOKEN
 ```
 
-`api_token` and `tenant` are the catalog's `credential` references.
-They are not HTTP header names.
+Use the actual **HTTP header names** in both sections: `Authorization`, `X-Tenant`, etc.
+The catalog's `credential` aliases identify private headers in its definitions;
+they are not keys in the client configuration. Dynamically registered MCPs still
+use credential aliases in their registration arguments.
 
 ### Direct value or environment variable?
 
 A string is always a **literal value**:
 
-```toml
-[tool.service]
-expected_endpoint = "https://mcp.example.com/mcp"
-
-[tool.service.headers]
-api_token = "Bearer your-token"
+```yaml
+catalogs:
+  - id: team
+    url: https://catalogue.example.com
+    tools:
+      service:
+        expected_endpoint: https://mcp.example.com/mcp
+        headers:
+          Authorization: Bearer your-token
 ```
 
-To read a variable, explicitly use `{ env = "SERVICE_TOKEN" }`.
-Writing `api_token = "SERVICE_TOKEN"` would send those words to the server.
+To read a variable, use `headersFromEnv`:
+
+```yaml
+headersFromEnv:
+  - name: Authorization
+    valueFrom:
+      envVarRef:
+        name: SERVICE_TOKEN
+```
+
+This block belongs inside the MCP's configuration alongside `expected_endpoint`.
+`name: Authorization` is the HTTP header; `SERVICE_TOKEN` is the environment
+variable to read. This resembles Kubernetes syntax but reads the local process's
+environment, not a Kubernetes Secret. No `secretKeyRef` is supported here.
+
+Writing `headers: {Authorization: "SERVICE_TOKEN"}` sends those literal words.
+A header must appear only once across both sections; names are case-insensitive.
+Missing or empty variables count as absent: a required catalog header blocks the
+connection, while optional headers are omitted. Private client headers can also
+be supplied without a catalog declaration. `Authorization` is rejected when the
+MCP uses OAuth, which supplies that header itself.
 
 The value is sent as provided: if the MCP server expects `Bearer …`, include
 the prefix. If it expects a raw token, provide only the token.
 
-A direct value stays on disk in the TOML file; keep this file private and out of the repository.
+A direct value stays on disk in the YAML file; keep this file private and out of the repository.
 An environment variable must be present in the **Temba process**.
 An AI server that is already running does not inherit variables exported later in another terminal.
 
@@ -143,10 +198,10 @@ An AI server that is already running does not inherit variables exported later i
 The two must match exactly, including the path and query parameters.
 
 If the destination changes, Temba refuses to send your headers until you
-approve the new address in the TOML file. These values are not sent
+approve the new address in the YAML file. These values are not sent
 to the catalog, OAuth providers, or other MCP servers. HTTP redirects are disabled.
 
-This setting is required for private headers configured in the TOML file.
+This setting is required for private headers configured in the YAML file.
 A public header provided by the catalog does not need it.
 
 ### What does the assistant see?
@@ -213,10 +268,10 @@ including local registrations.
 
 This option, disabled by default, adds the `add_mcp` tool:
 
-```toml
-[local_catalog]
-enabled = true
-max_servers = 16
+```yaml
+dynamic_catalog:
+  enabled: true
+  max_servers: 16
 ```
 
 | Option | Effect |
@@ -224,7 +279,7 @@ max_servers = 16
 | `enabled` | Exposes or removes the dynamic addition tool |
 | `max_servers` | Maximum simultaneous local registrations per process: 16 by default, between 1 and 64 |
 
-When upgrading, remove the former `idle_timeout_seconds` option from your TOML.
+When upgrading, remove the former `idle_timeout_seconds` option from your YAML.
 Registrations no longer expire due to inactivity.
 
 ### Adding an MCP server with a token
@@ -244,7 +299,7 @@ Here are the arguments for `add_mcp`:
 }
 ```
 
-The values are specific to this registration; it does not read headers from the TOML file.
+The values are specific to this registration; it does not read headers from the YAML file.
 `add_mcp` returns a secret 256-bit `local_id` and a `connect_tool_id`.
 
 1. Keep the `local_id` in the conversation.
@@ -292,7 +347,7 @@ provided tokens, and responses in its own history.
 
 ## Updating and troubleshooting
 
-After changing the TOML file or environment, restart the Temba process.
+After changing the YAML file or environment, restart the Temba process.
 After updating the client, also change the wheel path in your AI client.
 Replacing a wheel at the same path may cause `uvx` to use its old cached binary.
 

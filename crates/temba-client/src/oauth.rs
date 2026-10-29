@@ -22,7 +22,7 @@ use tokio::{
 use url::Url;
 use zeroize::Zeroizing;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogAuth {
     pub issuer: String,

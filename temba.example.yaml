@@ -1,0 +1,50 @@
+# Shared client settings. search_limit applies separately to each catalog.
+allow_insecure_http: true
+refresh_minutes: 60
+search_limit: 5
+labels: []
+catalogs:
+  - id: team
+    url: http://127.0.0.1:18080
+    # tools:
+    #   service:
+    #     expected_endpoint: https://mcp.example.com/mcp
+    #     headers:
+    #       X-Region: "eu-west"
+    #     headersFromEnv:
+    #       - name: Authorization
+    #         valueFrom:
+    #           envVarRef:
+    #             name: SERVICE_AUTHORIZATION
+
+# Optional third tool: entries remain in RAM until disconnect or process exit.
+dynamic_catalog:
+  enabled: false
+  max_servers: 16
+
+# The environment variable contains the complete value, e.g. "Bearer …".
+
+# Optional local IaC catalog. Start a separate `temba serve` process.
+# It is included automatically as `local` when enabled and nonempty.
+# No corresponding entry is needed in catalogs. Private tools settings stay local.
+local_catalog:
+  enabled: false
+  # listen: "127.0.0.1:8787" # Optional; this is the default
+  servers: []
+  # servers:
+  #   - id: documentation
+  #     endpoint: https://mcp.example.com/mcp
+  #     access:
+  #       public: true
+  #     headers:
+  #       - name: X-Api-Key
+  #         credential: token
+  #         mandatory: true
+  # tools:
+  #   documentation:
+  #     expected_endpoint: https://mcp.example.com/mcp
+  #     headersFromEnv:
+  #       - name: X-Api-Key
+  #         valueFrom:
+  #           envVarRef:
+  #             name: DOCUMENTATION_TOKEN

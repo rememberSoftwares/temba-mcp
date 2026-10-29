@@ -1,9 +1,11 @@
 mod catalog;
 mod config;
-mod local_catalog;
+mod dynamic_catalog;
+mod federation;
 mod oauth;
 mod oauth_network;
 mod search;
+mod serve;
 mod transport;
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
@@ -52,6 +54,7 @@ where
 
 #[derive(Parser)]
 #[command(
+    name = "temba",
     version,
     about = "Local MCP client and catalog CLI; OAuth credentials stay in memory"
 )]
@@ -59,7 +62,7 @@ struct Args {
     #[arg(
         long,
         env = "TEMBA_CONFIG",
-        default_value = "temba.toml",
+        default_value = "temba.yaml",
         global = true
     )]
     config: String,
@@ -69,6 +72,8 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// List all MCP definitions visible to your user, before local label filtering.
+    /// Serve the local IaC catalog without a management API.
+    Serve,
     Catalog {
         /// Print the complete catalog as JSON instead of terminal text.
         #[arg(long)]
@@ -78,7 +83,7 @@ enum Command {
 struct Entry {
     retired: AtomicBool,
     definition: Server,
-    personal: Option<local_catalog::Personal>,
+    personal: Option<dynamic_catalog::Personal>,
     state: RwLock<Remote>,
     operation: Mutex<()>,
     login: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -90,7 +95,7 @@ struct Remote {
     session: Option<Arc<oauth::Session>>,
 }
 struct Local {
-    config: config::Config,
+    config: config::SourceConfig,
     http: reqwest::Client,
     servers: RwLock<BTreeMap<String, Arc<Entry>>>,
     personal: RwLock<BTreeMap<String, Arc<Entry>>>,
@@ -100,6 +105,8 @@ struct Local {
     catalog_auth: RwLock<Option<oauth::CatalogAuth>>,
     catalog_status: RwLock<&'static str>,
     refresh: Mutex<()>,
+    catalog_login_gate: Arc<Mutex<()>>,
+    catalog_login_url: RwLock<Option<String>>,
 }
 #[derive(Debug)]
 struct MissingHeaders(Vec<temba_core::Header>);
@@ -107,7 +114,7 @@ impl std::fmt::Display for MissingHeaders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Mandatory local headers missing: {}. Configure their environment variables in the local TOML and restart the client; do not provide secrets in chat.",
+            "Mandatory local headers missing: {}. Configure their environment variables in the local YAML and restart the client; do not provide secrets in chat.",
             self.0
                 .iter()
                 .map(|h| format!(
@@ -182,12 +189,54 @@ impl Entry {
     }
 }
 impl Local {
+    fn new(config: config::SourceConfig, gate: Arc<Mutex<()>>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            config,
+            http: http()?,
+            servers: RwLock::new(BTreeMap::new()),
+            personal: RwLock::new(BTreeMap::new()),
+            etag: Mutex::new(None),
+            catalog_session: Mutex::new(None),
+            catalog_login: Mutex::new(None),
+            catalog_auth: RwLock::new(None),
+            catalog_status: RwLock::new("public"),
+            refresh: Mutex::new(()),
+            catalog_login_gate: gate,
+            catalog_login_url: RwLock::new(None),
+        }))
+    }
+    async fn close(&self) {
+        if let Some(task) = self.catalog_login.lock().await.take() {
+            task.abort();
+        }
+        let entries = self
+            .servers
+            .read()
+            .await
+            .values()
+            .chain(self.personal.read().await.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            entry.retired.store(true, Ordering::SeqCst);
+            entry.close().await;
+        }
+    }
+
     async fn bootstrap(&self) -> Result<()> {
         let auth = catalog::bootstrap(&self.http, &self.config.catalog_url).await?;
+        let changed = *self.catalog_auth.read().await != auth;
+        if changed {
+            if let Some(session) = self.catalog_session.lock().await.take() {
+                session.clear().await;
+            }
+            self.drop_authenticated().await;
+        }
+        let has_session = self.catalog_session.lock().await.is_some();
         let mut status = self.catalog_status.write().await;
         if auth.is_none() {
             *status = "public";
-        } else if *status == "public" {
+        } else if !has_session && !matches!(*status, "auth_in_progress" | "auth_failed") {
             *status = "auth_required";
         }
         *self.catalog_auth.write().await = auth;
@@ -312,7 +361,8 @@ impl Local {
             }
         }
         eprintln!(
-            "{event}; ready={ready}/{}; pending=[{}]",
+            "Catalog {}: {event}; ready={ready}/{}; pending=[{}]",
+            self.config.namespace,
             entries.len(),
             pending.join(", ")
         );
@@ -343,6 +393,29 @@ impl Local {
         let definition = &entry.definition;
         let mut headers = reqwest::header::HeaderMap::new();
         let tool = self.config.tool.get(&definition.id);
+        if entry.personal.is_none()
+            && let Some(tool) = tool.filter(|t| !t.headers.is_empty())
+        {
+            ensure!(
+                tool.expected_endpoint == definition.endpoint,
+                "Static credential destination mismatch"
+            );
+            ensure!(
+                definition.oauth.is_none() || !tool.headers.contains_key("authorization"),
+                "Authorization cannot be configured as a header when OAuth is enabled"
+            );
+            for (name, source) in &tool.headers {
+                if let Some(value) = source.resolve()? {
+                    ensure!(value.len() <= 16384, "Invalid header value length");
+                    let mut value = reqwest::header::HeaderValue::from_str(value.as_str())?;
+                    value.set_sensitive(true);
+                    headers.insert(
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+                        value,
+                    );
+                }
+            }
+        }
         let mut missing = Vec::new();
         for header in &definition.headers {
             let (value, private) = if let Some(reference) = &header.credential {
@@ -355,10 +428,10 @@ impl Local {
                         .filter(|v| !v.is_empty())
                         .cloned()
                 } else {
-                    match tool.and_then(|t| t.headers.get(reference)) {
-                        Some(source) => source.resolve()?,
-                        None => None,
+                    if headers.contains_key(&header.name) {
+                        continue;
                     }
+                    None
                 };
                 let Some(value) = value else {
                     if header.mandatory {
@@ -373,6 +446,9 @@ impl Local {
                 );
                 (value, true)
             } else {
+                if headers.contains_key(&header.name) {
+                    continue;
+                }
                 (
                     Zeroizing::new(
                         header
@@ -445,6 +521,14 @@ impl Local {
                 ().serve(StreamableHttpClientTransport::with_client(client, config))
                     .await?;
             let tools = service.peer().list_all_tools().await?;
+            let mut names = std::collections::HashSet::new();
+            ensure!(
+                tools.iter().all(|tool| !matches!(
+                    tool.name.as_ref(),
+                    "__temba_connect__" | "__temba_disconnect__"
+                ) && names.insert(tool.name.clone())),
+                "MCP returned duplicate tool names"
+            );
             ensure!(tools.len() <= 10000, "Too many tools");
             Ok::<_, anyhow::Error>((service, tools))
         };
@@ -478,7 +562,10 @@ impl Local {
         )
         .await;
         if status == "auth_in_progress" {
-            return Ok(response);
+            return Ok(catalog_login_response(
+                &self.config.namespace,
+                self.catalog_login_url.read().await.as_deref(),
+            ));
         }
         Ok(
             json!({"status":status,"target":"remote_mcp","server":e.definition.id,
@@ -543,7 +630,9 @@ impl Local {
             if e.personal.is_some()
                 && let Some(origin) = error.downcast_ref::<oauth::OriginNotAllowed>()
             {
-                anyhow::Error::new(local_catalog::LocalOAuthOriginNotAllowed(origin.0.clone()))
+                anyhow::Error::new(dynamic_catalog::LocalOAuthOriginNotAllowed(
+                    origin.0.clone(),
+                ))
             } else {
                 error
             }
@@ -595,13 +684,6 @@ impl Local {
             json!({"status":"auth_in_progress","target":"remote_mcp","server":e.definition.id,"url":url,"hint":format!("Authorization for MCP {} started. Finish it in your browser, then repeat tool_search. Do not claim the MCP is connected until its status is ready.",e.definition.id)}),
         )
     }
-    async fn refresh_in_background(self: &Arc<Self>) {
-        if self.refresh().await.is_err() {
-            eprintln!(
-                "Catalog: background refresh failed; interactive reconnection waits for the next tool request"
-            );
-        }
-    }
     async fn validate_catalog_session(self: &Arc<Self>) {
         let session = self.catalog_session.lock().await.clone();
         let auth_enabled = self.catalog_auth.read().await.is_some();
@@ -642,70 +724,129 @@ impl Local {
         )
         .await;
         if status == "auth_in_progress" {
-            return Ok(response);
+            return Ok(catalog_login_response(
+                &self.config.namespace,
+                self.catalog_login_url.read().await.as_deref(),
+            ));
         }
-        Ok(json!({"status":status,"target":"catalog","catalog":"temba",
-        "hint": match status {
-            "authenticated" => "The catalog is ready. Continue the user's request without asking them to retry or authorize again.",
-            "loading" => "Authentication is complete; catalog definitions are still loading. Search again shortly. No browser action is required.",
-            "catalog_unavailable" => "Authentication is complete but catalog loading failed. Search again later; no browser authorization is required.",
-            _ => "Catalog authentication did not complete. Search again to inspect its status."
-        }}))
+        Ok(
+            json!({"status":status,"target":"catalog","catalog": if self.config.namespace.is_empty() { "temba" } else { self.config.namespace.as_str() },
+            "hint": match status {
+                "public" => "Catalog authentication is disabled; public definitions are available without browser login.",
+                "authenticated" => "The catalog is ready. Continue the user's request without asking them to retry or authorize again.",
+                "loading" => "Authentication is complete; catalog definitions are still loading. Search again shortly. No browser action is required.",
+                "catalog_unavailable" => "Authentication is complete but catalog loading failed. Search again later; no browser authorization is required.",
+                _ => "Catalog authentication did not complete. Search again to inspect its status."
+            }}),
+        )
     }
     async fn start_catalog_login(self: &Arc<Self>) -> Result<Value> {
         let mut task = self.catalog_login.lock().await;
         if task.as_ref().is_some_and(|t| !t.is_finished()) {
-            return Ok(catalog_login_response(None));
+            return Ok(catalog_login_response(
+                &self.config.namespace,
+                self.catalog_login_url.read().await.as_deref(),
+            ));
         }
         if let Some(session) = self.catalog_session.lock().await.clone()
             && session.access().await.is_ok()
         {
             return Ok(
-                json!({"status":*self.catalog_status.read().await,"target":"catalog","catalog":"temba","hint":"The Temba catalog is already authenticated. No login action is required."}),
+                json!({"status":*self.catalog_status.read().await,"target":"catalog","catalog": if self.config.namespace.is_empty() { "temba" } else { self.config.namespace.as_str() },"hint":"The Temba catalog is already authenticated. No login action is required."}),
             );
         }
         *self.catalog_status.write().await = "auth_in_progress";
-        self.bootstrap().await?;
-        let auth = self
-            .catalog_auth
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Catalog authentication is disabled"))?;
-        let pending = auth.pending(&self.http).await?;
-        let url = pending.url.clone();
+        let refresh_bootstrap = self.catalog_auth.read().await.is_some();
+        if !refresh_bootstrap {
+            self.bootstrap().await?;
+        }
+        ensure!(
+            self.catalog_auth.read().await.is_some(),
+            "Catalog authentication is disabled"
+        );
+        *self.catalog_login_url.write().await = None;
         let local = self.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         *task = Some(tokio::spawn(async move {
-            match pending.finish().await {
-                Ok(session) => {
-                    eprintln!("Catalog: authentication succeeded");
-                    *local.catalog_status.write().await = "loading";
-                    *local.catalog_session.lock().await = Some(session);
-                    *local.etag.lock().await = None;
-                    if local.refresh().await.is_err() {
-                        eprintln!("Catalog: authenticated refresh failed");
-                        if local.catalog_session.lock().await.is_some() {
-                            *local.catalog_status.write().await = "catalog_unavailable";
-                        }
-                    } else {
-                        eprintln!("Catalog: protected definitions loaded");
+            let Ok(_guard) = tokio::time::timeout(
+                AUTH_COMPLETION_WAIT,
+                local.catalog_login_gate.clone().lock_owned(),
+            )
+            .await
+            else {
+                *local.catalog_status.write().await = "auth_required";
+                return;
+            };
+            let prepared: Result<Option<oauth::Pending>> = async {
+                if refresh_bootstrap {
+                    local.bootstrap().await?;
+                }
+                let auth = local.catalog_auth.read().await.clone();
+                match auth {
+                    Some(auth) => Ok(Some(auth.pending(&local.http).await?)),
+                    None => {
+                        local.refresh().await?;
+                        Ok(None)
                     }
                 }
+            }
+            .await;
+            match prepared {
+                Ok(Some(pending)) => {
+                    let url = pending.url.clone();
+                    *local.catalog_login_url.write().await = Some(url.clone());
+                    let _ = sender.send(url.clone());
+                    let catalog = local.config.namespace.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if open::that(&url).is_err() {
+                            eprintln!(
+                                "Catalog {catalog}: browser could not be opened; visit {url}"
+                            );
+                        }
+                    });
+                    local.complete_catalog_login(pending).await;
+                }
+                Ok(None) => {}
                 Err(_) => {
                     *local.catalog_status.write().await = "auth_failed";
-                    eprintln!("Catalog: authorization failed or timed out");
+                    eprintln!(
+                        "Catalog {}: authorization could not start",
+                        local.config.namespace
+                    );
                 }
             }
+            *local.catalog_login_url.write().await = None;
         }));
-        let browser_url = url.clone();
-        tokio::task::spawn_blocking(move || {
-            if open::that(browser_url).is_err() {
-                eprintln!(
-                    "Catalog: default browser could not be opened; reconnect using __catalog__.__temba_connect__ to obtain the connection link"
-                );
+        let url = tokio::time::timeout(Duration::from_millis(100), receiver)
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        Ok(catalog_login_response(
+            &self.config.namespace,
+            url.as_deref(),
+        ))
+    }
+    async fn complete_catalog_login(self: &Arc<Self>, pending: oauth::Pending) {
+        match pending.finish().await {
+            Ok(session) => {
+                eprintln!("Catalog: authentication succeeded");
+                *self.catalog_status.write().await = "loading";
+                *self.catalog_session.lock().await = Some(session);
+                *self.etag.lock().await = None;
+                if self.refresh().await.is_err() {
+                    eprintln!("Catalog: authenticated refresh failed");
+                    if self.catalog_session.lock().await.is_some() {
+                        *self.catalog_status.write().await = "catalog_unavailable";
+                    }
+                } else {
+                    eprintln!("Catalog: protected definitions loaded");
+                }
             }
-        });
-        Ok(catalog_login_response(Some(&url)))
+            Err(_) => {
+                *self.catalog_status.write().await = "auth_failed";
+                eprintln!("Catalog: authorization failed or timed out");
+            }
+        }
     }
     async fn search(self: &Arc<Self>, query: &str, local_ids: &[String]) -> Value {
         let started = Instant::now();
@@ -770,7 +911,7 @@ impl Local {
                     e.definition.description,
                     e.definition.labels.join(" ")
                 ));
-                rows.push(json!({"tool_id":format!("{}.__temba_connect__",e.definition.id),"description":if s.status == "credentials_required" { format!("MCP {} needs mandatory local headers. Inspect missing_headers, configure credentials in the local TOML/environment and restart the client. Do not ask for secret values in chat; this action cannot supply them.",e.definition.id) } else { format!("Connect to MCP {} ({}). This action concerns only this remote MCP. For OAuth, finish authorization in your browser and search again; connection succeeds only when its status is ready.",e.definition.id,e.definition.description) },"target":"remote_mcp","server":e.definition.id,"status":s.status}));
+                rows.push(json!({"tool_id":format!("{}.__temba_connect__",e.definition.id),"description":if s.status == "credentials_required" { format!("MCP {} needs mandatory local headers. Inspect missing_headers, configure credentials in the local YAML/environment and restart the client. Do not ask for secret values in chat; this action cannot supply them.",e.definition.id) } else { format!("Connect to MCP {} ({}). This action concerns only this remote MCP. For OAuth, finish authorization in your browser and search again; connection succeeds only when its status is ready.",e.definition.id,e.definition.description) },"target":"remote_mcp","server":e.definition.id,"status":s.status}));
             }
         }
         let scores = search::scores(query, &docs);
@@ -794,10 +935,12 @@ impl Local {
                 "authenticated": self.catalog_session.lock().await.is_some(),
                 "status": catalog_status,
                 "automatic_login": catalog_auth_enabled,
+                "authorization_url": if catalog_status == "auth_in_progress" { self.catalog_login_url.read().await.clone() } else { None },
                 "connect_description": if retry_login { Some("Retry the failed Temba catalog browser login. This does not connect any remote MCP.") } else { None },
                 "hint": match catalog_status {
                     "public" => "Catalog login is disabled; no authentication is required.",
                     "authenticated" => "The catalog is authenticated. Do not suggest catalog login because an MCP is missing; permissions and labels still apply.",
+                    "auth_required" => "Catalog login will start on a tool request. Another catalog may be using the callback port; finish the active authorization and search again. Do not ask the user to choose a technical action.",
                     "auth_in_progress" => "Catalog login started automatically. Tell the user to finish authorization in their browser and search again. Do not ask whether to call a connection tool.",
                     "loading" => "Catalog authentication succeeded; protected definitions are loading. Search again shortly; no login action is required.",
                     "auth_failed" => "Automatic catalog login failed or timed out. Explain the failure; the returned catalog_connect_tool retries browser login. Do not ask the user to choose a technical tool identifier.",
@@ -853,7 +996,7 @@ impl Local {
             match self.servers.read().await.get(server).cloned() {
                 Some(entry) => entry,
                 None if *self.catalog_status.read().await == "auth_in_progress" => {
-                    return Ok(result(catalog_login_response(None)));
+                    return Ok(result(catalog_login_response(&self.config.namespace, None)));
                 }
                 None => return Err(anyhow::anyhow!("Unknown or unavailable server")),
             }
@@ -910,10 +1053,10 @@ impl Local {
 }
 // Only report controlled diagnostics, never provider response bodies or credentials.
 fn setup_error(error: &anyhow::Error) -> String {
-    if let Some(error) = error.downcast_ref::<local_catalog::LocalOAuthOriginNotAllowed>() {
+    if let Some(error) = error.downcast_ref::<dynamic_catalog::LocalOAuthOriginNotAllowed>() {
         return error.to_string();
     }
-    if let Some(error) = error.downcast_ref::<local_catalog::RegistrationError>() {
+    if let Some(error) = error.downcast_ref::<dynamic_catalog::RegistrationError>() {
         return error.to_string();
     }
     if let Some(missing) = error.downcast_ref::<MissingHeaders>() {
@@ -945,11 +1088,11 @@ fn setup_error(error: &anyhow::Error) -> String {
     }
     "Connection or action unavailable. Check the catalog configuration and local credentials; repeat tool_search.".into()
 }
-fn catalog_login_response(url: Option<&str>) -> Value {
+fn catalog_login_response(namespace: &str, url: Option<&str>) -> Value {
     let mut response = json!({
         "status":"auth_in_progress",
         "target":"catalog",
-        "catalog":"temba",
+        "catalog": if namespace.is_empty() { "temba" } else { namespace },
         "hint":"Authentication to the Temba catalog is in progress. This does not authenticate to remote MCPs. Finish authorization in your browser, then repeat tool_search to reload definitions allowed for your identity. This does not grant group membership or start remote MCP authorization. If the requested MCP remains absent, report that it is not available in the visible catalog."
     });
     if let Some(url) = url {
@@ -963,7 +1106,7 @@ fn bail_catalog() {
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
         let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to a remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. When a connection result is authenticated or ready, continue the original request immediately without asking the user to retry. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
-        if self.0.config.local_catalog.enabled {
+        if self.0.config.dynamic_catalog.enabled {
             let instructions = info.instructions.clone().unwrap_or_default();
             info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM. Local registration, scoped search and connection do not require catalog authentication. OAuth providers are discovered automatically over public destinations when definition.oauth.allowedOrigins is absent or empty. A nonempty list restricts provider origins for that MCP. A registration can be disconnected and recreated with a corrected definition.", instructions))
         } else {
@@ -976,7 +1119,7 @@ impl ServerHandler for Handler {
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let mut tools=vec![Tool::new("tool_search","Search central tools and remote MCP connection states. To include ephemeral local MCPs, supply their secret IDs in local_ids. Local MCPs are never enumerated without their IDs. Catalog authentication is automatic; catalog.status reports public, auth_in_progress, loading, authenticated or failure. catalog_connect_tool is returned only to retry a failed catalog login.",json!({"type":"object","properties":{"query":{"type":"string"},"local_ids":{"type":"array","items":{"type":"string"},"maxItems":64}},"required":["query"],"additionalProperties":false}).as_object().unwrap().clone()),Tool::new("call_tool","Call a tool_id returned by tool_search. __catalog__.__temba_connect__ authenticates only to the Temba catalog; <server>.__temba_connect__ connects only to that visible remote MCP. Report the returned target and status accurately.",json!({"type":"object","properties":{"tool_id":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_id"],"additionalProperties":false}).as_object().unwrap().clone())];
-        if self.0.config.local_catalog.enabled {
+        if self.0.config.dynamic_catalog.enabled {
             tools.push(Tool::new("add_mcp",
                 "Register an ephemeral MCP in local RAM and return a secret local_id. Supply a definition using endpoint, oauth and header declarations, and optional private header values keyed by credential reference. No central modification or file persistence. Only callers presenting local_id can discover/use this registration. OAuth authorization is independent of catalog authentication. Omit definition.oauth.allowedOrigins or use an empty list for automatic public discovery; provide a nonempty list to restrict trusted provider origins. OAuth authorization is a separate browser action. Never publish another conversation's local_id.",
                 json!({
@@ -1037,7 +1180,7 @@ impl ServerHandler for Handler {
                     self.0.search(string("query").unwrap_or(""), &ids).await,
                 ))
             }
-            "add_mcp" if self.0.config.local_catalog.enabled => {
+            "add_mcp" if self.0.config.dynamic_catalog.enabled => {
                 let definition = match args
                     .get("definition")
                     .cloned()
@@ -1091,53 +1234,16 @@ async fn main() -> Result<()> {
     temba_core::harden_process();
     let args = Args::parse();
     let source = Zeroizing::new(tokio::fs::read_to_string(args.config).await?);
-    let mut config: config::Config = toml::from_str(source.as_str()).map_err(|_| {
-        anyhow::anyhow!("Invalid local TOML configuration; check syntax and tool/headers settings")
+    let mut config: config::Config = serde_yaml_ng::from_str(source.as_str()).map_err(|_| {
+        anyhow::anyhow!("Invalid YAML; check catalogs, tools, headers and headersFromEnv")
     })?;
     drop(source);
     config.validate()?;
-    if let Some(Command::Catalog { json }) = args.command {
-        return catalog::run(&config, json).await;
+    match args.command {
+        Some(Command::Catalog { json }) => catalog::run(config, json).await,
+        Some(Command::Serve) => serve::run(config).await,
+        None => federation::run(config).await,
     }
-    let local = Arc::new(Local {
-        config,
-        http: http()?,
-        servers: RwLock::new(BTreeMap::new()),
-        personal: RwLock::new(BTreeMap::new()),
-        etag: Mutex::new(None),
-        catalog_session: Mutex::new(None),
-        catalog_login: Mutex::new(None),
-        catalog_auth: RwLock::new(None),
-        catalog_status: RwLock::new("public"),
-        refresh: Mutex::new(()),
-    });
-    local.bootstrap().await?;
-    local.refresh().await?;
-    let background = local.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(background.config.refresh_minutes * 60)).await;
-            background.refresh_in_background().await;
-        }
-    });
-    let service = Handler(local.clone())
-        .serve(rmcp::transport::stdio())
-        .await?;
-    service.waiting().await?;
-    task.abort();
-    if let Some(t) = local.catalog_login.lock().await.take() {
-        t.abort();
-    }
-    for e in local
-        .servers
-        .read()
-        .await
-        .values()
-        .chain(local.personal.read().await.values())
-    {
-        e.close().await;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1145,14 +1251,14 @@ mod integration_tests {
     use super::*;
     #[test]
     fn catalog_cli_is_optional_and_config_works_before_or_after_subcommand() {
-        let args = Args::try_parse_from(["temba-client", "--config", "custom.toml"]).unwrap();
-        assert_eq!(args.config, "custom.toml");
+        let args = Args::try_parse_from(["temba-client", "--config", "custom.yaml"]).unwrap();
+        assert_eq!(args.config, "custom.yaml");
         assert!(args.command.is_none());
         for input in [
             vec![
                 "temba-client",
                 "--config",
-                "custom.toml",
+                "custom.yaml",
                 "catalog",
                 "--json",
             ],
@@ -1161,11 +1267,11 @@ mod integration_tests {
                 "catalog",
                 "--json",
                 "--config",
-                "custom.toml",
+                "custom.yaml",
             ],
         ] {
             let args = Args::try_parse_from(input).unwrap();
-            assert_eq!(args.config, "custom.toml");
+            assert_eq!(args.config, "custom.yaml");
             assert!(matches!(
                 args.command,
                 Some(Command::Catalog { json: true })
@@ -1178,6 +1284,12 @@ mod integration_tests {
             Some(Command::Catalog { json: false })
         ));
         assert!(Args::try_parse_from(["temba-client", "--json"]).is_err());
+        assert!(matches!(
+            Args::try_parse_from(["temba", "serve", "--config", "custom.yaml"])
+                .unwrap()
+                .command,
+            Some(Command::Serve)
+        ));
     }
     use axum::{
         Json, Router,
@@ -1238,7 +1350,7 @@ mod integration_tests {
         let task = tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
         (url, state, task)
     }
-    fn local(config: config::Config) -> Arc<Local> {
+    fn local(config: config::SourceConfig) -> Arc<Local> {
         Arc::new(Local {
             config,
             http: http().unwrap(),
@@ -1250,13 +1362,15 @@ mod integration_tests {
             catalog_auth: RwLock::new(None),
             catalog_status: RwLock::new("public"),
             refresh: Mutex::new(()),
+            catalog_login_gate: Arc::new(Mutex::new(())),
+            catalog_login_url: RwLock::new(None),
         })
     }
     #[tokio::test]
     async fn tokens_are_isolated_and_endpoint_changes_drop_sessions() {
         let (a, secure, ta) = mock().await;
         let (b, public, tb) = mock().await;
-        let mut config:config::Config=toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[tool.secure]\nexpected_endpoint='{a}'\n[tool.secure.headers]\napi_token={{env='PATH'}}")).unwrap();
+        let mut config:config::SourceConfig=serde_yaml_ng::from_str(&format!("catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\ntool:\n  secure:\n    expected_endpoint: {a}\n    headersFromEnv:\n    - name: Authorization\n      valueFrom:\n        envVarRef:\n          name: PATH\n")).unwrap();
         config.validate().unwrap();
         let local = local(config);
         let definition = |id: &str, url: &str, auth: Value| {
@@ -1316,7 +1430,7 @@ mod integration_tests {
     #[tokio::test]
     async fn oauth_plus_multiple_headers_are_sent_only_to_the_approved_mcp() {
         let (url, upstream, server) = mock().await;
-        let mut config: config::Config = toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[tool.combined]\nexpected_endpoint='{url}'\n[tool.combined.headers]\napi_key={{env='PATH'}}\ntenant='Bearer complete-tenant-value'")).unwrap();
+        let mut config: config::SourceConfig = serde_yaml_ng::from_str(&format!("catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\ntool:\n  combined:\n    expected_endpoint: {url}\n    headers:\n      X-Tenant: Bearer complete-tenant-value\n      X-Client-Only: client-only-value\n    headersFromEnv:\n    - name: X-Api-Key\n      valueFrom:\n        envVarRef:\n          name: PATH\n")).unwrap();
         config.validate().unwrap();
         let local = local(config);
         let mut definition: Server = serde_json::from_value(json!({"id":"combined","endpoint":url,"oauth":{},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-Tenant","credential":"tenant"},{"name":"X-App","value":"temba"}]})).unwrap();
@@ -1345,6 +1459,7 @@ mod integration_tests {
             assert_eq!(headers["x-api-key"], value);
             assert_eq!(headers["x-tenant"], "Bearer complete-tenant-value");
             assert_eq!(headers["x-app"], "temba");
+            assert_eq!(headers["x-client-only"], "client-only-value");
         }
         let (other_url, other, other_server) = mock().await;
         definition.endpoint = other_url;
@@ -1355,11 +1470,47 @@ mod integration_tests {
         other_server.abort();
     }
 
+    #[test]
+    fn configured_http_headers_cannot_override_oauth_or_change_destinations() {
+        let mut config: config::SourceConfig = serde_yaml_ng::from_str(
+            r#"
+catalog_url: https://catalog.example.com
+tool:
+  service:
+    expected_endpoint: https://mcp.example.com/mcp
+    headers:
+      Authorization: "Bearer private-value"
+      X-Client: "configured-locally"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let local = local(config);
+        let mut definition: Server = serde_json::from_value(json!({
+            "id":"service", "endpoint":"https://mcp.example.com/mcp", "oauth":{}
+        }))
+        .unwrap();
+        definition.validate(false).unwrap();
+        assert!(
+            local
+                .credential_headers(&Entry::new(definition.clone()))
+                .is_err()
+        );
+        definition.oauth = None;
+        let headers = local
+            .credential_headers(&Entry::new(definition.clone()))
+            .unwrap();
+        assert_eq!(headers["authorization"], "Bearer private-value");
+        assert!(headers["authorization"].is_sensitive());
+        assert_eq!(headers["x-client"], "configured-locally");
+        definition.endpoint = "https://other.example.com/mcp".into();
+        assert!(local.credential_headers(&Entry::new(definition)).is_err());
+    }
     #[tokio::test]
     async fn missing_optional_headers_are_omitted_and_mandatory_headers_block_before_network() {
         let (url, upstream, server) = mock().await;
-        let config: config::Config =
-            toml::from_str(&format!("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[tool.mandatory]\nexpected_endpoint='{url}'\n[tool.mandatory.headers]\nprovided='private-supplied-header'")).unwrap();
+        let config: config::SourceConfig =
+            serde_yaml_ng::from_str(&format!("catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\ntool:\n  mandatory:\n    expected_endpoint: {url}\n    headers:\n      X-Provided: private-supplied-header\n")).unwrap();
         let local = local(config);
         let mut definition: Server = serde_json::from_value(json!({
             "id":"optional","endpoint":url,"headers":[
@@ -1437,8 +1588,8 @@ mod integration_tests {
     async fn personal_ids_isolate_headers_and_disconnect_clears_secrets() {
         let (a, upstream_a, task_a) = mock().await;
         let (b, upstream_b, task_b) = mock().await;
-        let mut config: config::Config = toml::from_str(
-            "catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[local_catalog]\nenabled=true\nmax_servers=2"
+        let mut config: config::SourceConfig = serde_yaml_ng::from_str(
+            "catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\ndynamic_catalog:\n  enabled: true\n  max_servers: 2\n"
         ).unwrap();
         config.validate().unwrap();
         let local = local(config);
@@ -1558,8 +1709,8 @@ mod integration_tests {
     }
     #[tokio::test(start_paused = true)]
     async fn personal_registration_survives_a_week_of_inactivity() {
-        let config: config::Config = toml::from_str(
-            "catalog_url='https://catalog.example.com'\n[local_catalog]\nenabled=true",
+        let config: config::SourceConfig = serde_yaml_ng::from_str(
+            "catalog_url: https://catalog.example.com\ndynamic_catalog:\n  enabled: true\n",
         )
         .unwrap();
         let local = local(config);
@@ -1597,10 +1748,10 @@ mod integration_tests {
         assert!(local.personal_entry(id).await.is_none());
     }
     #[tokio::test]
-    async fn personal_registration_is_optional_and_does_not_reuse_toml_headers() {
+    async fn personal_registration_is_optional_and_does_not_reuse_configured_headers() {
         for enabled in [false, true] {
-            let config: config::Config = toml::from_str(&format!(
-                "catalog_url='https://catalog.example.com'\n[local_catalog]\nenabled={enabled}\n[tool.shared]\nexpected_endpoint='https://mcp.example.com'\n[tool.shared.headers]\nkey='TOML-private-value'"
+            let config: config::SourceConfig = serde_yaml_ng::from_str(&format!(
+                "catalog_url: https://catalog.example.com\ndynamic_catalog:\n  enabled: {enabled}\ntool:\n  shared:\n    expected_endpoint: https://mcp.example.com\n    headers:\n      X-Key: YAML-private-value\n"
             )).unwrap();
             let local = local(config);
             let (front, back) = tokio::io::duplex(16384);
@@ -1623,7 +1774,7 @@ mod integration_tests {
                 "headers":[{"name":"X-Key","credential":"key","mandatory":true}]
             }))
             .unwrap();
-            // Even when enabled and a TOML mapping has the same label, registrations cannot reuse it.
+            // Even when enabled and a YAML mapping has the same label, registrations cannot reuse it.
             assert!(
                 local
                     .add_personal(definition, BTreeMap::new())
@@ -1643,7 +1794,7 @@ mod integration_tests {
                 let text = value["content"][0]["text"].as_str().unwrap();
                 assert!(
                     !text.contains("provided-private-value")
-                        && !text.contains("TOML-private-value")
+                        && !text.contains("YAML-private-value")
                 );
                 let registration: Value = serde_json::from_str(text).unwrap();
                 assert_eq!(registration["status"], "auth_required");
@@ -1663,7 +1814,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn catalog_search_reports_state_and_only_offers_retry_after_failure() {
-        let config = toml::from_str("catalog_url='https://catalog.example.com'").unwrap();
+        let config = serde_yaml_ng::from_str("catalog_url: https://catalog.example.com\n").unwrap();
         let local = local(config);
         let public = local.search("jira", &[]).await;
         assert_eq!(public["catalog"]["status"], "public");
@@ -1718,7 +1869,8 @@ mod integration_tests {
         );
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let config =
-            toml::from_str(&format!("catalog_url='{base}'\nallow_insecure_http=true")).unwrap();
+            serde_yaml_ng::from_str(&format!("catalog_url: {base}\nallow_insecure_http: true\n"))
+                .unwrap();
         let local = local(config);
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
@@ -1754,7 +1906,8 @@ mod integration_tests {
             );
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let config =
-            toml::from_str(&format!("catalog_url='{base}'\nallow_insecure_http=true")).unwrap();
+            serde_yaml_ng::from_str(&format!("catalog_url: {base}\nallow_insecure_http: true\n"))
+                .unwrap();
         let local = local(config);
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
@@ -1765,7 +1918,7 @@ mod integration_tests {
         *local.catalog_status.write().await = "authenticated";
         *local.catalog_session.lock().await = Some(oauth::Session::test_session("test-access"));
         for _ in 0..3 {
-            local.refresh_in_background().await;
+            let _ = local.refresh().await;
         }
         assert!(local.catalog_session.lock().await.is_none());
         assert_eq!(*local.catalog_status.read().await, "auth_required");
@@ -1781,7 +1934,8 @@ mod integration_tests {
     #[tokio::test]
     async fn cleared_session_is_detected_on_tool_search_before_the_next_timer_tick() {
         let config =
-            toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true").unwrap();
+            serde_yaml_ng::from_str("catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\n")
+                .unwrap();
         let local = local(config);
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
@@ -1805,7 +1959,8 @@ mod integration_tests {
     #[tokio::test]
     async fn fast_catalog_sso_search_includes_discovered_tools_without_retry() {
         let (endpoint, _, upstream) = mock().await;
-        let local = local(toml::from_str("catalog_url='https://catalog.example.com'").unwrap());
+        let local =
+            local(serde_yaml_ng::from_str("catalog_url: https://catalog.example.com\n").unwrap());
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
             client_id: "temba".into(),
@@ -1841,7 +1996,8 @@ mod integration_tests {
     #[tokio::test]
     async fn fast_catalog_sso_continues_the_original_call_once_after_discovery() {
         let (endpoint, requests, upstream) = mock().await;
-        let local = local(toml::from_str("catalog_url='https://catalog.example.com'").unwrap());
+        let local =
+            local(serde_yaml_ng::from_str("catalog_url: https://catalog.example.com\n").unwrap());
         *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
             issuer: "https://issuer.example.com".into(),
             client_id: "temba".into(),
@@ -1892,7 +2048,8 @@ mod integration_tests {
     #[tokio::test]
     async fn fast_remote_sso_connect_returns_ready_not_pending() {
         let (endpoint, _, upstream) = mock().await;
-        let local = local(toml::from_str("catalog_url='https://catalog.example.com'").unwrap());
+        let local =
+            local(serde_yaml_ng::from_str("catalog_url: https://catalog.example.com\n").unwrap());
         let definition =
             serde_json::from_value(json!({"id":"jira","endpoint":endpoint,"oauth":{}})).unwrap();
         let entry = Arc::new(Entry::new(definition));
@@ -1948,7 +2105,7 @@ mod integration_tests {
             })).with_state(state);
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         for authenticated_catalog in [false, true] {
-            let config = toml::from_str("catalog_url='http://127.0.0.1:1'\nallow_insecure_http=true\n[local_catalog]\nenabled=true").unwrap();
+            let config = serde_yaml_ng::from_str("catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\ndynamic_catalog:\n  enabled: true\n").unwrap();
             let local = local(config);
             if authenticated_catalog {
                 *local.catalog_auth.write().await = Some(oauth::CatalogAuth {
@@ -1976,7 +2133,7 @@ mod integration_tests {
                 .call(&format!("{id}.__temba_connect__"), None)
                 .await
                 .unwrap_err();
-            assert!(error.is::<local_catalog::LocalOAuthOriginNotAllowed>());
+            assert!(error.is::<dynamic_catalog::LocalOAuthOriginNotAllowed>());
             let message = setup_error(&error);
             assert!(message.contains("definition.oauth.allowedOrigins"));
             assert!(message.contains("No central catalog change"));
@@ -2053,8 +2210,8 @@ mod integration_tests {
                 vec!["both", "deepwiki", "gitlab", "jira"],
             ),
         ] {
-            let mut config: config::Config = toml::from_str(&format!(
-                "catalog_url='{base}'\nallow_insecure_http=true\nlabels={labels}"
+            let mut config: config::SourceConfig = serde_yaml_ng::from_str(&format!(
+                "catalog_url: {base}\nallow_insecure_http: true\nlabels: {labels}\n"
             ))
             .unwrap();
             config.validate().unwrap();
@@ -2095,8 +2252,8 @@ mod integration_tests {
             }),
         );
         let tc = tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
-        let mut config: config::Config = toml::from_str(&format!(
-            "catalog_url='{base}'\nallow_insecure_http=true\nlabels=['allowed']"
+        let mut config: config::SourceConfig = serde_yaml_ng::from_str(&format!(
+            "catalog_url: {base}\nallow_insecure_http: true\nlabels:\n- allowed\n"
         ))
         .unwrap();
         config.validate().unwrap();

@@ -26,7 +26,7 @@ A Kubernetes Service address is not an address these machines can use.
 
 | Field | Purpose |
 | --- | --- |
-| `id` | Unique MCP identifier, used in the TOML file, display and `tool_id` values |
+| `id` | Unique MCP identifier, used in the YAML file, display and `tool_id` values |
 | `description` | Helps the assistant identify what the service can be used for |
 | `endpoint` | MCP Streamable HTTP transport URL |
 | `labels` | Categories that users can enable locally |
@@ -122,7 +122,7 @@ Each header has **exactly one source**:
 
 `mandatory` defaults to `false`. A missing optional private value is omitted.
 If a required value is missing, the client reports `credentials_required` before
-contacting the MCP server. See [credentials in TOML](CLIENT.md#providing-tokens-and-private-headers).
+contacting the MCP server. See [credentials in YAML](CLIENT.md#providing-tokens-and-private-headers).
 
 Public values are visible in the user API and may be persisted.
 **Do not put tokens or API keys there.** Private headers are not sent to the catalog.
@@ -254,7 +254,7 @@ The volume contains neither OAuth tokens nor users' private headers.
 | `POST /v1/admin/servers` | Persistent addition if writes are enabled |
 | `DELETE /v1/admin/servers/{id}` | Persistent deletion of an API addition |
 
-Users can inspect these definitions with `temba-client catalog` or `temba-client catalog --json`;
+Users can inspect these definitions with `temba catalog` or `temba catalog --json`;
 the command handles catalog login and lists all authorized entries before local label filtering.
 See [the client guide](CLIENT.md#inspecting-the-catalog).
 

@@ -38,27 +38,35 @@ helm upgrade --install temba chart/temba-catalog
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), which provides the
 `uvx` command. You do not need to install Rust, Cargo, or a compiler.
 
-Then get the **Temba wheel for your system** from your administrator
-or from the [CI artifacts](.github/workflows/ci.yaml). This `.whl` file contains
-the precompiled Rust binary.
+Get the **Temba wheel for your system** from
+[GitHub Releases](https://github.com/rememberSoftwares/temba-mcp/releases).
+A release is published automatically when a numeric version tag is pushed.
+If no release is available yet, get a wheel from your administrator or the
+[CI artifacts](.github/workflows/ci.yaml).
+
+The `.whl` contains the precompiled Rust binary. You can use its downloaded path
+or its GitHub Release URL with `uvx --from`. Native archives are also available
+for running without uv. See [Temba releases and installation](docs/RELEASES.md).
 
 CI targets Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64.
-**The package is not yet published to a registry**: use a wheel file for now.
+**PyPI publishing is not configured**; GitHub Release downloads work without it.
 
 ### 2. Create your configuration
 
-Copy [temba.example.toml](temba.example.toml) to a file named `temba.toml`, then set
-the catalog URL. These two lines are enough to get started:
+Copy [temba.example.yaml](temba.example.yaml) to a private file named `temba.yaml`, then set
+the catalog URL and a local alias:
 
-```toml
-catalog_url = "https://catalogue.example.com"
-labels = []
+```yaml
+labels: []
+catalogs:
+  - id: team
+    url: https://catalogue.example.com
 ```
 
 Inspect the catalog to find MCP IDs, endpoints, labels and required headers:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml catalog
+uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog
 ```
 
 Add `--json` for JSON output. If the catalog is protected, Temba opens the browser
@@ -69,7 +77,7 @@ for login. See [inspecting the catalog](docs/CLIENT.md#inspecting-the-catalog).
 The client must launch the following command as a **local MCP server**:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba-client --config /absolute/path/to/temba.toml
+uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml
 ```
 
 Replace both paths with the paths to your wheel and configuration file.
@@ -89,9 +97,9 @@ Add a local MCP entry to your OpenCode configuration:
         "uvx",
         "--from",
         "/absolute/path/to/client.whl",
-        "temba-client",
+        "temba",
         "--config",
-        "/absolute/path/to/temba.toml"
+        "/absolute/path/to/temba.yaml"
       ],
       "enabled": true
     }
@@ -105,7 +113,7 @@ For another MCP client, use the same command in its configuration format.
 To check only that the binary is installed, run:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba-client --help
+uvx --from /absolute/path/to/client.whl temba --help
 ```
 
 ### 4. Make your first request
@@ -120,7 +128,7 @@ If authentication is required, Temba opens the browser **when you use the servic
 An existing SSO session may authorize the connection immediately: Temba briefly waits
 for the result and continues with the request. If you still need to take action, the assistant lets you know.
 
-> Changed the TOML file, environment variables, or client version?
+> Changed the YAML file, environment variables, or client version?
 > Restarting the UI of your AI client may not restart the process in charge of loading MCPs.
 > For instance, opencode needs "opencode service restart".
 
@@ -144,10 +152,12 @@ catalog:
       public: true
 ```
 
-* .toml on the client desktop:
-```toml
-catalog_url = "http://127.0.0.1:18080" # URL of the catalog
-# allow_insecure_http = true          # if using an HTTP URL for the catalog
+* .yaml on the client desktop:
+```yaml
+allow_insecure_http: true
+catalogs:
+  - id: team
+    url: http://127.0.0.1:18080
 ```
 
 => Ask your LLM to search something about a specific Github repo.
@@ -168,10 +178,12 @@ catalog:
     #  - https://auth.atlassian.com
 ```
 
-* .toml on the client desktop:
-```toml
-catalog_url = "http://127.0.0.1:18080" # URL of the catalog
-# allow_insecure_http = true          # if using an HTTP URL for the catalog
+* .yaml on the client desktop:
+```yaml
+allow_insecure_http: true
+catalogs:
+  - id: team
+    url: http://127.0.0.1:18080
 ```
 
 ### Sending a custom header
@@ -181,7 +193,7 @@ Let's say that e have a Gitlab MCP that needs two custom headers :
 * **Non-sensitive** string to scope the MCP to a particular project.
 * **Sensitive** string containing a user defined token.
 
-The non-sensitive header can be set in the catalog directly. On the other hand the sensitive token, being a user defined value, will be set in the client's toml file.
+The non-sensitive header can be set in the catalog directly. On the other hand the sensitive token, being a user defined value, will be set in the client's YAML file.
 
 * Temba catalog:  
 ```yaml
@@ -197,21 +209,31 @@ catalog:
 
 
     - name: X-Gitlab-Token   # For sensitive values
-      credential: token      # The credential name must match the one in the .toml ; 'token' in this example
+      credential: token      # Marks this header as a private client-supplied value
       mandatory: true
 ```
 
-* .toml on the client desktop:
-```toml
-[tool.gitlab]                                      # The string after 'tool' must match the 'id' in the catalog 
-expected_endpoint = "http://127.0.0.1:18082/mcp"
-[tool.gitlab.headers]
-token = "glpat-<SECRET-TOKEN-OF-USER>"             # Note the 'token' key that must be identical to the one in the catalog (cf 'credential' above)
+* .yaml on the client desktop:
+```yaml
+allow_insecure_http: true
+catalogs:
+  - id: team
+    url: http://127.0.0.1:18080
+    tools:
+      gitlab:
+        expected_endpoint: http://127.0.0.1:18082/mcp
+        headers:
+          X-Gitlab-Token: glpat-<SECRET-TOKEN-OF-USER>
 ```
 
-If you don't want to store the secret inside the toml, you can use the ENV like so:
-```
-token = {env = <ENV_KEY_NAME>}"
+If you don't want to store the secret inside the YAML, you can use the ENV like so:
+```yaml
+# Inside the MCP configuration, replace headers with:
+headersFromEnv:
+  - name: X-Gitlab-Token
+    valueFrom:
+      envVarRef:
+        name: GITLAB_TOKEN
 ```
 :warning: Note that some LLM clients may not forward local ENV to their subprocess.
 
@@ -235,19 +257,21 @@ catalog:
     oauth: {}
 ```
 
-* .toml on the client desktop for a developer:
-```toml
-labels = ["dev"]
+* .yaml on the client desktop for a developer:
+```yaml
+labels:
+- dev
 
-...
+# Other settings…
 ```
 => This client can discover the Gitlab MCP but not Jira.  
 
-* .toml on the client desktop for a product manager:  
-```toml
-labels = ["pm"]
+* .yaml on the client desktop for a product manager:
+```yaml
+labels:
+- pm
 
-...
+# Other settings…
 ```
 => This client can discover the Jira MCP but not Gitlab  
 
@@ -333,26 +357,41 @@ catalog:
     oauth: {}
 ```
 
-* .toml on the client desktop:
-```toml
-catalog_url = "http://127.0.0.1:18080" # URL of the catalog
-# allow_insecure_http = true           # if using an HTTP URL for the catalog
+* .yaml on the client desktop:
+```yaml
+allow_insecure_http: true
+catalogs:
+  - id: team
+    url: http://127.0.0.1:18080
 ```
 
 => Depending on the user's group, it will access either one of the tools or both if the user is present in both groups.  
 
+
+## Several catalogs and a local IaC catalog
+
+Add one `catalogs` entry per source. Each contributes up to `search_limit`
+results, with IDs such as `team.service.search` and `local.service.search`.
+Credentials and OAuth sessions stay separate, and an unavailable source does not
+block the others.
+
+`temba serve` exposes the static definitions in `local_catalog` without a management
+API. Set `local_catalog.enabled: true`: when it contains entries, the client
+includes it automatically as `local`. No URL needs to be added to `catalogs`.
+Private headers belong in `local_catalog.tools`; `listen` is optional. The LLM's optional third tool is configured separately in `dynamic_catalog`.
+See [multiple catalogs and local serving](docs/MULTI_CATALOG.md) for the setup.
 
 ## Let the LLM manage the catalog
 
 We're about to live in a world where LLMs will do a lot of our work. To do so, they need to interact with many services, therefore many MCPs will be needed...
 And because you can't know for sure which one will be required, the best solution is to let the LLM add them to the catalog itself.
 
-Enable the feature in your .toml file:  
+Enable the feature in your YAML file:
 
 ```yaml
-[local_catalog]
-enabled = true
-max_servers = 16  # Limit the number of MCPs the server can add
+dynamic_catalog:
+  enabled: true
+  max_servers: 16
 ```
 
 To test, ask the LLM to register the official Jira MCP. It will look for it on the internet and add the URL to the catalog.
@@ -376,7 +415,7 @@ To build the project or wheels, see the [development guide](docs/DEVELOPMENT.md)
 
 | You want to… | Read |
 | --- | --- |
-| Configure TOML, tokens, or labels | [Local client](docs/CLIENT.md) |
+| Configure YAML, tokens, or labels | [Local client](docs/CLIENT.md) |
 | Describe MCP servers, their OAuth, and their headers | [Shared catalog](docs/CATALOGUE.md) |
 | Install and expose the service | [Deployment](docs/DEPLOYMENT.md) |
 | Configure Keycloak groups and mappers | [Keycloak tutorial](docs/KEYCLOAK.md) |

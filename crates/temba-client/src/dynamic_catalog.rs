@@ -35,7 +35,7 @@ impl Local {
         mut definition: Server,
         headers: BTreeMap<String, String>,
     ) -> Result<Value> {
-        if !self.config.local_catalog.enabled {
+        if !self.config.dynamic_catalog.enabled {
             return Err(RegistrationError("Local catalog is disabled.").into());
         }
         definition
@@ -85,7 +85,7 @@ impl Local {
         let entry = Arc::new(entry);
         {
             let mut entries = self.personal.write().await;
-            if entries.len() >= self.config.local_catalog.max_servers {
+            if entries.len() >= self.config.dynamic_catalog.max_servers {
                 return Err(RegistrationError(
                     "Local catalog limit reached. Disconnect an existing local MCP to free a slot.",
                 )

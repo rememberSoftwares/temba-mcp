@@ -6,7 +6,7 @@ Remote MCP servers must already exist and be accessible from those machines.
 
 The catalog uses a container image and the [temba-catalog](../chart/temba-catalog) chart.
 Catalog and client versions evolve independently: currently,
-the catalog is at **1.3.3** and the client at **1.4.12**.
+the catalog is at **1.3.3** and the client at **2.2.0**.
 
 ## Prerequisites
 
@@ -98,11 +98,13 @@ Keep this port forwarding session open:
 kubectl --context minikube -n temba port-forward service/temba 18080:8080
 ```
 
-In the TOML file on the user's machine:
+In the YAML file on the user's machine:
 
-```toml
-catalog_url = "http://127.0.0.1:18080"
-allow_insecure_http = true
+```yaml
+allow_insecure_http: true
+catalogs:
+  - id: team
+    url: http://127.0.0.1:18080
 ```
 
 To check public definitions:
@@ -111,7 +113,7 @@ To check public definitions:
 curl --fail http://127.0.0.1:18080/v1/catalog
 ```
 
-The TOML flag is enough to reach the catalog through this port forwarding session.
+The YAML flag is enough to reach the catalog through this port forwarding session.
 `security.allowInsecureHttp` in the chart applies to **declared MCP endpoints**:
 enable it if those definitions use HTTP, whether local or remote.
 The local client must also enable `allow_insecure_http` to use those definitions.
@@ -139,7 +141,7 @@ Adjust the controller, namespace, domain, and TLS Secret names
 to your cluster. The TLS Secret must be supplied through your usual certificate management process.
 The chart's Ingress exposes `/v1`, used by both the user API and the admin API.
 
-Then share `https://catalogue.example.com` with users as their `catalog_url`.
+Then share `https://catalogue.example.com` with users as a `catalogs` entry’s `url`.
 Each remote MCP server must also be accessible from their machines.
 The catalog does not proxy their calls.
 
@@ -164,19 +166,24 @@ Old keys are rejected. To update an installation from earlier versions:
 | Old setting | Current setting |
 | --- | --- |
 | Global `auth` | `catalogueAuth` |
+| Client `temba.toml` | `temba.yaml`; the client now accepts YAML only |
+| `catalog_url` or `[[catalogs]]` in TOML | YAML `catalogs` list with `id` and `url` |
+| `[local_catalog]` with `enabled` / `max_servers` | YAML `dynamic_catalog` |
+| `[tool.<catalog>.<id>]` | `tools.<id>` inside the matching `catalogs` entry |
+| Executable `temba-client` | `temba` (package remains `temba-client`) |
 | `catalogAccess` | An `access` rule |
 | `adminApi.mutable` | `adminApi.readOnly`, with inverted logic |
 | `auth.type` on an MCP server | `oauth` and/or `headers` |
 | `url` on an MCP definition | `endpoint` |
 | Display `name` on an MCP definition | Remove it; keep the existing unique `id` |
 | `headers[].prefix` | Complete value supplied by the client |
-| `[credentials.<id>]` in TOML | `[tool.<id>]` and `[tool.<id>.headers]` |
-| Implicit ENV reference | Explicit `{ env = "VARIABLE" }` object |
+| Credential alias keys in client headers | Actual HTTP header names in `headers` or `headersFromEnv[].name` |
+| `{ env = "VARIABLE" }` in TOML | `headersFromEnv` list with `name` and `valueFrom.envVarRef.name` |
 | `allow_loopback_http` / `allow_localhost_http` in TOML | `allow_insecure_http` (also permits remote HTTP) |
 | `refresh_seconds` in TOML | `refresh_minutes`, default `60`, range `1..1440` |
 | `security.allowLoopbackHttp` in Helm | `security.allowInsecureHttp` |
 
-Before using client 1.4.9, update the catalog to 1.3.2 and remove server-level `name` from Helm values, raw catalog files and persisted API definitions. Keep the existing IDs so TOML mappings and tool IDs remain stable. Header `name` fields are unchanged.
+Before using client 1.4.9, update the catalog to 1.3.2 and remove server-level `name` from Helm values, raw catalog files and persisted API definitions. Keep the existing IDs so client mappings and tool IDs remain stable. Header `name` fields are unchanged.
 
 The catalog format is `schemaVersion: 2`. The Python gateway, Redis, token envelopes,
 and old HTTP MCP routes are no longer part of the architecture.

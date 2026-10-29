@@ -1,5 +1,9 @@
 The release serves a REST catalog, not an MCP gateway.
-Configure OpenCode with the local temba-client stdio command.
+Configure OpenCode with the local temba stdio command.
 For a local catalog: kubectl port-forward service/{{ .Release.Name }} 18080:{{ .Values.service.port }}
-Then set catalog_url = "http://127.0.0.1:18080" and allow_insecure_http = true in the local TOML.
-Remote MCP URLs must be reachable from the user's workstation (HTTPS ingress).
+Then configure temba.yaml:
+  allow_insecure_http: true
+  catalogs:
+    - id: team
+      url: http://127.0.0.1:18080
+Remote MCP URLs must be reachable from the user's workstation (HTTPS by default).

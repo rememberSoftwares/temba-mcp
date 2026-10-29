@@ -53,23 +53,32 @@ accessible from client machines.
 
 ## Client configuration
 
-The local `temba.toml` file contains only token references:
+The local `temba.yaml` file contains only token references:
 
-```toml
-[tool.jira-token]
-expected_endpoint = "http://127.0.0.1:18081/mcp"
-[tool.jira-token.headers]
-token = { env = "JIRA_TOKEN" }
-
-[tool.gitlab]
-expected_endpoint = "http://127.0.0.1:18082/mcp"
-[tool.gitlab.headers]
-token = { env = "GITLAB_TOKEN" }
+```yaml
+catalogs:
+  - id: team
+    url: https://catalogue.example.com
+    tools:
+      jira-token:
+        expected_endpoint: http://127.0.0.1:18081/mcp
+        headersFromEnv:
+          - name: X-Jira-Token
+            valueFrom:
+              envVarRef:
+                name: JIRA_TOKEN
+      gitlab:
+        expected_endpoint: http://127.0.0.1:18082/mcp
+        headersFromEnv:
+          - name: X-Gitlab-Token
+            valueFrom:
+              envVarRef:
+                name: GITLAB_TOKEN
 ```
 
 Set these two variables in the environment that launches OpenCode. The values
 are raw tokens, without the `Bearer ` prefix. A local literal value in
-the TOML file also works. `expected_endpoint` restricts the allowed destination
+the YAML file also works. `expected_endpoint` restricts the allowed destination
 for sending the token.
 
 Labels are a local filter, separate from Keycloak permissions: `labels = []`
@@ -77,7 +86,7 @@ includes only MCP servers without labels (GitLab for `/dev`, Jira OAuth for `/pm
 `labels = ["support"]` adds Jira with a token; `labels = ["tech"]` adds DeepWiki.
 To include both, use `labels = ["support", "tech"]`. MCP servers without
 labels remain visible. If an MCP server has multiple labels, all must be
-enabled in the TOML file. Even though DeepWiki is public, it therefore requires the `tech` label
+enabled in the YAML file. Even though DeepWiki is public, it therefore requires the `tech` label
 to be included by the local client.
 
 Without a service token, an allowed MCP server is still listed with the

@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::{fmt::Write, sync::Arc, time::Duration};
 use temba_core::Catalog;
 
-use super::{config::Config, oauth};
+use super::{config::SourceConfig, oauth};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,7 +32,7 @@ pub async fn bootstrap(http: &reqwest::Client, base: &str) -> Result<Option<oaut
 
 async fn fetch(
     http: &reqwest::Client,
-    config: &Config,
+    config: &SourceConfig,
     session: Option<&oauth::Session>,
 ) -> Result<Catalog> {
     let mut request = http
@@ -47,7 +47,7 @@ async fn fetch(
     Ok(catalog)
 }
 
-pub async fn run(config: &Config, json: bool) -> Result<()> {
+pub async fn load(config: &SourceConfig) -> Result<Catalog> {
     let http = super::http()?;
     let session: Option<Arc<oauth::Session>> = match bootstrap(&http, &config.catalog_url).await? {
         None => None,
@@ -74,11 +74,42 @@ pub async fn run(config: &Config, json: bool) -> Result<()> {
     if let Some(session) = session {
         session.clear().await;
     }
-    let catalog = result?;
+    result
+}
+
+pub async fn run(config: super::config::Config, json: bool) -> Result<()> {
+    let sources = config.into_sources();
+    ensure!(!sources.is_empty(), "Configure at least one catalogs entry");
+    let mut rows = vec![];
+    let mut text = String::new();
+    let mut healthy = 0;
+    for (id, config) in sources {
+        match load(&config).await {
+            Ok(catalog) => {
+                healthy += 1;
+                let _ = writeln!(text, "Catalog: {id}");
+                text.push_str(&render(&catalog, &id));
+                rows.push(serde_json::json!({"id":id,"url":config.catalog_url,"status":"ready","catalog":catalog}));
+            }
+            Err(error) => {
+                eprintln!("Catalog {id}: unavailable: {error}");
+                rows.push(
+                    serde_json::json!({"id":id,"url":config.catalog_url,"status":"unavailable"}),
+                );
+                let _ = writeln!(text, "Catalog {id}: unavailable");
+            }
+        }
+    }
+    ensure!(healthy > 0, "No catalog could be loaded");
     if json {
-        println!("{}", serde_json::to_string_pretty(&catalog)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"partial":healthy != rows.len(),"catalogs":rows})
+            )?
+        );
     } else {
-        print!("{}", render(&catalog));
+        print!("{text}");
     }
     Ok(())
 }
@@ -96,7 +127,7 @@ fn terminal(value: &str) -> String {
     output
 }
 
-fn render(catalog: &Catalog) -> String {
+fn render(catalog: &Catalog, namespace: &str) -> String {
     let mut output = format!("Temba catalog — {} MCP server(s)\n", catalog.servers.len());
     if catalog.servers.is_empty() {
         output.push_str("No MCP servers are visible to this user.\n");
@@ -104,7 +135,7 @@ fn render(catalog: &Catalog) -> String {
     for server in &catalog.servers {
         let _ = writeln!(
             output,
-            "\n{}\n  Endpoint: {}",
+            "\n{namespace}.{}\n  Endpoint: {}",
             server.id,
             terminal(&server.endpoint)
         );
@@ -172,13 +203,14 @@ fn render(catalog: &Catalog) -> String {
         if !server.headers.is_empty() {
             output.push_str("  Headers:\n");
             for header in &server.headers {
-                if let Some(reference) = &header.credential {
+                if header.credential.is_some() {
                     let _ = writeln!(
                         output,
-                        "    {} <- tool.{}.headers.{} ({})",
+                        "    {} <- catalogs[id={}].tools.{}.headers.{} or headersFromEnv ({})",
                         header.name,
+                        namespace,
                         server.id,
-                        reference,
+                        header.name,
                         if header.mandatory {
                             "required"
                         } else {
@@ -222,13 +254,13 @@ mod tests {
 
     #[test]
     fn terminal_output_explains_configuration_and_escapes_control_sequences() {
-        let output = render(&example());
+        let output = render(&example(), "team");
         for text in [
             "service",
             "https://mcp.example/mcp",
             "Labels: support",
-            "X-Key <- tool.service.headers.api_token (required)",
-            "X-Tenant <- tool.service.headers.tenant (optional)",
+            "X-Key <- catalogs[id=team].tools.service.headers.X-Key or headersFromEnv (required)",
+            "X-Tenant <- catalogs[id=team].tools.service.headers.X-Tenant or headersFromEnv (optional)",
             "X-Client = \"temba\" (public)",
             "OAuth: enabled",
             "automatic public discovery",
@@ -243,7 +275,7 @@ mod tests {
             revision: String::new(),
             servers: vec![],
         };
-        assert!(render(&empty).contains("No MCP servers"));
+        assert!(render(&empty, "team").contains("No MCP servers"));
     }
 
     #[tokio::test]
@@ -281,7 +313,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let mut config: Config = toml::from_str(&format!("catalog_url='{base}'\nallow_insecure_http=true\nlabels=[]\n[tool.service]\nexpected_endpoint='https://mcp.example/mcp'\n[tool.service.headers]\napi_token='never-send-or-print-this'")).unwrap();
+        let mut config: SourceConfig = serde_yaml_ng::from_str(&format!("catalog_url: {base}\nallow_insecure_http: true\nlabels: []\ntool:\n  service:\n    expected_endpoint: https://mcp.example/mcp\n    headers:\n      Authorization: never-send-or-print-this\n")).unwrap();
         config.validate().unwrap();
         let http = super::super::http().unwrap();
         assert!(bootstrap(&http, &base).await.unwrap().is_none());
@@ -295,7 +327,7 @@ mod tests {
                 .unwrap()
                 .contains("never-send-or-print-this")
         );
-        assert!(!render(&catalog).contains("never-send-or-print-this"));
+        assert!(!render(&catalog, "team").contains("never-send-or-print-this"));
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         server.abort();
     }

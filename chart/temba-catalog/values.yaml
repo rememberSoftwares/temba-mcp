@@ -29,7 +29,7 @@ adminApi:
 security:
   # Accepte les endpoints MCP et origines OAuth en HTTP, locaux ou distants.
   # Le client doit aussi activer allow_insecure_http. Ne configure pas l'Ingress.
-  # Pour le port-forward du catalogue, utiliser allow_insecure_http dans le TOML client.
+  # Pour le port-forward du catalogue, utiliser allow_insecure_http dans le YAML client.
   allowInsecureHttp: false
   networkPolicy:
     # Refus par défaut en entrée/sortie, puis autorisations explicites ci-dessous.
