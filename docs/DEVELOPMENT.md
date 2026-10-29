@@ -17,6 +17,9 @@
 ```
 
 The workspace requires **Rust 1.99 or later**, as specified in `Cargo.toml`.
+CI explicitly installs Rust **1.99.1** for checks and every platform build,
+including Maturin's Linux container. The shared `RUST_TOOLCHAIN` workflow setting
+controls this version; preinstalled runner toolchains are not used.
 Helm can check the chart; `uv` provides the `uvx` launcher used for distribution.
 
 ## Checking changes
