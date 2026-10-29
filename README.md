@@ -1,7 +1,7 @@
 # Temba
 
-STOP WASTING TOKENS with MCP server that you won't use!  
-Temba is a **catalog** of MCP servers that let LLMs discover and use tools only when it needs them.  
+Stop WAISTING tokens with MCP servers that you won't use!  
+Temba is a **catalog** of MCP servers that let LLMs discover and use tools only when needed.  
 
 [Getting started](#getting-started) · [Deploying the catalog](#deploying-the-catalog) · [Documentation](#documentation)
 
