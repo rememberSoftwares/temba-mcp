@@ -9,12 +9,14 @@ permissions:
   contents: read
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Verify required CI scripts are committed
+        run: git ls-files --error-unmatch scripts/package_client_release.py scripts/test_release.py scripts/check_chart.py
       - name: Validate version and release tag
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -25,7 +27,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: python -m unittest discover -s scripts -p 'test_release.py'
-      - uses: azure/setup-helm@v4.3.0
+      - uses: azure/setup-helm@v5
       - run: helm lint chart/temba-catalog
       - run: python3 scripts/check_chart.py
   wheels:
@@ -34,17 +36,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu}
+          - {os: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
           - {os: macos-15, target: aarch64-apple-darwin}
           - {os: macos-15-intel, target: x86_64-apple-darwin}
           - {os: windows-latest, target: x86_64-pc-windows-msvc}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       - name: Install Windows assembler
         if: runner.os == 'Windows'
         run: choco install nasm --no-progress -y
@@ -62,7 +64,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: python scripts/package_client_release.py package --target "$TARGET"
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.target }}
           path: release-assets/*
@@ -70,18 +72,18 @@ jobs:
   release:
     if: github.ref_type == 'tag'
     needs: [rust, wheels]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     concurrency:
       group: release-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: release-*
           path: release-assets
