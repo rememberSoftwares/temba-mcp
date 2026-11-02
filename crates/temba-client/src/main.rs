@@ -7,7 +7,7 @@ mod oauth_network;
 mod search;
 mod serve;
 mod transport;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use rmcp::{
     ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt,
@@ -56,7 +56,8 @@ where
 #[command(
     name = "temba",
     version,
-    about = "Local MCP client and catalog CLI; OAuth credentials stay in memory"
+    about = "Local MCP client and catalog CLI; OAuth credentials stay in memory",
+    after_help = "Without a subcommand, Temba runs in MCP stdio mode for AI clients (OpenCode and other MCP hosts). It waits for protocol requests on stdin and does not return to the prompt until stopped.\n\nFor terminal use:\n  temba catalog    List accessible MCP definitions, then exit\n  temba serve      Host the configured local catalog until stopped\n\nUse --config to select your YAML file. Press Ctrl+C to stop a running process."
 )]
 struct Args {
     #[arg(
@@ -71,9 +72,9 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// List all MCP definitions visible to your user, before local label filtering.
-    /// Serve the local IaC catalog without a management API.
+    /// Host the configured local catalog until stopped, without a management API.
     Serve,
+    /// List accessible MCP definitions before local label filtering, then exit.
     Catalog {
         /// Print the complete catalog as JSON instead of terminal text.
         #[arg(long)]
@@ -1233,7 +1234,16 @@ impl ServerHandler for Handler {
 async fn main() -> Result<()> {
     temba_core::harden_process();
     let args = Args::parse();
-    let source = Zeroizing::new(tokio::fs::read_to_string(args.config).await?);
+    let source = Zeroizing::new(
+        tokio::fs::read_to_string(&args.config)
+            .await
+            .with_context(|| {
+                format!(
+                    "Cannot read configuration file '{}'. Use --config /path/to/temba.yaml or set TEMBA_CONFIG; the default is temba.yaml in the current working directory",
+                    args.config
+                )
+            })?,
+    );
     let mut config: config::Config = serde_yaml_ng::from_str(source.as_str()).map_err(|_| {
         anyhow::anyhow!("Invalid YAML; check catalogs, tools, headers and headersFromEnv")
     })?;
@@ -1242,7 +1252,12 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::Catalog { json }) => catalog::run(config, json).await,
         Some(Command::Serve) => serve::run(config).await,
-        None => federation::run(config).await,
+        None => {
+            eprintln!(
+                "Starting Temba in MCP stdio mode for AI clients.\nWaiting for MCP requests on stdin; stdout is reserved for protocol messages.\nFor terminal use, add 'catalog' to list accessible MCPs and exit, or 'serve' to host the local catalog. Press Ctrl+C to stop."
+            );
+            federation::run(config).await
+        }
     }
 }
 

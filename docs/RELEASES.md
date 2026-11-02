@@ -41,6 +41,17 @@ URL; it identifies the version, operating system and architecture.
 **Without uv:** extract the native archive and run `./temba --config ./temba.yaml`
 on Linux/macOS, or `.\temba.exe --config .\temba.yaml` in Windows PowerShell.
 No Rust compiler or Python installation is needed for the native executable.
+Use `./temba --version` (or `.\temba.exe --version`) to check the binary without
+loading a configuration. Other commands read `temba.yaml` from the current
+working directory unless `--config` or `TEMBA_CONFIG` specifies a different file.
+The configuration is not included in the native archive; start from
+[temba.example.yaml](../temba.example.yaml).
+
+`temba catalog` lists accessible MCP definitions; `temba serve` starts the local
+catalog. Running without a subcommand starts the stdio MCP process used by your
+AI client, rather than a terminal listing. The startup explanation is written to
+stderr; stdout remains reserved for MCP protocol messages. `temba -h` explains
+these modes without loading a configuration.
 
 For downloaded assets, Linux users can check the published digests with
 `sha256sum --check --ignore-missing SHA256SUMS`; macOS provides `shasum -a 256` and

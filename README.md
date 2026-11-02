@@ -7,6 +7,10 @@ Temba is a **catalog** of MCP servers that let LLMs discover and use tools only 
 
 ## Why Temba?
 
+Using the official Jira MCP will add 20k tokens to your context from the start and disturb the LLM.  
+You may not even use these MCP in every conversations.  
+The same applies with all MCPs that ar loaded by default in your context. Do you really need this Gitlab MCP ? You're paying for its token .
+
 - **Don't waste tokens** : The catalog's search feature prevents loading all your MCPs in the context from the start.
 - **Manage tools access using Keycloak** : Use keycloak groups to assign tools to users.
 - **Simple catalog management** : Use Infra As Code or REST API to manage catalog entries.
