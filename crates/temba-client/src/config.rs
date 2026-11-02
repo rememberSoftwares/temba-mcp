@@ -7,8 +7,6 @@ use zeroize::Zeroizing;
 pub struct Config {
     #[serde(default)]
     pub catalogs: Vec<CatalogSource>,
-    #[serde(default)]
-    pub labels: Vec<String>,
     #[serde(default = "refresh")]
     pub refresh_minutes: u64,
     #[serde(default = "limit")]
@@ -25,6 +23,8 @@ pub struct Config {
 pub struct CatalogSource {
     pub id: String,
     pub url: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
     #[serde(default, deserialize_with = "unique_map")]
     pub tools: BTreeMap<String, ToolConfig>,
 }
@@ -78,6 +78,11 @@ impl Config {
             let url = temba_core::endpoint(&source.url, self.allow_insecure_http)?;
             ensure!(url.query().is_none(), "Catalog URL cannot have a query");
             source.url = source.url.trim_end_matches('/').to_owned();
+            source.labels = source
+                .labels
+                .iter()
+                .map(|l| l.trim().to_lowercase())
+                .collect();
         }
         for source in &self.catalogs {
             for (server, tool) in &source.tools {
@@ -85,11 +90,6 @@ impl Config {
                 validate_tool(tool, self.allow_insecure_http)?;
             }
         }
-        self.labels = self
-            .labels
-            .iter()
-            .map(|l| l.trim().to_lowercase())
-            .collect();
         if let Some(local) = &mut self.local_catalog {
             ensure!(
                 local.listen.port() != 0,
@@ -130,6 +130,7 @@ impl Config {
             self.catalogs.push(CatalogSource {
                 id: "local".into(),
                 url: format!("http://{address}"),
+                labels: Vec::new(),
                 tools: local.tools,
             });
         }
@@ -139,7 +140,7 @@ impl Config {
                 let config = SourceConfig {
                     namespace: source.id.clone(),
                     catalog_url: source.url,
-                    labels: self.labels.clone(),
+                    labels: (source.id != "local").then_some(source.labels),
                     refresh_minutes: self.refresh_minutes,
                     search_limit: self.search_limit,
                     allow_insecure_http: self.allow_insecure_http,
@@ -154,7 +155,7 @@ impl Config {
         SourceConfig {
             namespace: "dynamic".into(),
             catalog_url: "https://unused.invalid".into(),
-            labels: self.labels.clone(),
+            labels: None,
             refresh_minutes: self.refresh_minutes,
             search_limit: self.search_limit,
             allow_insecure_http: self.allow_insecure_http,
@@ -189,8 +190,8 @@ pub struct SourceConfig {
     #[serde(default)]
     pub namespace: String,
     pub catalog_url: String,
-    #[serde(default)]
-    pub labels: Vec<String>,
+    #[serde(default = "remote_labels")]
+    pub labels: Option<Vec<String>>,
     #[serde(default = "refresh")]
     pub refresh_minutes: u64,
     #[serde(default = "limit")]
@@ -329,6 +330,9 @@ impl LocalHeader {
         }
     }
 }
+fn remote_labels() -> Option<Vec<String>> {
+    Some(Vec::new())
+}
 fn refresh() -> u64 {
     60
 }
@@ -349,11 +353,9 @@ impl SourceConfig {
             "search_limit must be between 1 and 50"
         );
         self.catalog_url = self.catalog_url.trim_end_matches('/').to_owned();
-        self.labels = self
-            .labels
-            .iter()
-            .map(|s| s.trim().to_lowercase())
-            .collect();
+        if let Some(labels) = &mut self.labels {
+            *labels = labels.iter().map(|s| s.trim().to_lowercase()).collect();
+        }
         ensure!(
             (1..=64).contains(&self.dynamic_catalog.max_servers),
             "Invalid local catalog limits"
@@ -514,6 +516,50 @@ catalogs:
 #[cfg(test)]
 mod federation_tests {
     use super::*;
+    #[test]
+    fn label_selection_belongs_only_to_each_remote_catalog() {
+        let mut config: Config = serde_yaml_ng::from_str(
+            r#"
+catalogs:
+  - id: first
+    url: https://first.example.com
+    labels: [" Support "]
+  - id: second
+    url: https://second.example.com
+    labels: ["DOCUMENTATION"]
+  - id: defaults
+    url: https://default.example.com
+local_catalog:
+  enabled: true
+  servers:
+    - id: service
+      endpoint: https://mcp.example.com/mcp
+      labels: [private-category]
+      access: {public: true}
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.dynamic_source().labels.is_none());
+        let sources = config.into_sources();
+        assert_eq!(
+            sources[0].1.labels.as_deref(),
+            Some(["support".to_owned()].as_slice())
+        );
+        assert_eq!(
+            sources[1].1.labels.as_deref(),
+            Some(["documentation".to_owned()].as_slice())
+        );
+        assert_eq!(sources[2].1.labels.as_deref(), Some([].as_slice()));
+        assert!(sources[3].1.labels.is_none());
+        for invalid in [
+            "labels: []",
+            "local_catalog: {labels: []}",
+            "dynamic_catalog: {labels: []}",
+        ] {
+            assert!(serde_yaml_ng::from_str::<Config>(invalid).is_err());
+        }
+    }
     #[test]
     fn local_source_is_automatic_and_carries_only_its_own_credentials() {
         let mut config: Config = serde_yaml_ng::from_str(

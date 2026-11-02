@@ -11,13 +11,17 @@ Define the shared options and catalog entries:
 allow_insecure_http: true
 search_limit: 5
 refresh_minutes: 60
-labels: []
 catalogs:
   - id: team
     url: https://catalogue.example.com
+    labels: [support]
   - id: partner
     url: https://partner-catalog.example.com
+    labels: [documentation]
 ```
+
+Each remote catalog selects its own `labels` (default `[]`); the global `labels`
+key is no longer accepted. Local and dynamically added MCPs have no label filter.
 
 Each catalog contributes up to five ranked results. Two catalogs can therefore
 return up to ten tools. A source with fewer matches contributes fewer results.

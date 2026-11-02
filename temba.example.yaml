@@ -2,10 +2,10 @@
 allow_insecure_http: true
 refresh_minutes: 60
 search_limit: 5
-labels: []
 catalogs:
   - id: team
     url: http://127.0.0.1:18080
+    labels: [] # Select labels for this remote catalog only; [] includes unlabelled MCPs.
     # tools:
     #   service:
     #     expected_endpoint: https://mcp.example.com/mcp
@@ -27,6 +27,7 @@ dynamic_catalog:
 # Optional local IaC catalog. Start a separate `temba serve` process.
 # It is included automatically as `local` when enabled and nonempty.
 # No corresponding entry is needed in catalogs. Private tools settings stay local.
+# All local MCPs are available without label selection.
 local_catalog:
   enabled: false
   # listen: "127.0.0.1:8787" # Optional; this is the default

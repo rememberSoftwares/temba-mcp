@@ -74,7 +74,7 @@ struct Args {
 enum Command {
     /// Host the configured local catalog until stopped, without a management API.
     Serve,
-    /// List accessible MCP definitions before local label filtering, then exit.
+    /// List accessible MCP definitions before label filtering, then exit.
     Catalog {
         /// Print the complete catalog as JSON instead of terminal text.
         #[arg(long)]
@@ -290,9 +290,11 @@ impl Local {
             .map(str::to_owned);
         let mut catalog: Catalog = temba_core::http_json(response).await?;
         catalog.validate(self.config.allow_insecure_http)?;
-        catalog
-            .servers
-            .retain(|s| s.labels.iter().all(|l| self.config.labels.contains(l)));
+        if let Some(labels) = &self.config.labels {
+            catalog
+                .servers
+                .retain(|s| s.labels.iter().all(|l| labels.contains(l)));
+        }
         let old = self.servers.read().await.clone();
         let mut next = BTreeMap::new();
         let mut connect = vec![];

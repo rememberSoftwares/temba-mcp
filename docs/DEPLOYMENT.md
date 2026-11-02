@@ -165,6 +165,7 @@ Old keys are rejected. To update an installation from earlier versions:
 
 | Old setting | Current setting |
 | --- | --- |
+| Global client `labels` | `labels` inside each remote `catalogs` entry; no label selection for local/dynamic MCPs |
 | Global `auth` | `catalogueAuth` |
 | Client `temba.toml` | `temba.yaml`; the client now accepts YAML only |
 | `catalog_url` or `[[catalogs]]` in TOML | YAML `catalogs` list with `id` and `url` |

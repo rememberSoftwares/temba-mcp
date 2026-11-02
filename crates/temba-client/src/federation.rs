@@ -326,6 +326,73 @@ mod tests {
         config
     }
     #[tokio::test]
+    async fn remote_label_filters_are_isolated_and_local_has_no_filter() {
+        let definitions = json!({"schemaVersion":2,"servers":[
+            {"id":"plain","endpoint":"https://mcp.invalid/plain","oauth":{}},
+            {"id":"support","endpoint":"https://mcp.invalid/support","labels":["support"],"oauth":{}},
+            {"id":"tech","endpoint":"https://mcp.invalid/tech","labels":["tech"],"oauth":{}},
+            {"id":"both","endpoint":"https://mcp.invalid/both","labels":["support","tech"],"oauth":{}}
+        ]});
+        let router = Router::new().route(
+            "/v1/catalog",
+            get(move || {
+                let definitions = definitions.clone();
+                async move { Json(definitions) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut config: config::Config = serde_yaml_ng::from_str(&format!(
+            r#"
+allow_insecure_http: true
+catalogs:
+  - id: first
+    url: http://{address}
+    labels: [support]
+  - id: second
+    url: http://{address}
+    labels: [tech]
+  - id: defaults
+    url: http://{address}
+local_catalog:
+  enabled: true
+  listen: {address}
+  servers:
+    - id: placeholder
+      endpoint: https://mcp.invalid/mcp
+      access: {{public: true}}
+"#
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let federation = Federation::new(config).unwrap();
+        for (id, expected) in [
+            ("first", vec!["plain", "support"]),
+            ("second", vec!["plain", "tech"]),
+            ("defaults", vec!["plain"]),
+            ("local", vec!["both", "plain", "support", "tech"]),
+        ] {
+            let engine = &federation.sources[id].engine;
+            engine.refresh().await.unwrap();
+            assert_eq!(
+                engine
+                    .servers
+                    .read()
+                    .await
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            if id != "local" {
+                assert!(engine.call("both.__temba_connect__", None).await.is_err());
+            }
+            engine.close().await;
+        }
+        server.abort();
+    }
+    #[tokio::test]
     async fn combines_five_per_catalog_without_id_credential_session_or_failure_collisions() {
         let (a, ae, reject_a, ta) = fixture("first", false).await;
         let (b, be, _, tb) = fixture("second", false).await;

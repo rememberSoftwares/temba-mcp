@@ -81,10 +81,11 @@ are raw tokens, without the `Bearer ` prefix. A local literal value in
 the YAML file also works. `expected_endpoint` restricts the allowed destination
 for sending the token.
 
-Labels are a local filter, separate from Keycloak permissions: `labels = []`
+Labels are a per-catalog client filter, separate from Keycloak permissions.
+Set `labels` inside the relevant remote `catalogs` entry: `labels: []`
 includes only MCP servers without labels (GitLab for `/dev`, Jira OAuth for `/pm`).
-`labels = ["support"]` adds Jira with a token; `labels = ["tech"]` adds DeepWiki.
-To include both, use `labels = ["support", "tech"]`. MCP servers without
+`labels: ["support"]` adds Jira with a token; `labels: ["tech"]` adds DeepWiki.
+To include both, use `labels: ["support", "tech"]`. MCP servers without
 labels remain visible. If an MCP server has multiple labels, all must be
 enabled in the YAML file. Even though DeepWiki is public, it therefore requires the `tech` label
 to be included by the local client.

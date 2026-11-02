@@ -7,19 +7,19 @@ It is read when the process starts.
 ## Basic settings
 
 ```yaml
-labels: []
 refresh_minutes: 60
 search_limit: 5
 catalogs:
   - id: team
     url: https://catalogue.example.com
+    labels: []
 ```
 
 | Option | Purpose | Default |
 | --- | --- | --- |
 | `catalogs[].id` | Unique local catalog alias; used in tool IDs and credential mappings | Required per catalog |
 | `catalogs[].url` | REST catalog URL, without an `/mcp` or `/v1/catalog` suffix | Required per catalog |
-| `labels` | Labels of the MCP servers you choose to include | `[]`: MCP servers without labels |
+| `catalogs[].labels` | Labels selected independently for this remote catalog | `[]`: MCP servers without labels |
 | `refresh_minutes` | Refresh interval for each catalog, between 1 and 1,440 minutes (24 hours) | `60` |
 | `search_limit` | Maximum results per catalog per search, between 1 and 50 | `5` |
 | `allow_insecure_http` | Allows unencrypted HTTP for local and remote destinations; HTTPS certificate checks remain enabled | `false` |
@@ -55,7 +55,7 @@ The default terminal view shows each MCP's ID, endpoint, labels, access rule,
 OAuth settings, and public or expected private headers. A required private header
 is shown with its YAML location, for example `catalogs[id=team].tools.service.headers.Authorization`
 or `headersFromEnv`.
-Local labels do not filter this list, so you can discover available categories.
+Per-catalog label selections do not filter this list, so you can discover available categories.
 
 For JSON containing each catalog’s ID, URL, status and full definitions, plus a `partial` flag:
 
@@ -95,11 +95,18 @@ See [multiple catalogs and the local server](MULTI_CATALOG.md) for the complete 
 
 ## Selecting MCP servers by label
 
-Labels enable categories of MCP servers without changing your permissions.
-To include an MCP server, all of its labels must appear in your list.
-MCP servers without labels remain included.
+Each remote entry in `catalogs` has its own optional `labels` list, defaulting
+to `[]`. To include an MCP server, all of its labels must appear in that catalog's
+list. MCP servers without labels remain included. Labels select categories without
+changing your permissions; selecting `support` in one catalog has no effect on
+another catalog.
 
-| Labels in the YAML file | MCP servers included, among those allowed by the catalog |
+`local_catalog` and `dynamic_catalog` have no label selection: their MCPs are
+available without this filter, even if a server definition contains labels.
+The former root-level `labels` key is rejected. Move it inside each remote
+catalog where you want to keep the same selection.
+
+| Labels in a remote catalog entry | MCP servers included, among those allowed by the catalog |
 | --- | --- |
 | `[]` | Those without any labels |
 | `["support"]` | Those without labels and those labeled only `support` |
@@ -363,7 +370,7 @@ MCP service-a: ready; ready=2/3; pending=[service-b:connecting]
 
 | Symptom | Check |
 | --- | --- |
-| Missing MCP server | Keycloak token groups, local labels, and catalog definition |
+| Missing MCP server | Keycloak token groups, per-catalog labels, and catalog definition |
 | `credentials_required` | `credential` references, nonempty values, and the Temba process environment |
 | Destination rejected | Exact match between `expected_endpoint` and `endpoint`; check the change before approving |
 | OAuth origin rejected | `oauth.allowedOrigins` in the correct definition, central or local |

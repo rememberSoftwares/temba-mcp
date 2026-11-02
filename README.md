@@ -61,10 +61,10 @@ Copy [temba.example.yaml](temba.example.yaml) to a private file named `temba.yam
 the catalog URL and a local alias:
 
 ```yaml
-labels: []
 catalogs:
   - id: team
     url: https://catalogue.example.com
+    labels: []
 ```
 
 Inspect the catalog to find MCP IDs, endpoints, labels and required headers:
@@ -253,9 +253,11 @@ Let's add a Gitlab and Jira MCP. The Gitlab MCP is for developpers and use the l
 catalog:
   servers:
   - id: gitlab
+    labels: [dev]
     description: GitLab tools for project and instance configured on the MCP server.
     endpoint: http://<GITLAB-MCP-URL>/mcp
   - id: jira
+    labels: [pm]
     description: Atlassian remote Jira MCP ; sign in using its browser OAuth flow.
     endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
     oauth: {}
@@ -263,19 +265,21 @@ catalog:
 
 * .yaml on the client desktop for a developer:
 ```yaml
-labels:
-- dev
-
-# Other settings…
+catalogs:
+  - id: team
+    url: https://catalogue.example.com
+    labels:
+      - dev
 ```
 => This client can discover the Gitlab MCP but not Jira.  
 
 * .yaml on the client desktop for a product manager:
 ```yaml
-labels:
-- pm
-
-# Other settings…
+catalogs:
+  - id: team
+    url: https://catalogue.example.com
+    labels:
+      - pm
 ```
 => This client can discover the Jira MCP but not Gitlab  
 
