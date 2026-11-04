@@ -383,11 +383,14 @@ results, with IDs such as `team.service.search` and `local.service.search`.
 Credentials and OAuth sessions stay separate, and an unavailable source does not
 block the others.
 
-`temba serve` exposes the static definitions in `local_catalog` without a management
-API. Set `local_catalog.enabled: true`: when it contains entries, the client
-includes it automatically as `local`. No URL needs to be added to `catalogs`.
-Private headers belong in `local_catalog.tools`; `listen` is optional. The LLM's optional third tool is configured separately in `dynamic_catalog`.
-See [multiple catalogs and local serving](docs/MULTI_CATALOG.md) for the setup.
+Set `local_catalog.enabled: true` to load your own definitions automatically as
+`local`. No separate command or URL in `catalogs` is needed: your AI client starts
+Temba, which manages both remote HTTP MCPs and local `command` / `args` programs.
+HTTP headers belong in `local_catalog.tools`; program credentials use `env` /
+`envFromEnv`. See [local MCP programs](docs/LOCAL_STDIO.md).
+
+The LLM's optional third tool is configured separately in `dynamic_catalog`.
+See [multiple catalogs and local configuration](docs/MULTI_CATALOG.md) for the setup.
 
 ## Let the LLM manage the catalog
 

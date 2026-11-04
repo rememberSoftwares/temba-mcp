@@ -85,13 +85,15 @@ results from healthy sources. Sessions, ETags and credentials are isolated.
 Catalog login callbacks sharing a port are queued; background refresh never opens a browser.
 
 `dynamic_catalog` enables the LLM's temporary `add_mcp` tool.
-`local_catalog` instead declares static IaC definitions served by `temba serve`.
-Set `local_catalog.enabled: true` to include it automatically when it has entries;
-no URL needs to be added to `catalogs`. Its reserved catalog ID is `local`.
-`local_catalog.tools` holds its private headers. `listen` defaults to
-`127.0.0.1:8787` and can be omitted. Run `serve` separately; an occupied port
-produces an explicit error. The flag defaults to `false`.
-See [multiple catalogs and the local server](MULTI_CATALOG.md) for the complete setup.
+`local_catalog` declares your static IaC definitions. Set
+`local_catalog.enabled: true` to load them automatically when Temba starts;
+no additional process or URL in `catalogs` is needed. Its reserved catalog
+ID is `local`. HTTP entries are contacted directly; `command` / `args` entries
+are launched locally by Temba. `local_catalog.tools` holds private HTTP headers;
+program environments belong in `env` / `envFromEnv`.
+See [local MCP programs](LOCAL_STDIO.md).
+The flag defaults to `false`.
+See [multiple catalogs and local configuration](MULTI_CATALOG.md) for the complete setup.
 
 ## Selecting MCP servers by label
 
@@ -368,6 +370,20 @@ They show MCP server names, their states, and connection progress:
 MCP service-a: ready; ready=2/3; pending=[service-b:connecting]
 ```
 
+Configuration errors identify the YAML file, the nearest line and column, and the
+field path (list indices start at zero). For example:
+
+```text
+Configuration 'temba.yaml' near line 12, column 5 at local_catalog.servers[0].access:
+Unknown field 'access'. Remove access from command/args entries; local stdio MCPs do not use catalog access rules.
+```
+
+Type errors show the expected format without echoing the supplied value.
+Validation errors identify the catalog or local MCP entry. Missing process
+variables name the `envFromEnv` reference; executable errors suggest checking
+installation, `PATH`, permissions or `cwd`. HTTP errors distinguish rejected
+credentials, denied access, missing endpoints, rate limits and service failures.
+
 | Symptom | Check |
 | --- | --- |
 | Missing MCP server | Keycloak token groups, per-catalog labels, and catalog definition |
@@ -377,7 +393,7 @@ MCP service-a: ready; ready=2/3; pending=[service-b:connecting]
 | Callback port already in use | Another connection is using this local port; stop the old process or configure another port |
 | Call timeout | Check the result of the remote operation before retrying a write |
 
-The client refreshes the catalog every 60 seconds by default. Removing or
+The client refreshes the catalog every 60 minutes by default. Removing or
 changing a definition closes the old connection. An invalid response
 does not replace the last valid catalog.
 

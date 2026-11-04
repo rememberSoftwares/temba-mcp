@@ -24,13 +24,12 @@ dynamic_catalog:
 
 # The environment variable contains the complete value, e.g. "Bearer …".
 
-# Optional local IaC catalog. Start a separate `temba serve` process.
+# Optional local IaC catalog. Loaded automatically by Temba.
 # It is included automatically as `local` when enabled and nonempty.
 # No corresponding entry is needed in catalogs. Private tools settings stay local.
 # All local MCPs are available without label selection.
 local_catalog:
   enabled: false
-  # listen: "127.0.0.1:8787" # Optional; this is the default
   servers: []
   # servers:
   #   - id: documentation
@@ -49,3 +48,18 @@ local_catalog:
   #         valueFrom:
   #           envVarRef:
   #             name: DOCUMENTATION_TOKEN
+
+  # A local stdio MCP:
+  # Add to the servers list above, instead of endpoint:
+  #   - id: workspace
+  #     command: /absolute/path/to/my-mcp
+  #     args: ["--directory", "/absolute/path/to/workspace"]
+  #     cwd: /absolute/path/to/workspace
+  #     timeoutSeconds: 60
+  #     env:
+  #       APPLICATION_MODE: "development"
+  #     envFromEnv:
+  #       - name: API_TOKEN
+  #         valueFrom:
+  #           envVarRef:
+  #             name: WORKSPACE_API_TOKEN

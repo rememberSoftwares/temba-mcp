@@ -357,7 +357,6 @@ catalogs:
     url: http://{address}
 local_catalog:
   enabled: true
-  listen: {address}
   servers:
     - id: placeholder
       endpoint: https://mcp.invalid/mcp
@@ -366,6 +365,7 @@ local_catalog:
         ))
         .unwrap();
         config.validate().unwrap();
+        config.local_catalog.as_mut().unwrap().address = address;
         let federation = Federation::new(config).unwrap();
         for (id, expected) in [
             ("first", vec!["plain", "support"]),

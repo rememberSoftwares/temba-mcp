@@ -1,4 +1,4 @@
-# Multiple catalogs and a local IaC server
+# Multiple catalogs and a local IaC catalog
 
 One local `temba` process can query several catalogs. The AI client still exposes
 only `tool_search`, `call_tool`, and optionally `add_mcp`.
@@ -61,14 +61,13 @@ is still occupied after ten seconds, the queued source waits for another tool
 request instead of opening a browser much later during inactivity. Each identity
 provider still controls its own browser session and group rules.
 
-## Serve static definitions locally
+## Define a local static catalog
 
 Add this section to the same YAML:
 
 ```yaml
 local_catalog:
   enabled: true
-  # listen: "127.0.0.1:8787" # Optional: this is the default
   servers:
     - id: documentation
       endpoint: https://mcp.example.com/mcp
@@ -89,37 +88,17 @@ local_catalog:
               name: DOCUMENTATION_TOKEN
 ```
 
-Start a separate process:
+Set `enabled: true` and start your AI client as usual. Temba loads the local
+catalog automatically as `local`: no separate process and no URL in `catalogs`
+are needed. Restart the AI client's Temba process after editing the file.
+Disabled or empty local catalogs are not included; `enabled` defaults to `false`.
 
-```sh
-uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml serve
-```
-
-The server reads its definitions once at startup. Restart it after edits. Clients
-pick up changes on their next `refresh_minutes` tick; restart the client for an
-immediate reload.
-It exposes `GET /v1/bootstrap`, `GET /v1/catalog` (with ETag), and `/healthz`.
-There is no management API, volume, identity provider, or upstream MCP connection.
-Definitions must be public; the server never returns private values from `catalogs[].tools`.
-It binds to loopback by default. Choosing a network-wide listen address exposes
-these public definitions to that network.
-
-When `local_catalog.enabled: true` and at least one server is declared, the
-client automatically includes it as catalog `local`. Do not add its URL to
-`catalogs`; that ID is reserved. Disabled or empty local catalogs are not included.
-`enabled` defaults to `false`. The `serve` process is independent and must stay
-running; `serve` refuses to start if the catalog is disabled.
-
-`listen` is optional and defaults to `127.0.0.1:8787`. The client derives its URL
-from this address. Wildcard listeners (`0.0.0.0` / `::`) are contacted through
-loopback. Choose a fixed nonzero port; if it is occupied, `serve` reports the
-address and exits. Using the automatically configured local HTTP listener does
-not require `allow_insecure_http` and does not allow HTTP MCP endpoints.
-
-Put private headers under `local_catalog.tools`, with the same shape as
-`catalogs[].tools`. Only `servers` is published by `serve`; private tools settings
-are discarded before listening. If the server is stopped, other catalogs remain
-usable and `local` is reported as unavailable.
+HTTP entries are contacted directly from Temba. Local programs (`command` / `args`)
+are managed by the same Temba process through an internal gateway on a free
+loopback port. Each instance has its own catalog and programs. See
+[local MCP programs](LOCAL_STDIO.md). HTTP definitions must be public; the local
+catalog has no identity provider. Private headers belong in `local_catalog.tools`;
+programs use `env` / `envFromEnv`.
 
 ## Keep dynamic additions independent
 

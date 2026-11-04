@@ -47,8 +47,8 @@ working directory unless `--config` or `TEMBA_CONFIG` specifies a different file
 The configuration is not included in the native archive; start from
 [temba.example.yaml](../temba.example.yaml).
 
-`temba catalog` lists accessible MCP definitions; `temba serve` starts the local
-catalog. Running without a subcommand starts the stdio MCP process used by your
+`temba catalog` lists accessible MCP definitions. The local catalog loads
+automatically. Running without a subcommand starts the stdio MCP process used by your
 AI client, rather than a terminal listing. The startup explanation is written to
 stderr; stdout remains reserved for MCP protocol messages. `temba -h` explains
 these modes without loading a configuration.
@@ -66,8 +66,8 @@ PowerShell provides `Get-FileHash -Algorithm SHA256`.
 3. Push a tag matching **`X.Y.Z`**. For the current client version:
 
    ```sh
-   git tag 2.2.3
-   git push origin 2.2.3
+   git tag 2.3.0
+   git push origin 2.3.0
    ```
 
 4. Follow **Actions → Checks, binaries and releases**. After all checks

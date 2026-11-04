@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Verify required CI scripts are committed
-        run: git ls-files --error-unmatch scripts/package_client_release.py scripts/test_release.py scripts/check_chart.py
+        run: git ls-files --error-unmatch scripts/package_client_release.py scripts/test_release.py scripts/check_chart.py crates/temba-client/tests/fixtures/stdio_mcp.py
       - name: Validate version and release tag
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}

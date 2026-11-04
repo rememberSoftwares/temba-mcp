@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
@@ -35,13 +35,14 @@ pub struct StaticCatalog {
     pub enabled: bool,
     #[serde(default, deserialize_with = "unique_map")]
     pub tools: BTreeMap<String, ToolConfig>,
-    #[serde(default = "listen")]
-    pub listen: std::net::SocketAddr,
+    // Assigned by the local runtime before catalog I/O. Not a YAML option.
+    #[serde(skip, default = "runtime_address")]
+    pub address: std::net::SocketAddr,
     #[serde(default)]
-    pub servers: Vec<temba_core::Server>,
+    pub servers: Vec<crate::local_server::LocalServer>,
 }
-fn listen() -> std::net::SocketAddr {
-    "127.0.0.1:8787".parse().unwrap()
+fn runtime_address() -> std::net::SocketAddr {
+    "127.0.0.1:0".parse().unwrap()
 }
 fn id(value: &str) -> bool {
     !value.is_empty()
@@ -67,15 +68,23 @@ impl Config {
         );
         ensure!(
             (1..=64).contains(&self.dynamic_catalog.max_servers),
-            "Invalid dynamic catalog limit"
+            "dynamic_catalog.max_servers must be between 1 and 64"
         );
         let mut ids = std::collections::HashSet::new();
-        for source in &mut self.catalogs {
+        for (index, source) in self.catalogs.iter_mut().enumerate() {
             ensure!(
-                id(&source.id) && source.id != "local" && ids.insert(source.id.clone()),
-                "Invalid or duplicate catalog id; local is reserved for local_catalog"
+                id(&source.id),
+                "catalogs[{index}].id: use 1–64 letters, digits, hyphens or underscores, without a leading __"
             );
-            let url = temba_core::endpoint(&source.url, self.allow_insecure_http)?;
+            ensure!(
+                source.id != "local",
+                "catalogs[{index}].id: local is reserved for local_catalog; choose another ID"
+            );
+            ensure!(
+                ids.insert(source.id.clone()),
+                "catalogs[{index}].id: duplicate catalog ID; each catalogs[] entry needs a unique ID"
+            );
+            let url = temba_core::endpoint(&source.url, self.allow_insecure_http).with_context(|| format!("catalogs[{index}].url: invalid catalog URL; use HTTPS, or explicitly enable allow_insecure_http for HTTP"))?;
             ensure!(url.query().is_none(), "Catalog URL cannot have a query");
             source.url = source.url.trim_end_matches('/').to_owned();
             source.labels = source
@@ -84,49 +93,60 @@ impl Config {
                 .map(|l| l.trim().to_lowercase())
                 .collect();
         }
-        for source in &self.catalogs {
+        for (index, source) in self.catalogs.iter().enumerate() {
             for (server, tool) in &source.tools {
                 ensure!(id(server), "Invalid MCP id in catalog tools");
-                validate_tool(tool, self.allow_insecure_http)?;
+                validate_tool(tool, self.allow_insecure_http).with_context(|| {
+                    format!("catalogs[{index}].tools.{}", server.escape_debug())
+                })?;
             }
         }
         if let Some(local) = &mut self.local_catalog {
-            ensure!(
-                local.listen.port() != 0,
-                "local_catalog.listen needs a fixed, nonzero port"
-            );
             for (server, tool) in &local.tools {
                 ensure!(id(server), "Invalid MCP id in local_catalog.tools");
-                validate_tool(tool, self.allow_insecure_http)?;
+                validate_tool(tool, self.allow_insecure_http)
+                    .with_context(|| format!("local_catalog.tools.{}", server.escape_debug()))?;
+            }
+            for (index, server) in local.servers.iter_mut().enumerate() {
+                server
+                    .validate(local.address, self.allow_insecure_http)
+                    .with_context(|| format!("local_catalog.servers[{index}]"))?;
             }
             let mut catalog = temba_core::Catalog {
                 schema_version: 2,
                 revision: String::new(),
-                servers: std::mem::take(&mut local.servers),
+                servers: local
+                    .servers
+                    .iter()
+                    .map(|s| s.public_definition(local.address))
+                    .collect(),
             };
-            catalog.validate(self.allow_insecure_http)?;
-            ensure!(
-                catalog.servers.iter().all(|s| s.access.public),
-                "The local static catalog has no identity provider; its definitions must use public access"
-            );
-            local.servers = catalog.servers;
+            catalog.validate(true).context("local_catalog.servers: invalid MCP definitions (IDs must be unique across HTTP and stdio entries)")?;
+            for server in &local.servers {
+                if let crate::local_server::LocalServer::Stdio(server) = server {
+                    ensure!(
+                        !local.tools.contains_key(&server.id),
+                        "Configure stdio credentials in env/envFromEnv, not local_catalog.tools"
+                    );
+                }
+            }
         }
         Ok(())
     }
     pub fn into_sources(mut self) -> Vec<(String, SourceConfig)> {
+        let mut local_stdio_endpoints = std::collections::HashSet::new();
         if let Some(local) = self
             .local_catalog
             .take()
             .filter(|c| c.enabled && !c.servers.is_empty())
         {
-            let mut address = local.listen;
-            if address.ip().is_unspecified() {
-                address.set_ip(if address.is_ipv4() {
-                    std::net::Ipv4Addr::LOCALHOST.into()
-                } else {
-                    std::net::Ipv6Addr::LOCALHOST.into()
-                });
-            }
+            let address = local.address;
+            local_stdio_endpoints = local
+                .servers
+                .iter()
+                .filter(|s| matches!(s, crate::local_server::LocalServer::Stdio(_)))
+                .map(|s| s.public_definition(local.address).endpoint)
+                .collect();
             self.catalogs.push(CatalogSource {
                 id: "local".into(),
                 url: format!("http://{address}"),
@@ -144,6 +164,11 @@ impl Config {
                     refresh_minutes: self.refresh_minutes,
                     search_limit: self.search_limit,
                     allow_insecure_http: self.allow_insecure_http,
+                    local_stdio_endpoints: if source.id == "local" {
+                        local_stdio_endpoints.clone()
+                    } else {
+                        Default::default()
+                    },
                     tool: source.tools,
                     dynamic_catalog: DynamicCatalog::default(),
                 };
@@ -159,6 +184,7 @@ impl Config {
             refresh_minutes: self.refresh_minutes,
             search_limit: self.search_limit,
             allow_insecure_http: self.allow_insecure_http,
+            local_stdio_endpoints: Default::default(),
             tool: BTreeMap::new(),
             dynamic_catalog: DynamicCatalog {
                 enabled: self.dynamic_catalog.enabled,
@@ -189,6 +215,8 @@ fn validate_tool(tool: &ToolConfig, allow_http: bool) -> Result<()> {
 pub struct SourceConfig {
     #[serde(default)]
     pub namespace: String,
+    #[serde(skip)]
+    pub local_stdio_endpoints: std::collections::HashSet<String>,
     pub catalog_url: String,
     #[serde(default = "remote_labels")]
     pub labels: Option<Vec<String>>,
@@ -217,7 +245,7 @@ impl Default for DynamicCatalog {
         }
     }
 }
-fn unique_map<'de, D, V>(d: D) -> std::result::Result<BTreeMap<String, V>, D::Error>
+pub(crate) fn unique_map<'de, D, V>(d: D) -> std::result::Result<BTreeMap<String, V>, D::Error>
 where
     D: Deserializer<'de>,
     V: Deserialize<'de>,
@@ -313,7 +341,9 @@ pub enum LocalHeader {
     Literal(Zeroizing<String>),
     Env { env: String },
 }
-fn secret<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Zeroizing<String>, D::Error> {
+pub(crate) fn secret<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Zeroizing<String>, D::Error> {
     String::deserialize(d).map(Zeroizing::new)
 }
 impl LocalHeader {
@@ -340,6 +370,20 @@ fn limit() -> usize {
     5
 }
 impl SourceConfig {
+    pub fn validate_catalog(&self, catalog: &mut temba_core::Catalog) -> Result<()> {
+        for server in &mut catalog.servers {
+            let local_stdio = self.local_stdio_endpoints.contains(&server.endpoint);
+            if local_stdio {
+                ensure!(
+                    server.oauth.is_none() && server.headers.is_empty(),
+                    "Invalid local stdio gateway definition"
+                );
+            }
+            server.validate(self.allow_insecure_http || local_stdio)?;
+        }
+        catalog.validate(true)
+    }
+
     #[cfg(test)]
     pub fn validate(&mut self) -> Result<()> {
         let u = temba_core::endpoint(&self.catalog_url, self.allow_insecure_http)?;
@@ -584,7 +628,7 @@ local_catalog:
         let sources = config.into_sources();
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[1].0, "local");
-        assert_eq!(sources[1].1.catalog_url, "http://127.0.0.1:8787");
+        assert_eq!(sources[1].1.catalog_url, "http://127.0.0.1:0");
         assert!(!sources[1].1.allow_insecure_http);
         assert!(sources[0].1.tool.is_empty());
         assert_eq!(
@@ -597,23 +641,11 @@ local_catalog:
         );
     }
     #[test]
-    fn local_activation_and_bind_addresses_are_unambiguous() {
+    fn local_activation_is_explicit_and_empty_catalogs_are_not_included() {
         for (options, expected) in [
             ("", None),
             ("enabled: false", None),
-            ("enabled: true", Some("http://127.0.0.1:8787")),
-            (
-                "enabled: true\n  listen: '0.0.0.0:9876'",
-                Some("http://127.0.0.1:9876"),
-            ),
-            (
-                "enabled: true\n  listen: '[::]:9876'",
-                Some("http://[::1]:9876"),
-            ),
-            (
-                "enabled: true\n  listen: '[::1]:9876'",
-                Some("http://[::1]:9876"),
-            ),
+            ("enabled: true", Some("http://127.0.0.1:0")),
         ] {
             let mut config: Config = serde_yaml_ng::from_str(&format!("local_catalog:\n  {options}\n  servers:\n    - id: service\n      endpoint: https://mcp.example.com/mcp\n      access: {{public: true}}\n")).unwrap();
             config.validate().unwrap();
@@ -623,18 +655,17 @@ local_catalog:
         let mut empty: Config = serde_yaml_ng::from_str("local_catalog: {enabled: true}").unwrap();
         empty.validate().unwrap();
         assert!(empty.into_sources().is_empty());
-        for input in [
-            "catalogs: [{id: local, url: 'https://catalog.example.com'}]",
-            "local_catalog: {enabled: true, listen: '127.0.0.1:0'}",
-        ] {
-            let mut config: Config = serde_yaml_ng::from_str(input).unwrap();
-            assert!(config.validate().is_err());
-        }
+        let mut reserved: Config =
+            serde_yaml_ng::from_str("catalogs: [{id: local, url: 'https://catalog.example.com'}]")
+                .unwrap();
+        assert!(reserved.validate().is_err());
     }
     #[test]
     fn validates_namespaces_and_static_definitions_without_legacy_ambiguity() {
         for input in [
             "catalog_url: https://old.example\n",
+            "local_catalog: {listen: '127.0.0.1:8787'}",
+            "local_catalog: {address: '0.0.0.0:8787'}",
             "catalogs:\n- id: same\n  url: https://a.example\n- id: same\n  url: https://b.example\n",
             "catalogs:\n- id: has.dot\n  url: https://a.example\n",
             "catalogs:\n- id: __local\n  url: https://a.example\n",
@@ -648,7 +679,7 @@ local_catalog:
                 "accepted {input}"
             );
         }
-        let mut config: Config = serde_yaml_ng::from_str("search_limit: 5\ncatalogs:\n- id: team\n  url: https://catalog.example/\n  tools:\n    service:\n      expected_endpoint: https://mcp.example\n      headers:\n        X-Key: literal-value\ndynamic_catalog:\n  enabled: true\nlocal_catalog:\n  listen: 127.0.0.1:8787\n  servers:\n  - id: service\n    endpoint: https://mcp.example\n").unwrap();
+        let mut config: Config = serde_yaml_ng::from_str("search_limit: 5\ncatalogs:\n- id: team\n  url: https://catalog.example/\n  tools:\n    service:\n      expected_endpoint: https://mcp.example\n      headers:\n        X-Key: literal-value\ndynamic_catalog:\n  enabled: true\nlocal_catalog:\n  servers:\n  - id: service\n    endpoint: https://mcp.example\n").unwrap();
         config.validate().unwrap();
         assert!(config.dynamic_source().tool.is_empty());
         let sources = config.into_sources();

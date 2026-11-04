@@ -6,7 +6,7 @@ Remote MCP servers must already exist and be accessible from those machines.
 
 The catalog uses a container image and the [temba-catalog](../chart/temba-catalog) chart.
 Catalog and client versions evolve independently: currently,
-the catalog is at **1.3.3** and the client at **2.2.3**.
+the catalog is at **1.3.3** and the client at **2.3.0**.
 
 ## Prerequisites
 

@@ -36,6 +36,8 @@ python3 -m unittest discover -s scripts -p test_release.py
 ```
 
 The chart checks require Python 3 and Helm; no Python dependencies are needed.
+Gateway integration tests also use Python 3 (standard library only) to run a real
+MCP child process. CI installs Python before running the Rust tests.
 
 Tool search runs locally, using BM25 ranking.
 The MCP protocol uses stdout; client diagnostics must stay on stderr.

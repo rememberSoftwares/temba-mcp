@@ -1,11 +1,14 @@
 mod catalog;
 mod config;
+mod diagnostics;
 mod dynamic_catalog;
 mod federation;
+mod local_runtime;
+mod local_server;
 mod oauth;
 mod oauth_network;
 mod search;
-mod serve;
+mod stdio_gateway;
 mod transport;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -57,7 +60,7 @@ where
     name = "temba",
     version,
     about = "Local MCP client and catalog CLI; OAuth credentials stay in memory",
-    after_help = "Without a subcommand, Temba runs in MCP stdio mode for AI clients (OpenCode and other MCP hosts). It waits for protocol requests on stdin and does not return to the prompt until stopped.\n\nFor terminal use:\n  temba catalog    List accessible MCP definitions, then exit\n  temba serve      Host the configured local catalog until stopped\n\nUse --config to select your YAML file. Press Ctrl+C to stop a running process."
+    after_help = "Without a subcommand, Temba runs in MCP stdio mode for AI clients (OpenCode and other MCP hosts). It waits for protocol requests on stdin and does not return to the prompt until stopped.\n\nFor terminal use:\n  temba catalog    List accessible MCP definitions, then exit\n\nUse --config to select your YAML file. Press Ctrl+C to stop a running process."
 )]
 struct Args {
     #[arg(
@@ -72,8 +75,6 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Host the configured local catalog until stopped, without a management API.
-    Serve,
     /// List accessible MCP definitions before label filtering, then exit.
     Catalog {
         /// Print the complete catalog as JSON instead of terminal text.
@@ -289,7 +290,7 @@ impl Local {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let mut catalog: Catalog = temba_core::http_json(response).await?;
-        catalog.validate(self.config.allow_insecure_http)?;
+        self.config.validate_catalog(&mut catalog)?;
         if let Some(labels) = &self.config.labels {
             catalog
                 .servers
@@ -1073,15 +1074,24 @@ fn setup_error(error: &anyhow::Error) -> String {
     }
     if let Some(e) = error.downcast_ref::<reqwest::Error>() {
         if let Some(status) = e.status() {
-            return format!(
-                "OAuth/catalog request rejected (HTTP {status}). Check the provider's client registration configuration."
-            );
+            let hint = match status.as_u16() {
+                400 => "Check OAuth client registration, redirect URI and request configuration",
+                401 => {
+                    "Credentials are missing, expired or rejected; reconnect or check the configured headers"
+                }
+                403 => "Access was denied; check account permissions and catalog group rules",
+                404 => "Endpoint not found; check the catalog URL or MCP endpoint",
+                429 => "Rate limit reached; wait before retrying",
+                500..=599 => "The remote service failed; check its status before retrying",
+                _ => "Check the endpoint configuration and service status",
+            };
+            return format!("HTTP request rejected (HTTP {status}). {hint}.");
         }
         if e.is_timeout() {
-            return "OAuth/catalog request timed out. Check network access to the provider.".into();
+            return "HTTP connection timed out. Check network access to the MCP, catalog or identity provider.".into();
         }
         if e.is_connect() {
-            return "OAuth/catalog provider unreachable. Check DNS, TLS certificates and network access.".into();
+            return "Remote service unreachable. Check DNS, TLS certificates and network access to the configured endpoint.".into();
         }
     }
     if let Some(e) = error.downcast_ref::<std::io::Error>()
@@ -1232,8 +1242,17 @@ impl ServerHandler for Handler {
         }
     }
 }
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Tokio stdin uses a blocking read that cannot be cancelled while the MCP
+    // host keeps its pipe open. Resources are closed by run() before this step.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+async fn run() -> Result<()> {
     temba_core::harden_process();
     let args = Args::parse();
     let source = Zeroizing::new(
@@ -1246,21 +1265,25 @@ async fn main() -> Result<()> {
                 )
             })?,
     );
-    let mut config: config::Config = serde_yaml_ng::from_str(source.as_str()).map_err(|_| {
-        anyhow::anyhow!("Invalid YAML; check catalogs, tools, headers and headersFromEnv")
-    })?;
+    let mut config = diagnostics::config(source.as_str(), &args.config)?;
     drop(source);
-    config.validate()?;
-    match args.command {
-        Some(Command::Catalog { json }) => catalog::run(config, json).await,
-        Some(Command::Serve) => serve::run(config).await,
-        None => {
-            eprintln!(
-                "Starting Temba in MCP stdio mode for AI clients.\nWaiting for MCP requests on stdin; stdout is reserved for protocol messages.\nFor terminal use, add 'catalog' to list accessible MCPs and exit, or 'serve' to host the local catalog. Press Ctrl+C to stop."
-            );
-            federation::run(config).await
+    let local = local_runtime::Embedded::start(&mut config).await?;
+    let work = async {
+        match args.command {
+            Some(Command::Catalog { json }) => catalog::run(config, json).await,
+            None => {
+                eprintln!(
+                    "Starting Temba in MCP stdio mode for AI clients.\nWaiting for MCP requests on stdin; stdout is reserved for protocol messages.\nFor terminal use, add 'catalog' to list accessible MCPs and exit. The configured local catalog starts automatically in MCP mode. Press Ctrl+C to stop."
+                );
+                federation::run(config).await
+            }
         }
+    };
+    let result = tokio::select! { result = work => result, _ = local_runtime::termination_signal() => Ok(()) };
+    if let Some(local) = local {
+        local.close().await?;
     }
+    result
 }
 
 #[cfg(test)]
@@ -1301,12 +1324,7 @@ mod integration_tests {
             Some(Command::Catalog { json: false })
         ));
         assert!(Args::try_parse_from(["temba-client", "--json"]).is_err());
-        assert!(matches!(
-            Args::try_parse_from(["temba", "serve", "--config", "custom.yaml"])
-                .unwrap()
-                .command,
-            Some(Command::Serve)
-        ));
+        assert!(Args::try_parse_from(["temba", "serve"]).is_err());
     }
     use axum::{
         Json, Router,

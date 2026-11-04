@@ -43,7 +43,7 @@ async fn fetch(
     }
     let response = request.send().await?.error_for_status()?;
     let mut catalog: Catalog = temba_core::http_json(response).await?;
-    catalog.validate(config.allow_insecure_http)?;
+    config.validate_catalog(&mut catalog)?;
     Ok(catalog)
 }
 
