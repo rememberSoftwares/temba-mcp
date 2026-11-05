@@ -8,21 +8,21 @@ import tempfile
 chart = Path(__file__).resolve().parents[1] / 'chart' / 'temba-catalog'
 
 def server(identifier, endpoint='https://mcp.example.com/mcp', **extra):
-    return {'id': identifier, 'endpoint': endpoint, **extra}
+    return {'name': identifier, 'endpoint': endpoint, **extra}
 
 cases = [
     ('empty catalog', [], None),
-    ('unique IDs', [server('service-a'), server('service-b')], None),
-    ('case-sensitive IDs', [server('Service'), server('service')], None),
-    ('same ID, different endpoint', [server('same'), server('same', 'https://other.example.com/mcp')], 'Duplicate MCP id "same"'),
-    ('identical entries', [server('same'), server('same')], 'Duplicate MCP id "same"'),
-    ('missing ID', [{'endpoint': 'https://mcp.example.com/mcp'}], '.id must be a nonempty string'),
-    ('numeric ID', [server(123)], '.id must be a nonempty string'),
-    ('empty ID', [server('')], '.id is invalid'),
-    ('ID with spaces', [server('Service A')], '.id is invalid'),
-    ('reserved local ID', [server('__local_reserved')], '.id is invalid'),
-    ('ID too long', [server('a' * 65)], '.id is invalid'),
-    ('legacy display name', [server('service', name='Service')], '.name is no longer supported'),
+    ('unique names', [server('service-a'), server('service-b')], None),
+    ('case-sensitive names', [server('Service'), server('service')], None),
+    ('same name, different endpoint', [server('same'), server('same', 'https://other.example.com/mcp')], 'duplicate MCP name "same"'),
+    ('identical entries', [server('same'), server('same')], 'duplicate MCP name "same"'),
+    ('missing name', [{'endpoint': 'https://mcp.example.com/mcp'}], '.name must be a nonempty string'),
+    ('numeric name', [server(123)], '.name must be a nonempty string'),
+    ('empty name', [server('')], '.name is invalid'),
+    ('name with spaces', [server('Service A')], '.name is invalid'),
+    ('reserved local name', [server('__local_reserved')], '.name is invalid'),
+    ('name too long', [server('a' * 65)], '.name is invalid'),
+    ('removed id', [server('service', id='service')], '.id is no longer supported'),
     ('header name remains supported', [server('service', headers=[{'name': 'X-Tenant', 'value': 'team'}])], None),
 ]
 with tempfile.TemporaryDirectory(prefix='temba-chart-check-') as directory:
@@ -34,5 +34,7 @@ with tempfile.TemporaryDirectory(prefix='temba-chart-check-') as directory:
             assert result.returncode == 0, f'{title}: {result.stderr}'
         else:
             assert result.returncode != 0 and error in result.stderr, f'{title}: expected {error!r}, got {result.stderr}'
+        if error and 'duplicate MCP name' in error:
+            assert 'catalog.servers[1].name' in result.stderr and 'catalog.servers[0].name' in result.stderr
         print(f'PASS: {title}')
 print(f'{len(cases)} Helm catalog checks passed.')

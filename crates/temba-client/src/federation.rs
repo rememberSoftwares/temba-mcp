@@ -3,10 +3,11 @@ use futures::future::join_all;
 use tokio::sync::Notify;
 
 struct Source {
-    id: String,
+    name: String,
     engine: Arc<Local>,
     initialized: AtomicBool,
     changed: Notify,
+    diagnostic: RwLock<Option<String>>,
 }
 impl Source {
     async fn wait(&self) {
@@ -26,6 +27,12 @@ impl Source {
                         Err(error)
                     }
                 };
+                let diagnostic = loaded
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<temba_core::DuplicateMcpName>())
+                    .map(ToString::to_string);
+                *source.diagnostic.write().await = diagnostic.clone();
                 if loaded.is_err() {
                     let mut status = source.engine.catalog_status.write().await;
                     if !matches!(
@@ -36,8 +43,11 @@ impl Source {
                     }
                     eprintln!(
                         "Catalog {}: refresh failed ({}); other catalogs remain usable",
-                        source.id, *status
+                        source.name, *status
                     );
+                    if let Some(message) = diagnostic {
+                        eprintln!("Catalog {}: {message}", source.name);
+                    }
                 }
                 source.initialized.store(true, Ordering::SeqCst);
                 source.changed.notify_waiters();
@@ -69,17 +79,18 @@ impl Federation {
                 Ok((
                     id.clone(),
                     Arc::new(Source {
-                        id,
+                        name: id,
                         engine,
                         initialized: AtomicBool::new(false),
                         changed: Notify::new(),
+                        diagnostic: RwLock::new(None),
                     }),
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         ensure!(
             !sources.is_empty() || dynamic.config.dynamic_catalog.enabled,
-            "Configure catalogs or enable dynamic_catalog"
+            "No MCP sources configured. Run 'temba add catalog', add MCP entries to local_catalog.servers, or enable dynamic registration with 'temba set dynamic_catalog true'"
         );
         Ok(Arc::new(Self { sources, dynamic }))
     }
@@ -101,16 +112,23 @@ impl Federation {
         }
         let responses = join_all(self.sources.values().map(|source| async move {
             source.wait().await;
-            (source.id.clone(), source.engine.search(query, &[]).await)
+            (
+                source.name.clone(),
+                source.engine.search(query, &[]).await,
+                source.diagnostic.read().await.clone(),
+            )
         }))
         .await;
         let mut tools = Vec::new();
         let mut servers = Vec::new();
         let mut catalogs = Vec::new();
         let mut partial = false;
-        for (id, response) in responses {
+        for (id, response, diagnostic) in responses {
             let mut status = response["catalog"].clone();
-            status["id"] = json!(id);
+            status["name"] = json!(id);
+            if let Some(message) = diagnostic {
+                status["error"] = json!(message);
+            }
             status["connect_tool"] = json!(
                 response["catalog_connect_tool"]
                     .as_str()
@@ -284,9 +302,8 @@ mod tests {
         let endpoint = format!("{base}/mcp");
         let reject = Arc::new(AtomicBool::new(false));
         let rejected = reject.clone();
-        let public = json!({"id":"same","endpoint":endpoint,"headers":[{"name":"X-Key","credential":"key","mandatory":true}]});
-        let private =
-            json!({"id":"private","endpoint":endpoint,"access":{"authenticated":true},"oauth":{}});
+        let public = json!({"name":"same","endpoint":endpoint,"headers":[{"name":"X-Key","credential":"key","mandatory":true}]});
+        let private = json!({"name":"private","endpoint":endpoint,"access":{"authenticated":true},"oauth":{}});
         let router = Router::new()
             .route("/v1/bootstrap",get(||async{Json(json!({"schemaVersion":2,"catalogueAuth":null}))}))
             .route("/protected/v1/bootstrap",get(||async{Json(json!({"schemaVersion":2,"catalogueAuth":{"issuer":"https://identity.invalid/realm","clientId":"temba","callbackPort":19877}}))}))
@@ -321,17 +338,59 @@ mod tests {
         (base, endpoint, reject, task)
     }
     fn config(a: &str, ae: &str, b: &str, be: &str) -> config::Config {
-        let mut config:config::Config=serde_yaml_ng::from_str(&format!("allow_insecure_http: true\nsearch_limit: 5\ncatalogs:\n- id: first\n  url: {a}\n  tools:\n    same:\n      expected_endpoint: {ae}\n      headers:\n        X-Key: private-first\n- id: second\n  url: {b}\n  tools:\n    same:\n      expected_endpoint: {be}\n      headers:\n        X-Key: private-second\n- id: offline\n  url: http://127.0.0.1:1\ndynamic_catalog:\n  enabled: true\n")).unwrap();
+        let mut config:config::Config=serde_yaml_ng::from_str(&format!("allow_insecure_http: true\nsearch_limit: 5\ncatalogs:\n- name: first\n  url: {a}\n  tools:\n    same:\n      expected_endpoint: {ae}\n      headers:\n        X-Key: private-first\n- name: second\n  url: {b}\n  tools:\n    same:\n      expected_endpoint: {be}\n      headers:\n        X-Key: private-second\n- name: offline\n  url: http://127.0.0.1:1\ndynamic_catalog:\n  enabled: true\n")).unwrap();
         config.validate().unwrap();
         config
     }
     #[tokio::test]
+    async fn remote_duplicate_names_are_rejected_and_reported_to_the_caller() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/bootstrap",
+                get(|| async { Json(json!({"schemaVersion":2,"catalogueAuth":null})) }),
+            )
+            .route(
+                "/v1/catalog",
+                get(|| async {
+                    Json(json!({"schemaVersion":2,"servers":[
+                        {"name":"repeated","endpoint":"https://first.example/mcp"},
+                        {"name":"repeated","endpoint":"https://second.example/mcp"}
+                    ]}))
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config: config::Config = serde_yaml_ng::from_str(&format!(
+            "allow_insecure_http: true\ncatalogs: [{{name: team, url: 'http://{address}'}}]"
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let federation = Federation::new(config).unwrap();
+        let task = federation.sources["team"].start();
+        tokio::time::timeout(Duration::from_secs(3), federation.sources["team"].wait())
+            .await
+            .unwrap();
+        let response = federation.search("anything", &[]).await;
+        assert_eq!(response["partial"], true);
+        assert!(
+            response["catalogs"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate MCP name 'repeated'")
+        );
+        assert!(response["tools"].as_array().unwrap().is_empty());
+        task.abort();
+        federation.sources["team"].engine.close().await;
+        server.abort();
+    }
+    #[tokio::test]
     async fn remote_label_filters_are_isolated_and_local_has_no_filter() {
         let definitions = json!({"schemaVersion":2,"servers":[
-            {"id":"plain","endpoint":"https://mcp.invalid/plain","oauth":{}},
-            {"id":"support","endpoint":"https://mcp.invalid/support","labels":["support"],"oauth":{}},
-            {"id":"tech","endpoint":"https://mcp.invalid/tech","labels":["tech"],"oauth":{}},
-            {"id":"both","endpoint":"https://mcp.invalid/both","labels":["support","tech"],"oauth":{}}
+            {"name":"plain","endpoint":"https://mcp.invalid/plain","oauth":{}},
+            {"name":"support","endpoint":"https://mcp.invalid/support","labels":["support"],"oauth":{}},
+            {"name":"tech","endpoint":"https://mcp.invalid/tech","labels":["tech"],"oauth":{}},
+            {"name":"both","endpoint":"https://mcp.invalid/both","labels":["support","tech"],"oauth":{}}
         ]});
         let router = Router::new().route(
             "/v1/catalog",
@@ -347,18 +406,18 @@ mod tests {
             r#"
 allow_insecure_http: true
 catalogs:
-  - id: first
+  - name: first
     url: http://{address}
     labels: [support]
-  - id: second
+  - name: second
     url: http://{address}
     labels: [tech]
-  - id: defaults
+  - name: defaults
     url: http://{address}
 local_catalog:
   enabled: true
   servers:
-    - id: placeholder
+    - name: placeholder
       endpoint: https://mcp.invalid/mcp
       access: {{public: true}}
 "#
@@ -398,7 +457,7 @@ local_catalog:
         let (b, be, _, tb) = fixture("second", false).await;
         let federation = Federation::new(config(&a, &ae, &b, &be)).unwrap();
         for source in federation.sources.values() {
-            if source.id == "offline" {
+            if source.name == "offline" {
                 *source.engine.catalog_status.write().await = "catalog_unavailable";
             } else {
                 source.engine.bootstrap().await.unwrap();
@@ -503,7 +562,7 @@ local_catalog:
         config.validate().unwrap();
         let federation = Federation::new(config).unwrap();
         let definition = serde_json::from_value(
-            json!({"id":"temporary", "endpoint":"https://mcp.invalid/mcp", "oauth":{}}),
+            json!({"name":"temporary", "endpoint":"https://mcp.invalid/mcp", "oauth":{}}),
         )
         .unwrap();
         let added = federation
@@ -577,10 +636,11 @@ local_catalog:
         *engine.catalog_session.lock().await = Some(oauth::Session::test_session("rejected-token"));
         *engine.catalog_status.write().await = "authenticated";
         let source = Arc::new(Source {
-            id: "test".into(),
+            name: "test".into(),
             engine,
             initialized: AtomicBool::new(false),
             changed: Notify::new(),
+            diagnostic: RwLock::new(None),
         });
         let task = source.start();
         source.wait().await;

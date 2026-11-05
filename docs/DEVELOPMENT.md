@@ -20,7 +20,7 @@ The workspace requires **Rust 1.99 or later**, as specified in `Cargo.toml`.
 CI explicitly installs Rust **1.99.1** for checks and every platform build,
 including Maturin's Linux container. The shared `RUST_TOOLCHAIN` workflow setting
 controls this version; preinstalled runner toolchains are not used.
-Helm can check the chart; `uv` provides the `uvx` launcher used for distribution.
+Helm can check the chart. Users install the native binary; uv is optional.
 
 ## Checking changes
 
@@ -42,15 +42,27 @@ MCP child process. CI installs Python before running the Rust tests.
 Tool search runs locally, using BM25 ranking.
 The MCP protocol uses stdout; client diagnostics must stay on stderr.
 
-## Building the client
+## Building the native binary
+
+```sh
+cargo build --release --locked -p temba-client
+./target/release/temba --help
+```
+
+The executable is `target/release/temba` (`target/release/temba.exe` on Windows).
+It runs directly, without a Python launcher. Use an absolute binary path in your
+AI client while developing, and rebuild it after source changes.
+
+### Optional wheel packaging
 
 ```sh
 uvx --from 'maturin>=1.9,<2' maturin build --release --locked --out dist
 ```
 
-The result is a wheel in `dist/`, containing the native Rust binary.
-The backend is configured in [pyproject.toml](../pyproject.toml) with `bindings = "bin"`.
-Python handles packaging and launching; the Rust binary handles MCP execution.
+This produces a wheel in `dist/`, using `bindings = "bin"` in
+[pyproject.toml](../pyproject.toml). The CI pipeline also extracts its native
+executable into the standalone release archive. Python is a packaging dependency,
+not a runtime dependency of the native executable.
 
 [CI](../.github/workflows/ci.yaml) currently builds for:
 
@@ -74,10 +86,10 @@ The client and catalog can have different versions.
 For the client, keep the version consistent across `crates/temba-client/Cargo.toml`,
 `pyproject.toml`, and `Cargo.lock`.
 
-Each release must produce a wheel with a **new name and version**.
-Overwriting a wheel at the same path may cause `uvx` to reuse its old cached binary.
-Users must update the path in their AI client, then restart
-the Temba process actually in use, including when it runs behind a persistent server.
+Each release must have a **new version**. Native users replace their installed
+executable and restart the Temba process in their AI client.
+For optional wheel testing, rebuilding the same version at the same path can leave
+a stale uvx environment; use `uvx --no-cache --from ./dist/your-wheel.whl temba`.
 
 See [publishing and installing Temba releases](RELEASES.md) for the exact tag
 commands and download options. The tag must point to committed code containing

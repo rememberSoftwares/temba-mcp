@@ -1,6 +1,6 @@
 # Temba
 
-Stop WAISTING tokens with MCP servers that you won't use!  
+Stop waisting tokens in every chats by using MCP servers that you don't use!  
 Temba is a **catalog** of MCP servers that let LLMs discover and use tools only when needed.  
 
 [Getting started](#getting-started) · [Deploying the catalog](#deploying-the-catalog) · [Documentation](#documentation)
@@ -9,13 +9,13 @@ Temba is a **catalog** of MCP servers that let LLMs discover and use tools only 
 
 Using the official Jira MCP will add 20k tokens to your context from the start and disturb the LLM.  
 You may not even use these MCP in every conversations.  
-The same applies with all MCPs that ar loaded by default in your context. Do you really need this Gitlab MCP ? You're paying for its token .
+The same applies with all MCPs that are loaded by default in your context. Do you really need this Gitlab MCP ? You're paying for its token .  
 
-- **Don't waste tokens** : The catalog's search feature prevents loading all your MCPs in the context from the start.
-- **Manage tools access using Keycloak** : Use keycloak groups to assign tools to users.
-- **Simple catalog management** : Use Infra As Code or REST API to manage catalog entries.
-- **Secured by design** : OIDC sessions from remote MCPs stays on the machine.
+- **Stop wasting tokens** : The catalog's search feature prevents loading all your MCPs in the context from the start.
+- **Manage tools access using Keycloak** : Use keycloak groups to assign tools to users (use labels otherwise).
+- **Local MCP catalog** : Create your own catalog of MCPs without needing any backend
 - **Dynamic MCP registration** : Optionnally let the LLM register MCPs it finds to its own catalog.
+- **Simple catalog management** : Use Infra As Code or REST API to manage catalog entries.
 
 ## How it works
 
@@ -25,10 +25,10 @@ The same applies with all MCPs that ar loaded by default in your context. Do you
 ## Getting started
 
 Temba is made of two components :
-* The server side catalog installed on Kubernetes using Helm.
-* The local MCP tool that connects to the catalog used by the client (Opencode, Codex, Claude Code, etc)
+* A server side catalog installed on Kubernetes using Helm (optionnal).
+* A local MCP tool that connects to the catalog used by the client (Opencode, Codex, Claude Code, etc)
 
-### Installing the catalog
+### [Optionnal] Installing the catalog
 
 The catalog must be installed on Kubernetes using the helm chart in `./chart/temba-catalog`.
 
@@ -37,40 +37,54 @@ cd ./chart/temba-catalog
 helm upgrade --install temba chart/temba-catalog
 ```
 
-### 1. Get the client
+### 1. Install Temba
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/), which provides the
-`uvx` command. You do not need to install Rust, Cargo, or a compiler.
+Download the **native archive for your system** from
+[GitHub Releases](https://github.com/rememberSoftwares/temba-mcp/releases)
+and extract it. Temba is a standalone Rust executable: no Python, uv or Rust
+installation is required.
 
-Get the **Temba wheel for your system** from
-[GitHub Releases](https://github.com/rememberSoftwares/temba-mcp/releases).
-A release is published automatically when a numeric version tag is pushed.
-If no release is available yet, get a wheel from your administrator or the
-[CI artifacts](.github/workflows/ci.yaml).
+On Linux and macOS, install the extracted binary on your `PATH`:
 
-The `.whl` contains the precompiled Rust binary. You can use its downloaded path
-or its GitHub Release URL with `uvx --from`. Native archives are also available
-for running without uv. See [Temba releases and installation](docs/RELEASES.md).
+```sh
+sudo install -m 0755 temba /usr/local/bin/temba
+temba --version
+```
 
-CI targets Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64.
-**PyPI publishing is not configured**; GitHub Release downloads work without it.
+On Windows, put `temba.exe` in a directory on your user `PATH`.
+See [installation for each platform](docs/RELEASES.md#install-the-native-binary)
+for archive names, extraction and checksum verification.
+
+If the version you need is not released yet, use the native archive from the
+[CI artifacts](.github/workflows/ci.yaml) or ask your administrator for it.
 
 ### 2. Create your configuration
 
-Copy [temba.example.yaml](temba.example.yaml) to a private file named `temba.yaml`, then set
-the catalog URL and a local alias:
-
-```yaml
-catalogs:
-  - id: team
-    url: https://catalogue.example.com
-    labels: []
-```
-
-Inspect the catalog to find MCP IDs, endpoints, labels and required headers:
+Run the short setup assistant:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog
+temba add catalog
+```
+
+Enter the catalog URL, choose a unique name and optionally select labels. Leave
+the URL empty to enable your local catalog; add its MCP definitions to
+`local_catalog.servers` afterward. The assistant saves the configuration to
+`~/.temba/temba.yaml` (`%USERPROFILE%\.temba\temba.yaml` on Windows).
+You can also start from [temba.example.yaml](temba.example.yaml).
+
+Update basic settings without editing YAML:
+
+```sh
+temba set search_limit 10
+temba set dynamic_catalog true
+```
+
+See `temba --help` and `temba set --help` for settings and examples.
+
+Inspect the catalog to find MCP names, endpoints, labels and required headers:
+
+```sh
+temba catalog
 ```
 
 Add `--json` for JSON output. If the catalog is protected, Temba opens the browser
@@ -81,11 +95,12 @@ for login. See [inspecting the catalog](docs/CLIENT.md#inspecting-the-catalog).
 The client must launch the following command as a **local MCP server**:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml
+temba
 ```
 
-Replace both paths with the paths to your wheel and configuration file.
-Use absolute paths: the AI client's working directory may change from one project to another.
+Temba reads the configuration from your home directory,
+independently of the AI client's working directory. To use another file, add
+`--config /absolute/path/to/temba.yaml` or set `TEMBA_CONFIG`.
 
 <details>
 <summary>OpenCode configuration example</summary>
@@ -97,14 +112,7 @@ Add a local MCP entry to your OpenCode configuration:
   "mcp": {
     "temba": {
       "type": "local",
-      "command": [
-        "uvx",
-        "--from",
-        "/absolute/path/to/client.whl",
-        "temba",
-        "--config",
-        "/absolute/path/to/temba.yaml"
-      ],
+      "command": ["temba"],
       "enabled": true
     }
   }
@@ -114,10 +122,11 @@ Add a local MCP entry to your OpenCode configuration:
 </details>
 
 For another MCP client, use the same command in its configuration format.
+If Temba is not on that client’s `PATH`, use the absolute installed binary path.
 To check only that the binary is installed, run:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba --help
+temba --help
 ```
 
 ### 4. Make your first request
@@ -148,7 +157,7 @@ Let's add the DeepWiki MCP to the catalog. It does not require any kind of authe
 ```yaml
 catalog:
   servers:
-  - id: deepwiki
+  - name: deepwiki
     description: Public technical documentation tools.
     endpoint: https://mcp.deepwiki.com/mcp
     timeoutSeconds: 45
@@ -160,7 +169,7 @@ catalog:
 ```yaml
 allow_insecure_http: true
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
 ```
 
@@ -174,7 +183,7 @@ Let's add the official Jira MCP that uses an oauth connexion
 ```yaml
 catalog:
   servers:
-  - id: jira
+  - name: jira
     description: Atlassian remote Jira MCP ; sign in using its browser OAuth flow.
     endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
     oauth: {}
@@ -186,7 +195,7 @@ catalog:
 ```yaml
 allow_insecure_http: true
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
 ```
 
@@ -203,7 +212,7 @@ The non-sensitive header can be set in the catalog directly. On the other hand t
 ```yaml
 catalog:
   servers:
-  - id: gitlab
+  - name: gitlab
     description: GitLab tools for project and instance configured on the MCP server.
     endpoint: http://<GITLAB-MCP-URL>/mcp
     headers:
@@ -221,7 +230,7 @@ catalog:
 ```yaml
 allow_insecure_http: true
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
     tools:
       gitlab:
@@ -252,11 +261,11 @@ Let's add a Gitlab and Jira MCP. The Gitlab MCP is for developpers and use the l
 ```yaml
 catalog:
   servers:
-  - id: gitlab
+  - name: gitlab
     labels: [dev]
     description: GitLab tools for project and instance configured on the MCP server.
     endpoint: http://<GITLAB-MCP-URL>/mcp
-  - id: jira
+  - name: jira
     labels: [pm]
     description: Atlassian remote Jira MCP ; sign in using its browser OAuth flow.
     endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
@@ -266,7 +275,7 @@ catalog:
 * .yaml on the client desktop for a developer:
 ```yaml
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     labels:
       - dev
@@ -276,7 +285,7 @@ catalogs:
 * .yaml on the client desktop for a product manager:
 ```yaml
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     labels:
       - pm
@@ -340,7 +349,7 @@ In each MCP server definition, choose **only one** rule:
 
 | Rule | Who can see the MCP server? |
 |---|---|
-| `access: {public: true}` | Everyone, without a catalog connection |
+| `access: {public: true}` | Everyone, without a catalog connection (default) |
 | `access: {authenticated: true}` | All users connected to the catalog |
 | `access: {groupsAnyOf: ["team-a"]}` | Members of this group |
 | `access: {groupsAnyOf: ["team-a", "team-b"]}` | Members of either team |
@@ -356,10 +365,10 @@ Let's add a Gitlab and Jira MCP. The Gitlab MCP is for users part of group `team
 ```yaml
 catalog:
   servers:
-  - id: gitlab
+  - name: gitlab
     description: GitLab tools for project and instance configured on the MCP server.
     endpoint: http://<GITLAB-MCP-URL>/mcp
-  - id: jira
+  - name: jira
     description: Atlassian remote Jira MCP ; sign in using its browser OAuth flow.
     endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
     oauth: {}
@@ -369,7 +378,7 @@ catalog:
 ```yaml
 allow_insecure_http: true
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
 ```
 
@@ -420,7 +429,7 @@ chart/temba-catalog/    Kubernetes deployment
 docs/                  User and administration guides
 ```
 
-To build the project or wheels, see the [development guide](docs/DEVELOPMENT.md).
+To build the project or release assets, see the [development guide](docs/DEVELOPMENT.md).
 
 ## Documentation
 
@@ -433,8 +442,11 @@ To build the project or wheels, see the [development guide](docs/DEVELOPMENT.md)
 | Understand local HTTP, NetworkPolicies, and storage | [Catalog options](docs/CONFIGURATION.md) |
 | Understand local session protection | [Client security](SECURITY_CLIENT.md) |
 | Understand Kubernetes and container hardening | [Container security](SECURITY_CONTAINER.md) |
-| Build wheels or contribute code | [Development](docs/DEVELOPMENT.md) |
+| Build Temba or contribute code | [Development](docs/DEVELOPMENT.md) |
 
 The [Minikube scenario](docs/MINIKUBE_TEST.md) describes a specific test environment.
 The [V2 specification](SPECIFICATION_TEMBA_V2.md) also contains ideas for future development;
 the guides above describe the implemented behavior.
+
+
+**Temba, his arms wide.**  

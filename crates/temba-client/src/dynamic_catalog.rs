@@ -59,12 +59,12 @@ impl Local {
         {
             return Err(RegistrationError("Private headers must match the definition's credential references and size limits.").into());
         }
-        let label = definition.id.clone();
+        let label = definition.name.clone();
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes)
             .map_err(|_| RegistrationError("Random ID generation failed."))?;
         let id = format!("__local_{}", URL_SAFE_NO_PAD.encode(bytes));
-        definition.id = id.clone();
+        definition.name = id.clone();
         let mut entry = Entry::new(definition);
         entry.personal = Some(Personal {
             label,

@@ -13,7 +13,7 @@ In your Helm values file:
 ```yaml
 catalog:
   servers:
-    - id: documentation
+    - name: documentation
       description: Search and browse the team's documentation
       endpoint: https://docs-mcp.example.com/mcp
       access:
@@ -26,7 +26,7 @@ A Kubernetes Service address is not an address these machines can use.
 
 | Field | Purpose |
 | --- | --- |
-| `id` | Unique MCP identifier, used in the YAML file, display and `tool_id` values |
+| `name` | Unique MCP identifier, used in the YAML file, display and `tool_id` values |
 | `description` | Helps the assistant identify what the service can be used for |
 | `endpoint` | MCP Streamable HTTP transport URL |
 | `labels` | Categories that users can enable locally |
@@ -38,12 +38,12 @@ A Kubernetes Service address is not an address these machines can use.
 Without `oauth` or `headers`, no remote authentication is configured.
 Without `access`, the entry is public.
 
-There is no separate display `name`. IDs are case-sensitive and must contain
+`name` is the unique routing key, not a separate display label. Names are case-sensitive and must contain
 1–64 ASCII letters, digits, hyphens or underscores, without the reserved `__` prefix.
 
-Helm rejects duplicate IDs in `catalog.servers` at render time, before installation
-or upgrade. The API rejects IDs already owned by either Helm or an API addition
-with HTTP `409 Conflict`. Collisions with persisted API definitions are also
+Helm rejects duplicate names in `catalog.servers` at render time, before installation
+or upgrade. The API rejects names already owned by either Helm or an API addition
+with HTTP `409 Conflict` and a JSON error naming the duplicate. Collisions with persisted API definitions are also
 rejected when the catalog starts.
 
 Outside Helm, the file loaded by the catalog binary uses the following schema:
@@ -51,7 +51,7 @@ Outside Helm, the file loaded by the catalog binary uses the following schema:
 ```yaml
 schemaVersion: 2
 servers:
-  - id: documentation
+  - name: documentation
     endpoint: https://docs-mcp.example.com/mcp
 ```
 
@@ -62,7 +62,7 @@ servers:
 ```yaml
 catalog:
   servers:
-    - id: service
+    - name: service
       endpoint: https://mcp.example.com/mcp
       oauth: {}
 ```
@@ -103,7 +103,7 @@ Tokens and their renewal stay within the local process.
 ```yaml
 catalog:
   servers:
-    - id: service
+    - name: service
       endpoint: https://mcp.example.com/mcp
       headers:
         - name: Authorization
@@ -212,7 +212,7 @@ Create a `server.json` file:
 
 ```json
 {
-  "id": "service",
+  "name": "service",
   "endpoint": "https://mcp.example.com/mcp",
   "access": {"public": true}
 }
@@ -252,7 +252,7 @@ The volume contains neither OAuth tokens nor users' private headers.
 | `GET /v1/catalog` | User API: filtered definitions, ETag, and private cache |
 | `GET /v1/admin/servers` | Administrative bearer token: all definitions |
 | `POST /v1/admin/servers` | Persistent addition if writes are enabled |
-| `DELETE /v1/admin/servers/{id}` | Persistent deletion of an API addition |
+| `DELETE /v1/admin/servers/{name}` | Persistent deletion of an API addition |
 
 Users can inspect these definitions with `temba catalog` or `temba catalog --json`;
 the command handles catalog login and lists all authorized entries before local label filtering.

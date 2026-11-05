@@ -12,10 +12,10 @@ allow_insecure_http: true
 search_limit: 5
 refresh_minutes: 60
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     labels: [support]
-  - id: partner
+  - name: partner
     url: https://partner-catalog.example.com
     labels: [documentation]
 ```
@@ -36,13 +36,13 @@ sources use `refresh_minutes`. Failed login retries remain explicit tool actions
 only the catalog and MCP prefixes before calling the upstream tool; dots inside
 an upstream tool name are preserved. Use returned IDs exactly.
 
-Catalog IDs must be unique in YAML, and MCP IDs must be unique within a catalog.
+Catalog names must be unique in YAML, and MCP names must be unique within a catalog.
 An MCP returning duplicate tool names or names reserved for connection actions is rejected.
-The same URL may appear under distinct catalog IDs; those sessions are not merged.
+The same URL may appear under distinct catalog names; those sessions are not merged.
 
 ```yaml
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     tools:
       service:
@@ -69,7 +69,7 @@ Add this section to the same YAML:
 local_catalog:
   enabled: true
   servers:
-    - id: documentation
+    - name: documentation
       endpoint: https://mcp.example.com/mcp
       description: Technical documentation
       access:
@@ -117,18 +117,18 @@ trigger remote catalog login. Entries remain until disconnect or process exit.
 ## Inspect what your user can access
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog
-uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog --json
+temba catalog
+temba catalog --json
 ```
 
 The terminal view uses qualified IDs and YAML credential paths. JSON contains a
-`catalogs` array with source IDs, URLs, statuses and full definitions; `partial`
+`catalogs` array with source names, URLs, statuses and full definitions; `partial`
 signals failures. No local label filter is applied. Group restrictions still apply.
 If every source fails, the command exits nonzero without emitting partial JSON.
 
 ## Upgrade from the single-catalog client
 
-The executable is now `temba`; the wheel package is still named `temba-client`.
+The native executable is `temba`; configure your AI client to run it directly.
 Replace `catalog_url` with `catalogs`, move tool mappings under their catalog
 alias, and rename the old dynamic `local_catalog` section to `dynamic_catalog`.
 `local_catalog` is now exclusively for static server definitions. Set its

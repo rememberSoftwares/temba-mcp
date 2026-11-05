@@ -4,20 +4,52 @@ This guide complements the [README getting started guide](../README.md#getting-s
 The `temba.yaml` file belongs on the machine running `temba`.
 It is read when the process starts.
 
+## Create and update the configuration
+
+```sh
+temba add catalog
+temba set search_limit 10
+temba set refresh_minutes 120
+temba set dynamic_catalog true
+```
+
+`add catalog` asks for a URL, unique name and optional comma-separated labels.
+An empty URL enables the local catalog; add its MCPs under `local_catalog.servers`
+in the generated file. Adding an HTTP URL asks permission to enable unencrypted
+HTTP. These commands configure Temba without connecting to a catalog or starting MCPs.
+
+The default file is **`~/.temba/temba.yaml`** on Linux/macOS, and
+**`%USERPROFILE%\.temba\temba.yaml`** on Windows. Both refer to the current user's
+home directory. No file is loaded from the working directory automatically.
+A missing file is reported with its full location and setup instructions.
+`--config FILE` takes priority over `TEMBA_CONFIG`, which takes priority over the default:
+
+```sh
+temba --config /absolute/path/to/custom.yaml add catalog
+temba --config /absolute/path/to/custom.yaml set search_limit 10
+```
+
+`set` also accepts `allow_insecure_http`, `dynamic_catalog.enabled`,
+`dynamic_catalog.max_servers` and `local_catalog.enabled`.
+See `temba set --help` for boolean values and integer ranges.
+Changes are validated before saving; existing settings and credentials are retained.
+The commands rewrite YAML formatting and remove comments. New files use private
+permissions on Unix. Restart your AI host's Temba process to apply changes.
+
 ## Basic settings
 
 ```yaml
 refresh_minutes: 60
 search_limit: 5
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     labels: []
 ```
 
 | Option | Purpose | Default |
 | --- | --- | --- |
-| `catalogs[].id` | Unique local catalog alias; used in tool IDs and credential mappings | Required per catalog |
+| `catalogs[].name` | Unique local catalog alias; used in tool IDs and credential mappings | Required per catalog |
 | `catalogs[].url` | REST catalog URL, without an `/mcp` or `/v1/catalog` suffix | Required per catalog |
 | `catalogs[].labels` | Labels selected independently for this remote catalog | `[]`: MCP servers without labels |
 | `refresh_minutes` | Refresh interval for each catalog, between 1 and 1,440 minutes (24 hours) | `60` |
@@ -35,7 +67,7 @@ For a catalog accessed through port forwarding:
 ```yaml
 allow_insecure_http: true
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
 ```
 
@@ -48,19 +80,19 @@ See [local HTTP and networking](CONFIGURATION.md).
 List the MCP definitions available to your user before configuring private headers:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog
+temba catalog
 ```
 
-The default terminal view shows each MCP's ID, endpoint, labels, access rule,
+The default terminal view shows each MCP's name, endpoint, labels, access rule,
 OAuth settings, and public or expected private headers. A required private header
-is shown with its YAML location, for example `catalogs[id=team].tools.service.headers.Authorization`
+is shown with its YAML location, for example `catalogs[name=team].tools.service.headers.Authorization`
 or `headersFromEnv`.
 Per-catalog label selections do not filter this list, so you can discover available categories.
 
-For JSON containing each catalog’s ID, URL, status and full definitions, plus a `partial` flag:
+For JSON containing each catalog’s name, URL, status and full definitions, plus a `partial` flag:
 
 ```sh
-uvx --from /absolute/path/to/client.whl temba --config /absolute/path/to/temba.yaml catalog --json
+temba catalog --json
 ```
 
 If the catalog uses Keycloak, the command opens your browser and waits for login.
@@ -78,7 +110,7 @@ AI clients launch `temba` without a subcommand. The old executable name was `tem
 
 ## Multiple catalogs and local serving
 
-Configure `catalogs` entries with distinct IDs. Search returns up to
+Configure `catalogs` entries with distinct names. Search returns up to
 `search_limit` results from each source, with IDs such as `team.service.search`.
 A failed catalog is reported through `partial` and `catalogs` without hiding
 results from healthy sources. Sessions, ETags and credentials are isolated.
@@ -88,7 +120,7 @@ Catalog login callbacks sharing a port are queued; background refresh never open
 `local_catalog` declares your static IaC definitions. Set
 `local_catalog.enabled: true` to load them automatically when Temba starts;
 no additional process or URL in `catalogs` is needed. Its reserved catalog
-ID is `local`. HTTP entries are contacted directly; `command` / `args` entries
+name is `local`. HTTP entries are contacted directly; `command` / `args` entries
 are launched locally by Temba. `local_catalog.tools` holds private HTTP headers;
 program environments belong in `env` / `envFromEnv`.
 See [local MCP programs](LOCAL_STDIO.md).
@@ -122,7 +154,7 @@ A label cannot bypass a Keycloak rule.
 Suppose the catalog contains this definition:
 
 ```yaml
-id: service
+name: service
 endpoint: https://mcp.example.com/mcp
 headers:
   - name: Authorization
@@ -137,7 +169,7 @@ The examples use catalog alias `team`:
 
 ```yaml
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     tools:
       service:
@@ -162,7 +194,7 @@ A string is always a **literal value**:
 
 ```yaml
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     tools:
       service:
@@ -236,7 +268,7 @@ also use OAuth without authentication to the central catalog.
 
 The catalog connection starts automatically on the first tool call that
 requires it. For a remote MCP server, the assistant uses the connection action returned
-by the search. The technical actions are `<id>.__temba_connect__`, called through `call_tool`.
+by the search. The technical actions are `<name>.__temba_connect__`, called through `call_tool`.
 
 Temba waits up to 10 seconds for the result of an authorization it has started. If your
 browser session allows quick SSO, the request can continue immediately.
@@ -269,7 +301,7 @@ The response also contains `catalog.authentication_enabled`, `catalog.authentica
 and `catalog.automatic_login`. `catalog_connect_tool` offers a retry only
 after authentication fails, not while a connection is in progress or already established.
 
-The `<id>.__temba_disconnect__` action closes the MCP connection and removes its OAuth session.
+The `<name>.__temba_disconnect__` action closes the MCP connection and removes its OAuth session.
 `__catalog__.__temba_disconnect__` ends the catalog session and closes connections,
 including local registrations.
 
@@ -298,7 +330,7 @@ Here are the arguments for `add_mcp`:
 ```json
 {
   "definition": {
-    "id": "temporary-service",
+    "name": "temporary-service",
     "endpoint": "https://mcp.example.com/mcp",
     "headers": [
       {"name": "Authorization", "credential": "api_token", "mandatory": true}
@@ -326,7 +358,7 @@ Declare external providers' HTTPS origins in **the local definition**:
 ```json
 {
   "definition": {
-    "id": "temporary-service",
+    "name": "temporary-service",
     "endpoint": "https://mcp.example.com/mcp",
     "oauth": {}
   }
@@ -357,8 +389,9 @@ provided tokens, and responses in its own history.
 ## Updating and troubleshooting
 
 After changing the YAML file or environment, restart the Temba process.
-After updating the client, also change the wheel path in your AI client.
-Replacing a wheel at the same path may cause `uvx` to use its old cached binary.
+After updating Temba, replace the installed native executable and restart its process.
+If you use the optional uvx method during development, `--no-cache` avoids reusing
+an older wheel rebuilt with the same version and path.
 
 With a persistent AI server, restart the server that launches the MCP servers.
 Closing only a conversation or reopening the terminal is not always enough.

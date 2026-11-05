@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -111,7 +111,7 @@ fn schema() -> u32 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Server {
-    pub id: String,
+    pub name: String,
     #[serde(default)]
     pub description: String,
     pub endpoint: String,
@@ -136,14 +136,39 @@ pub struct Catalog {
     #[serde(default)]
     pub servers: Vec<Server>,
 }
+#[derive(Debug)]
+pub struct DuplicateMcpName {
+    pub name: String,
+    pub first: usize,
+    pub duplicate: usize,
+}
+impl std::fmt::Display for DuplicateMcpName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "servers[{}].name: duplicate MCP name '{}'; already used by servers[{}].name. Each MCP name must be unique within a catalog",
+            self.duplicate, self.name, self.first
+        )
+    }
+}
+impl std::error::Error for DuplicateMcpName {}
 impl Catalog {
     pub fn validate(&mut self, allow_http: bool) -> Result<()> {
         ensure!(self.schema_version == 2, "Unsupported catalog schema");
         ensure!(self.servers.len() <= 256, "Catalog exceeds 256 servers");
-        let mut ids = HashSet::new();
-        for server in &mut self.servers {
-            server.validate(allow_http)?;
-            ensure!(ids.insert(server.id.clone()), "Duplicate server ID");
+        let mut names = std::collections::BTreeMap::new();
+        for (index, server) in self.servers.iter_mut().enumerate() {
+            server
+                .validate(allow_http)
+                .with_context(|| format!("servers[{index}]"))?;
+            if let Some(first) = names.insert(server.name.clone(), index) {
+                return Err(DuplicateMcpName {
+                    name: server.name.clone(),
+                    first,
+                    duplicate: index,
+                }
+                .into());
+            }
         }
         self.revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&self.servers)?));
         Ok(())
@@ -152,14 +177,14 @@ impl Catalog {
 impl Server {
     pub fn validate(&mut self, allow_http: bool) -> Result<()> {
         ensure!(
-            !self.id.is_empty()
-                && self.id.len() <= 64
-                && !self.id.starts_with("__")
+            !self.name.is_empty()
+                && self.name.len() <= 64
+                && !self.name.starts_with("__")
                 && self
-                    .id
+                    .name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-            "Invalid server ID"
+            "Invalid MCP name: use 1-64 letters, digits, hyphens or underscores, without a leading __"
         );
         endpoint(&self.endpoint, allow_http)?;
         self.access.validate()?;
@@ -365,11 +390,11 @@ mod tests {
     #[test]
     fn equivalent_group_syntax_produces_the_same_catalog_revision() {
         let mut short: Catalog = serde_json::from_value(serde_json::json!({"servers":[{
-            "id":"service", "endpoint":"https://example.com/mcp", "access":{"groupsAnyOf":["dev"]}
+            "name":"service", "endpoint":"https://example.com/mcp", "access":{"groupsAnyOf":["dev"]}
         }]}))
         .unwrap();
         let mut full: Catalog = serde_json::from_value(serde_json::json!({"servers":[{
-            "id":"service", "endpoint":"https://example.com/mcp", "access":{"groupsAnyOf":["/dev"]}
+            "name":"service", "endpoint":"https://example.com/mcp", "access":{"groupsAnyOf":["/dev"]}
         }]}))
         .unwrap();
         short.validate(false).unwrap();
@@ -378,30 +403,34 @@ mod tests {
     }
     #[test]
     fn catalog_rejects_secrets_and_duplicates() {
-        assert!(serde_json::from_str::<Server>(r#"{"id":"jira","endpoint":"https://jira.test/mcp","headers":{"Authorization":"secret"}}"#).is_err());
+        assert!(serde_json::from_str::<Server>(r#"{"name":"jira","endpoint":"https://jira.test/mcp","headers":{"Authorization":"secret"}}"#).is_err());
         let s: Server =
-            serde_json::from_str(r#"{"id":"jira","endpoint":"https://jira.test/mcp"}"#).unwrap();
+            serde_json::from_str(r#"{"name":"jira","endpoint":"https://jira.test/mcp"}"#).unwrap();
         let mut c = Catalog {
             schema_version: 2,
             revision: String::new(),
             servers: vec![s.clone(), s],
         };
-        assert!(c.validate(false).is_err());
+        let error = c.validate(false).unwrap_err();
+        let duplicate = error.downcast_ref::<DuplicateMcpName>().unwrap();
+        assert_eq!(duplicate.name, "jira");
+        assert_eq!((duplicate.first, duplicate.duplicate), (0, 1));
+        assert!(error.to_string().contains("servers[1].name"));
     }
     #[test]
-    fn server_uses_only_id_and_rejects_the_removed_display_name() {
+    fn server_uses_only_name_and_rejects_the_removed_id() {
         let server: Server = serde_json::from_value(serde_json::json!({
-            "id":"service", "endpoint":"https://example.com/mcp",
+            "name":"service", "endpoint":"https://example.com/mcp",
             "headers":[{"name":"X-Tenant","value":"team"}]
         }))
         .unwrap();
         let value = serde_json::to_value(server).unwrap();
-        assert_eq!(value["id"], "service");
-        assert!(value.get("name").is_none());
+        assert_eq!(value["name"], "service");
+        assert!(value.get("id").is_none());
         assert_eq!(value["headers"][0]["name"], "X-Tenant");
         assert!(
             serde_json::from_value::<Server>(serde_json::json!({
-                "id":"service", "name":"Legacy display name", "endpoint":"https://example.com/mcp"
+                "id":"service", "name":"service", "endpoint":"https://example.com/mcp"
             }))
             .is_err()
         );
@@ -410,7 +439,7 @@ mod tests {
     fn oauth_and_headers_are_independent_but_authorization_cannot_conflict() {
         let definition = |headers| {
             serde_json::from_value::<Server>(serde_json::json!({
-                "id":"jira","endpoint":"https://example.com/mcp","oauth":{},
+                "name":"jira","endpoint":"https://example.com/mcp","oauth":{},
                 "headers":headers
             }))
             .unwrap()
@@ -427,12 +456,12 @@ mod tests {
         ] {
             assert!(definition(headers).validate(false).is_err());
         }
-        assert!(serde_json::from_value::<Server>(serde_json::json!({"id":"jira","endpoint":"https://example.com/mcp","headers":[{"name":"X-Key","credential":"key","value":"public"}]})).unwrap().validate(false).is_err());
+        assert!(serde_json::from_value::<Server>(serde_json::json!({"name":"jira","endpoint":"https://example.com/mcp","headers":[{"name":"X-Key","credential":"key","value":"public"}]})).unwrap().validate(false).is_err());
     }
     #[test]
     fn public_headers_have_exactly_one_source_and_no_secret_authorization_value() {
         let definition = |headers| {
-            serde_json::from_value::<Server>(serde_json::json!({"id":"public","endpoint":"https://example.com/mcp","headers":headers})).unwrap()
+            serde_json::from_value::<Server>(serde_json::json!({"name":"public","endpoint":"https://example.com/mcp","headers":headers})).unwrap()
         };
         let mut public = definition(serde_json::json!([{"name":"X-App","value":"temba"}]));
         public.validate(false).unwrap();
@@ -444,7 +473,7 @@ mod tests {
         ] {
             assert!(definition(headers).validate(false).is_err());
         }
-        assert!(serde_json::from_value::<Server>(serde_json::json!({"id":"old","endpoint":"https://example.com/mcp","headers":[{"name":"X-Key","credential":"key","prefix":"old"}]})).is_err());
+        assert!(serde_json::from_value::<Server>(serde_json::json!({"name":"old","endpoint":"https://example.com/mcp","headers":[{"name":"X-Key","credential":"key","prefix":"old"}]})).is_err());
     }
     #[test]
     fn credentials_and_insecure_destinations_rejected() {
@@ -464,7 +493,7 @@ mod tests {
         }
         assert!(endpoint("ftp://host/mcp", true).is_err());
         let mut server: Server = serde_json::from_value(serde_json::json!({
-            "id":"service", "endpoint":"https://mcp.example/mcp",
+            "name":"service", "endpoint":"https://mcp.example/mcp",
             "oauth":{"allowedOrigins":["http://identity.internal"]}
         }))
         .unwrap();

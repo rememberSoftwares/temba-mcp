@@ -3,7 +3,7 @@ allow_insecure_http: true
 refresh_minutes: 60
 search_limit: 5
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
     labels: [] # Select labels for this remote catalog only; [] includes unlabelled MCPs.
     # tools:
@@ -32,7 +32,7 @@ local_catalog:
   enabled: false
   servers: []
   # servers:
-  #   - id: documentation
+  #   - name: documentation
   #     endpoint: https://mcp.example.com/mcp
   #     access:
   #       public: true
@@ -51,7 +51,7 @@ local_catalog:
 
   # A local stdio MCP:
   # Add to the servers list above, instead of endpoint:
-  #   - id: workspace
+  #   - name: workspace
   #     command: /absolute/path/to/my-mcp
   #     args: ["--directory", "/absolute/path/to/workspace"]
   #     cwd: /absolute/path/to/workspace

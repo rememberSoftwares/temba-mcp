@@ -10,12 +10,12 @@ the programs automatically. No additional command is needed.
 local_catalog:
   enabled: true
   servers:
-    - id: documentation
+    - name: documentation
       endpoint: https://mcp.example.com/mcp
       access:
         public: true
 
-    - id: workspace
+    - name: workspace
       description: Tools for my workspace
       command: /absolute/path/to/my-mcp
       args:
@@ -41,7 +41,7 @@ Windows command shim, an explicit name such as `npx.cmd` can be used.
 
 | Setting for a command entry | Purpose |
 | --- | --- |
-| `id` | Unique MCP ID across both HTTP and stdio entries |
+| `name` | Unique MCP name across both HTTP and stdio entries |
 | `description` | Optional searchable description |
 | `command` | Executable path or name on `PATH` |
 | `args` | Argument list; defaults to `[]` |

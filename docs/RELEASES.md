@@ -3,59 +3,110 @@
 GitHub Actions builds the client on Linux, macOS and Windows. You can trigger
 all builds from your Linux machine; no local cross-compilation is required.
 
-## Download and run
+## Install the native binary
 
 Open [GitHub Releases](https://github.com/rememberSoftwares/temba-mcp/releases)
-and select your platform:
+and download the archive for your system, plus `SHA256SUMS` if you want to verify it.
+Replace `X.Y.Z` below with the downloaded version.
 
-| Platform | Native archive suffix |
+| Platform | Archive |
 | --- | --- |
-| Linux x86_64 | `x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `x86_64-apple-darwin.tar.gz` |
-| Windows x86_64 | `x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 | `temba-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `temba-X.Y.Z-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `temba-X.Y.Z-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `temba-X.Y.Z-x86_64-pc-windows-msvc.zip` |
 
-Each release contains four native archives, four wheels, and `SHA256SUMS`.
-The archive and wheel for a platform contain the same executable.
+Each archive contains one executable: `temba` or `temba.exe`. No Python, uv,
+Rust compiler or package manager is needed on the user's machine.
 Other architectures, including Linux ARM64 and Windows ARM64, are not built yet.
 
-**With uvx:** copy the link to the compatible `.whl` asset and replace
-`COPIED_WHEEL_URL` below with that full HTTPS URL:
+### Linux
+
+From the directory containing the downloaded files:
 
 ```sh
-uvx --from 'COPIED_WHEEL_URL' temba --config /absolute/path/to/temba.yaml
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf temba-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 0755 temba /usr/local/bin/temba
+temba --version
 ```
 
-Or install it once:
+### macOS
+
+Check the archive's SHA-256 against its line in `SHA256SUMS`, then extract it.
+For Apple Silicon:
+
+```sh
+shasum -a 256 temba-X.Y.Z-aarch64-apple-darwin.tar.gz
+tar -xzf temba-X.Y.Z-aarch64-apple-darwin.tar.gz
+sudo mkdir -p /usr/local/bin
+sudo install -m 0755 temba /usr/local/bin/temba
+temba --version
+```
+
+Use the `x86_64-apple-darwin` archive on Intel Macs.
+
+### Windows
+
+In PowerShell, compare the archive's SHA-256 with `SHA256SUMS`, then extract it:
+
+```powershell
+Get-FileHash .\temba-X.Y.Z-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+Expand-Archive .\temba-X.Y.Z-x86_64-pc-windows-msvc.zip .\temba-download
+```
+
+Move `temba-download\temba.exe` to a directory on your user `PATH`.
+Reopen your terminal and AI client after changing `PATH`, then run `temba --version`.
+You can also use the executable's absolute path directly in your AI configuration.
+
+## Configure and connect
+
+```sh
+temba add catalog
+temba catalog
+```
+
+The assistant saves `~/.temba/temba.yaml` on Linux/macOS, or
+`%USERPROFILE%\.temba\temba.yaml` on Windows. Use `--config FILE` or `TEMBA_CONFIG`
+to select another file. See [client setup](CLIENT.md#create-and-update-the-configuration).
+
+Your AI client starts Temba directly. For OpenCode:
+
+```json
+{
+  "mcp": {
+    "temba": {
+      "type": "local",
+      "command": ["temba"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Running `temba` without a subcommand starts the MCP stdio process and waits for
+requests; use `temba catalog` for a terminal listing. `temba --help` explains the modes.
+
+## Update Temba
+
+Download the new native archive and replace the installed executable using the
+same installation steps. Then restart the Temba process in your AI client.
+Your configuration stays in the home directory; the client command stays `temba`.
+
+## Optional installation with uv
+
+Wheels remain available for users who already use uv. They contain the same Rust
+executable as the native archives. Copy the full URL of the wheel for your platform:
 
 ```sh
 uv tool install 'COPIED_WHEEL_URL'
-temba --config /absolute/path/to/temba.yaml
+temba add catalog
 ```
 
-Use that installed executable in your AI client as well. The uv tools directory
-must be on `PATH`; `uv tool update-shell` can configure it for your terminal.
-URL installation does not require PyPI. Keep the complete wheel filename in the
-URL; it identifies the version, operating system and architecture.
-
-**Without uv:** extract the native archive and run `./temba --config ./temba.yaml`
-on Linux/macOS, or `.\temba.exe --config .\temba.yaml` in Windows PowerShell.
-No Rust compiler or Python installation is needed for the native executable.
-Use `./temba --version` (or `.\temba.exe --version`) to check the binary without
-loading a configuration. Other commands read `temba.yaml` from the current
-working directory unless `--config` or `TEMBA_CONFIG` specifies a different file.
-The configuration is not included in the native archive; start from
-[temba.example.yaml](../temba.example.yaml).
-
-`temba catalog` lists accessible MCP definitions. The local catalog loads
-automatically. Running without a subcommand starts the stdio MCP process used by your
-AI client, rather than a terminal listing. The startup explanation is written to
-stderr; stdout remains reserved for MCP protocol messages. `temba -h` explains
-these modes without loading a configuration.
-
-For downloaded assets, Linux users can check the published digests with
-`sha256sum --check --ignore-missing SHA256SUMS`; macOS provides `shasum -a 256` and
-PowerShell provides `Get-FileHash -Algorithm SHA256`.
+The uv tools directory must be on `PATH`; `uv tool update-shell` can configure it.
+For an ephemeral launch, use `uvx --from 'COPIED_WHEEL_URL' temba`.
+PyPI publishing is not configured. Each release includes four native archives,
+four optional wheels and `SHA256SUMS`.
 
 ## Publish a version
 

@@ -63,6 +63,9 @@ fn quoted_field<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
 fn explain(message: &str) -> String {
     if let Some(field) = quoted_field(message, "unknown field `") {
         let hint = match field {
+            "id" => {
+                "Replace id with name. Catalog names must be unique; MCP names must be unique within each catalog."
+            }
             "access" => {
                 "Remove access from command/args entries; local stdio MCPs do not use catalog access rules."
             }
@@ -121,23 +124,23 @@ mod tests {
     #[test]
     fn transport_fields_and_removed_options_have_actionable_paths() {
         let message = error(
-            "local_catalog:\n  enabled: true\n  servers:\n    - id: program\n      command: uvx\n      access: {public: true}\n",
+            "local_catalog:\n  enabled: true\n  servers:\n    - name: program\n      command: uvx\n      access: {public: true}\n",
         );
         assert!(message.contains("local_catalog.servers[0]"), "{message}");
         assert!(message.contains("Unknown field 'access'"), "{message}");
         assert!(message.contains("Remove access"));
         assert!(message.contains("line"));
         assert!(error("local_catalog: {listen: '127.0.0.1:8787'}").contains("Remove listen"));
-        assert!(error("local_catalog: {servers: [{id: program, command: uvx, endpoint: 'https://mcp.example'}]}").contains("Choose exactly one transport"));
+        assert!(error("local_catalog: {servers: [{name: program, command: uvx, endpoint: 'https://mcp.example'}]}").contains("Choose exactly one transport"));
     }
     #[test]
     fn validation_identifies_entries_and_concrete_limits() {
         let message =
-            error("local_catalog: {servers: [{id: program, command: uvx, cwd: relative/path}]}");
+            error("local_catalog: {servers: [{name: program, command: uvx, cwd: relative/path}]}");
         assert!(message.contains("local_catalog.servers[0]"));
         assert!(message.contains("absolute path"));
         assert!(error("refresh_minutes: 0").contains("between 1 and 1440"));
-        assert!(error("catalogs: [{id: a, url: 'https://example.com'}, {id: a, url: 'https://example.org'}]").contains("catalogs[1].id: duplicate"));
+        assert!(error("catalogs: [{name: a, url: 'https://example.com'}, {name: a, url: 'https://example.org'}]").contains("catalogs[1].name: duplicate"));
         assert!(error("local_catalog: {tools: {service: {expected_endpoint: 'https://example.com', headers: {Authorization: TOP_SECRET_TOKEN, authorization: OTHER_SECRET_TOKEN}}}}").contains("Duplicate HTTP header"));
     }
     #[test]
@@ -147,7 +150,7 @@ mod tests {
             "refresh_minutes: 'unknown field `TOP_SECRET_TOKEN`'",
             "refresh_minutes: 'TOP_SECRET_TOKEN, expected OTHER_SECRET_TOKEN'",
             "catalogs: [{url: 'https://example.com?token=TOP_SECRET_TOKEN'}]",
-            "local_catalog: {servers: [{id: program, command: uvx, env: {TOKEN: [TOP_SECRET_TOKEN]}}]}",
+            "local_catalog: {servers: [{name: program, command: uvx, env: {TOKEN: [TOP_SECRET_TOKEN]}}]}",
             "catalogs: [\n token: TOP_SECRET_TOKEN\n bad: [",
         ] {
             let message = error(source);
@@ -158,7 +161,7 @@ mod tests {
         assert!(error("refresh_minutes: not_a_number").contains("refresh_minutes"));
         assert!(
             error("catalogs: [{url: 'https://example.com'}]")
-                .contains("Missing required field 'id'")
+                .contains("Missing required field 'name'")
         );
     }
 }

@@ -1,5 +1,6 @@
 mod catalog;
 mod config;
+mod config_cli;
 mod diagnostics;
 mod dynamic_catalog;
 mod federation;
@@ -10,7 +11,7 @@ mod oauth_network;
 mod search;
 mod stdio_gateway;
 mod transport;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use rmcp::{
     ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt,
@@ -60,21 +61,27 @@ where
     name = "temba",
     version,
     about = "Local MCP client and catalog CLI; OAuth credentials stay in memory",
-    after_help = "Without a subcommand, Temba runs in MCP stdio mode for AI clients (OpenCode and other MCP hosts). It waits for protocol requests on stdin and does not return to the prompt until stopped.\n\nFor terminal use:\n  temba catalog    List accessible MCP definitions, then exit\n\nUse --config to select your YAML file. Press Ctrl+C to stop a running process."
+    after_help = "Configuration examples:\n  temba add catalog                   Add a remote catalog or enable the local catalog\n  temba set dynamic_catalog true      Enable the optional dynamic registration tool\n  temba set search_limit 10           Set results per catalog\n  temba set refresh_minutes 120       Set catalog refresh interval\n\nConfiguration file:\n  Default: ~/.temba/temba.yaml\n  Windows: %USERPROFILE%\\.temba\\temba.yaml\n  Override with --config <FILE> or TEMBA_CONFIG.\n\nMCP mode (no subcommand):\n  Your AI client launches Temba, which waits for MCP requests on stdin.\n  stdout is reserved for the protocol. For terminal use, run 'temba catalog'."
 )]
 struct Args {
-    #[arg(
-        long,
-        env = "TEMBA_CONFIG",
-        default_value = "temba.yaml",
-        global = true
-    )]
-    config: String,
+    /// Configuration file; defaults to ~/.temba/temba.yaml in your home directory.
+    #[arg(long, env = "TEMBA_CONFIG", global = true, value_name = "FILE")]
+    config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Set up configuration interactively (no network connection).
+    Add {
+        #[command(subcommand)]
+        command: AddCommand,
+    },
+    /// Update a configuration setting, creating the file if needed.
+    #[command(
+        after_help = "Settings:\n  search_limit                 Integer, 1–50 (default 5)\n  refresh_minutes              Integer, 1–1440 (default 60)\n  allow_insecure_http          true/false (default false)\n  dynamic_catalog              true/false; sets dynamic_catalog.enabled\n  dynamic_catalog.enabled      true/false (default false)\n  dynamic_catalog.max_servers  Integer, 1–64 (default 16)\n  local_catalog.enabled        true/false (default false)\n\nExamples:\n  temba set search_limit 10\n  temba set dynamic_catalog true\n  temba --config ./temba.yaml set refresh_minutes 120"
+    )]
+    Set { key: String, value: String },
     /// List accessible MCP definitions before label filtering, then exit.
     Catalog {
         /// Print the complete catalog as JSON instead of terminal text.
@@ -82,6 +89,12 @@ enum Command {
         json: bool,
     },
 }
+#[derive(Subcommand)]
+enum AddCommand {
+    /// Add a remote catalog; leave the URL empty to enable the local catalog.
+    Catalog,
+}
+
 struct Entry {
     retired: AtomicBool,
     definition: Server,
@@ -169,7 +182,7 @@ impl Entry {
     fn label(&self) -> &str {
         self.personal
             .as_ref()
-            .map_or(self.definition.id.as_str(), |p| p.label.as_str())
+            .map_or(self.definition.name.as_str(), |p| p.label.as_str())
     }
     async fn close(&self) {
         if let Some(task) = self.login.lock().await.take() {
@@ -301,7 +314,7 @@ impl Local {
         let mut connect = vec![];
         for definition in catalog.servers {
             let e = if let Some(existing) = old
-                .get(&definition.id)
+                .get(&definition.name)
                 .filter(|e| e.definition == definition)
             {
                 existing.clone()
@@ -319,7 +332,7 @@ impl Local {
                 }
                 e
             };
-            next.insert(e.definition.id.clone(), e);
+            next.insert(e.definition.name.clone(), e);
         }
         let removed: Vec<_> = old
             .iter()
@@ -361,7 +374,7 @@ impl Local {
             if status == "ready" {
                 ready += 1;
             } else {
-                pending.push(format!("{}:{status}", e.definition.id));
+                pending.push(format!("{}:{status}", e.definition.name));
             }
         }
         eprintln!(
@@ -396,7 +409,7 @@ impl Local {
     fn credential_headers(&self, entry: &Entry) -> Result<reqwest::header::HeaderMap> {
         let definition = &entry.definition;
         let mut headers = reqwest::header::HeaderMap::new();
-        let tool = self.config.tool.get(&definition.id);
+        let tool = self.config.tool.get(&definition.name);
         if entry.personal.is_none()
             && let Some(tool) = tool.filter(|t| !t.headers.is_empty())
         {
@@ -572,7 +585,7 @@ impl Local {
             ));
         }
         Ok(
-            json!({"status":status,"target":"remote_mcp","server":e.definition.id,
+            json!({"status":status,"target":"remote_mcp","server":e.definition.name,
             "hint": if status == "ready" {
                 "The MCP connection is ready. Search its tools and continue the user's request without asking them to retry or authorize again."
             } else if status == "connecting" {
@@ -586,7 +599,7 @@ impl Local {
         let mut task = e.login.lock().await;
         if task.as_ref().is_some_and(|t| !t.is_finished()) {
             return Ok(
-                json!({"status":"auth_in_progress","target":"remote_mcp","server":e.definition.id,"hint":format!("Authorization for MCP {} is in progress. Finish it in your browser, then repeat tool_search.",e.definition.id)}),
+                json!({"status":"auth_in_progress","target":"remote_mcp","server":e.definition.name,"hint":format!("Authorization for MCP {} is in progress. Finish it in your browser, then repeat tool_search.",e.definition.name)}),
             );
         }
         let (ready, session) = {
@@ -601,14 +614,14 @@ impl Local {
                 self.connect(&e).await;
             }
             return Ok(
-                json!({"status":e.state.read().await.status,"target":"remote_mcp","server":e.definition.id}),
+                json!({"status":e.state.read().await.status,"target":"remote_mcp","server":e.definition.name}),
             );
         }
         let Some(oauth) = &e.definition.oauth else {
             drop(task);
             self.connect(&e).await;
             return Ok(
-                json!({"status":e.state.read().await.status,"target":"remote_mcp","server":e.definition.id}),
+                json!({"status":e.state.read().await.status,"target":"remote_mcp","server":e.definition.name}),
             );
         };
         let headers = match self.credential_headers(&e) {
@@ -685,7 +698,7 @@ impl Local {
             }
         });
         Ok(
-            json!({"status":"auth_in_progress","target":"remote_mcp","server":e.definition.id,"url":url,"hint":format!("Authorization for MCP {} started. Finish it in your browser, then repeat tool_search. Do not claim the MCP is connected until its status is ready.",e.definition.id)}),
+            json!({"status":"auth_in_progress","target":"remote_mcp","server":e.definition.name,"url":url,"hint":format!("Authorization for MCP {} started. Finish it in your browser, then repeat tool_search. Do not claim the MCP is connected until its status is ready.",e.definition.name)}),
         )
     }
     async fn validate_catalog_session(self: &Arc<Self>) {
@@ -889,7 +902,7 @@ impl Local {
         let mut states = vec![];
         for e in entries.values() {
             let s = e.state.read().await;
-            let mut state = json!({"server":e.definition.id,"label":e.label(),"status":s.status});
+            let mut state = json!({"server":e.definition.name,"label":e.label(),"status":s.status});
             if s.status == "credentials_required"
                 && let Err(error) = self.credential_headers(e)
                 && let Some(missing) = error.downcast_ref::<MissingHeaders>()
@@ -906,7 +919,7 @@ impl Local {
                         t.name,
                         t.description.as_deref().unwrap_or("")
                     ));
-                    rows.push(json!({"tool_id":format!("{}.{}",e.definition.id,t.name),"description":t.description,"inputSchema":t.input_schema}));
+                    rows.push(json!({"tool_id":format!("{}.{}",e.definition.name,t.name),"description":t.description,"inputSchema":t.input_schema}));
                 }
             } else {
                 docs.push(format!(
@@ -915,7 +928,7 @@ impl Local {
                     e.definition.description,
                     e.definition.labels.join(" ")
                 ));
-                rows.push(json!({"tool_id":format!("{}.__temba_connect__",e.definition.id),"description":if s.status == "credentials_required" { format!("MCP {} needs mandatory local headers. Inspect missing_headers, configure credentials in the local YAML/environment and restart the client. Do not ask for secret values in chat; this action cannot supply them.",e.definition.id) } else { format!("Connect to MCP {} ({}). This action concerns only this remote MCP. For OAuth, finish authorization in your browser and search again; connection succeeds only when its status is ready.",e.definition.id,e.definition.description) },"target":"remote_mcp","server":e.definition.id,"status":s.status}));
+                rows.push(json!({"tool_id":format!("{}.__temba_connect__",e.definition.name),"description":if s.status == "credentials_required" { format!("MCP {} needs mandatory local headers. Inspect missing_headers, configure credentials in the local YAML/environment and restart the client. Do not ask for secret values in chat; this action cannot supply them.",e.definition.name) } else { format!("Connect to MCP {} ({}). This action concerns only this remote MCP. For OAuth, finish authorization in your browser and search again; connection succeeds only when its status is ready.",e.definition.name,e.definition.description) },"target":"remote_mcp","server":e.definition.name,"status":s.status}));
             }
         }
         let scores = search::scores(query, &docs);
@@ -1141,7 +1154,7 @@ impl ServerHandler for Handler {
                         "definition":{
                             "type":"object",
                             "properties":{
-                                "id":{"type":"string"},
+                                "name":{"type":"string"},
                                 "description":{"type":"string"},
                                 "labels":{"type":"array","items":{"type":"string"}},
                                 "endpoint":{"type":"string"},
@@ -1159,7 +1172,7 @@ impl ServerHandler for Handler {
                                 "headers":{"type":"array","items":{"type":"object"}},
                                 "timeoutSeconds":{"type":"integer","minimum":1,"maximum":300}
                             },
-                            "required":["id","endpoint"],
+                            "required":["name","endpoint"],
                             "additionalProperties":false
                         },
                         "headers":{"type":"object","additionalProperties":{"type":"string"}}
@@ -1255,22 +1268,34 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     temba_core::harden_process();
     let args = Args::parse();
-    let source = Zeroizing::new(
-        tokio::fs::read_to_string(&args.config)
-            .await
-            .with_context(|| {
-                format!(
-                    "Cannot read configuration file '{}'. Use --config /path/to/temba.yaml or set TEMBA_CONFIG; the default is temba.yaml in the current working directory",
-                    args.config
-                )
-            })?,
-    );
-    let mut config = diagnostics::config(source.as_str(), &args.config)?;
+    let path = config_cli::path(args.config.as_deref())?;
+    match &args.command {
+        Some(Command::Add {
+            command: AddCommand::Catalog,
+        }) => {
+            config_cli::add_catalog(
+                &path,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            println!("Saved configuration to {}", path.display());
+            return Ok(());
+        }
+        Some(Command::Set { key, value }) => {
+            config_cli::set(&path, key, value)?;
+            println!("Saved configuration to {}", path.display());
+            return Ok(());
+        }
+        _ => {}
+    }
+    let source = config_cli::read(&path)?;
+    let mut config = diagnostics::config(source.as_str(), &path.display().to_string())?;
     drop(source);
     let local = local_runtime::Embedded::start(&mut config).await?;
     let work = async {
         match args.command {
             Some(Command::Catalog { json }) => catalog::run(config, json).await,
+            Some(Command::Add { .. } | Command::Set { .. }) => unreachable!(),
             None => {
                 eprintln!(
                     "Starting Temba in MCP stdio mode for AI clients.\nWaiting for MCP requests on stdin; stdout is reserved for protocol messages.\nFor terminal use, add 'catalog' to list accessible MCPs and exit. The configured local catalog starts automatically in MCP mode. Press Ctrl+C to stop."
@@ -1292,7 +1317,10 @@ mod integration_tests {
     #[test]
     fn catalog_cli_is_optional_and_config_works_before_or_after_subcommand() {
         let args = Args::try_parse_from(["temba-client", "--config", "custom.yaml"]).unwrap();
-        assert_eq!(args.config, "custom.yaml");
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("custom.yaml"))
+        );
         assert!(args.command.is_none());
         for input in [
             vec![
@@ -1311,7 +1339,10 @@ mod integration_tests {
             ],
         ] {
             let args = Args::try_parse_from(input).unwrap();
-            assert_eq!(args.config, "custom.yaml");
+            assert_eq!(
+                args.config.as_deref(),
+                Some(std::path::Path::new("custom.yaml"))
+            );
             assert!(matches!(
                 args.command,
                 Some(Command::Catalog { json: true })
@@ -1325,6 +1356,36 @@ mod integration_tests {
         ));
         assert!(Args::try_parse_from(["temba-client", "--json"]).is_err());
         assert!(Args::try_parse_from(["temba", "serve"]).is_err());
+    }
+    #[test]
+    fn configuration_commands_parse_without_loading_a_file() {
+        assert!(matches!(
+            Args::try_parse_from(["temba", "add", "catalog"])
+                .unwrap()
+                .command,
+            Some(Command::Add {
+                command: AddCommand::Catalog
+            })
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["temba", "set", "dynamic_catalog", "true"])
+                .unwrap()
+                .command,
+            Some(Command::Set { .. })
+        ));
+        let args = Args::try_parse_from([
+            "temba",
+            "set",
+            "search_limit",
+            "10",
+            "--config",
+            "custom.yaml",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("custom.yaml"))
+        );
     }
     use axum::{
         Json, Router,
@@ -1409,7 +1470,7 @@ mod integration_tests {
         config.validate().unwrap();
         let local = local(config);
         let definition = |id: &str, url: &str, auth: Value| {
-            serde_json::from_value::<Server>(json!({"id":id,"endpoint":url,"headers":auth}))
+            serde_json::from_value::<Server>(json!({"name":id,"endpoint":url,"headers":auth}))
                 .unwrap()
         };
         let ea = Arc::new(Entry::new(definition(
@@ -1468,7 +1529,7 @@ mod integration_tests {
         let mut config: config::SourceConfig = serde_yaml_ng::from_str(&format!("catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\ntool:\n  combined:\n    expected_endpoint: {url}\n    headers:\n      X-Tenant: Bearer complete-tenant-value\n      X-Client-Only: client-only-value\n    headersFromEnv:\n    - name: X-Api-Key\n      valueFrom:\n        envVarRef:\n          name: PATH\n")).unwrap();
         config.validate().unwrap();
         let local = local(config);
-        let mut definition: Server = serde_json::from_value(json!({"id":"combined","endpoint":url,"oauth":{},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-Tenant","credential":"tenant"},{"name":"X-App","value":"temba"}]})).unwrap();
+        let mut definition: Server = serde_json::from_value(json!({"name":"combined","endpoint":url,"oauth":{},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-Tenant","credential":"tenant"},{"name":"X-App","value":"temba"}]})).unwrap();
         definition.validate(true).unwrap();
         let entry = Arc::new(Entry::new(definition.clone()));
         entry.state.write().await.session = Some(oauth::Session::test_session("oauth-access"));
@@ -1522,7 +1583,7 @@ tool:
         config.validate().unwrap();
         let local = local(config);
         let mut definition: Server = serde_json::from_value(json!({
-            "id":"service", "endpoint":"https://mcp.example.com/mcp", "oauth":{}
+            "name":"service", "endpoint":"https://mcp.example.com/mcp", "oauth":{}
         }))
         .unwrap();
         definition.validate(false).unwrap();
@@ -1548,7 +1609,7 @@ tool:
             serde_yaml_ng::from_str(&format!("catalog_url: http://127.0.0.1:1\nallow_insecure_http: true\ntool:\n  mandatory:\n    expected_endpoint: {url}\n    headers:\n      X-Provided: private-supplied-header\n")).unwrap();
         let local = local(config);
         let mut definition: Server = serde_json::from_value(json!({
-            "id":"optional","endpoint":url,"headers":[
+            "name":"optional","endpoint":url,"headers":[
                 {"name":"X-Optional","credential":"optional"},
                 {"name":"X-App","value":"temba"}
             ]
@@ -1567,7 +1628,7 @@ tool:
             assert_eq!(headers["x-app"], "temba");
             assert!(!headers.contains_key("x-optional"));
         }
-        definition.id = "mandatory".into();
+        definition.name = "mandatory".into();
         definition.headers.push(temba_core::Header {
             name: "X-Required".into(),
             credential: Some("required".into()),
@@ -1630,7 +1691,7 @@ tool:
         let local = local(config);
         let definition = |endpoint| {
             serde_json::from_value::<Server>(json!({
-                "id":"same-label","endpoint":endpoint,
+                "name":"same-label","endpoint":endpoint,
                 "headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true}]
             }))
             .unwrap()
@@ -1750,7 +1811,7 @@ tool:
         .unwrap();
         let local = local(config);
         let definition = serde_json::from_value(json!({
-            "id":"temporary-service", "endpoint":"https://mcp.example.com/mcp", "oauth":{},
+            "name":"temporary-service", "endpoint":"https://mcp.example.com/mcp", "oauth":{},
             "headers":[{"name":"X-Key","credential":"api_key","mandatory":true}]
         }))
         .unwrap();
@@ -1801,11 +1862,11 @@ tool:
             if enabled {
                 let add = tools.iter().find(|t| t.name == "add_mcp").unwrap();
                 let fields = &add.input_schema["properties"]["definition"]["properties"];
-                assert!(fields.get("id").is_some());
-                assert!(fields.get("name").is_none());
+                assert!(fields.get("name").is_some());
+                assert!(fields.get("id").is_none());
             }
             let definition: Server = serde_json::from_value(json!({
-                "id":"shared","endpoint":"https://mcp.example.com","oauth":{},
+                "name":"shared","endpoint":"https://mcp.example.com","oauth":{},
                 "headers":[{"name":"X-Key","credential":"key","mandatory":true}]
             }))
             .unwrap();
@@ -1819,7 +1880,7 @@ tool:
             assert!(local.personal.read().await.is_empty());
             let call = client.peer().call_tool(CallToolRequestParams::new("add_mcp").with_arguments(
                 json!({
-                    "definition":{"id":"shared","endpoint":"https://mcp.example.com","oauth":{},
+                    "definition":{"name":"shared","endpoint":"https://mcp.example.com","oauth":{},
                         "headers":[{"name":"X-Key","credential":"key","mandatory":true}]},
                     "headers":{"key":"provided-private-value"}
                 }).as_object().unwrap().clone()
@@ -2003,7 +2064,8 @@ tool:
             token_endpoint: String::new(),
         });
         *local.catalog_status.write().await = "auth_in_progress";
-        let definition = serde_json::from_value(json!({"id":"jira","endpoint":endpoint})).unwrap();
+        let definition =
+            serde_json::from_value(json!({"name":"jira","endpoint":endpoint})).unwrap();
         let entry = Arc::new(Entry::new(definition));
         let callback = local.clone();
         let task = tokio::spawn(async move {
@@ -2040,7 +2102,8 @@ tool:
             token_endpoint: String::new(),
         });
         *local.catalog_status.write().await = "auth_in_progress";
-        let definition = serde_json::from_value(json!({"id":"jira","endpoint":endpoint})).unwrap();
+        let definition =
+            serde_json::from_value(json!({"name":"jira","endpoint":endpoint})).unwrap();
         let entry = Arc::new(Entry::new(definition));
         let callback = local.clone();
         let remote = entry.clone();
@@ -2086,7 +2149,7 @@ tool:
         let local =
             local(serde_yaml_ng::from_str("catalog_url: https://catalog.example.com\n").unwrap());
         let definition =
-            serde_json::from_value(json!({"id":"jira","endpoint":endpoint,"oauth":{}})).unwrap();
+            serde_json::from_value(json!({"name":"jira","endpoint":endpoint,"oauth":{}})).unwrap();
         let entry = Arc::new(Entry::new(definition));
         entry.state.write().await.status = "auth_in_progress";
         let callback = local.clone();
@@ -2157,7 +2220,7 @@ tool:
                 "public"
             };
             let definition =
-                serde_json::from_value(json!({"id":"jira-temp","endpoint":endpoint,"oauth":{"allowedOrigins":["https://unrelated.example"]}}))
+                serde_json::from_value(json!({"name":"jira-temp","endpoint":endpoint,"oauth":{"allowedOrigins":["https://unrelated.example"]}}))
                     .unwrap();
             let registered = local
                 .add_personal(definition, BTreeMap::new())
@@ -2180,7 +2243,7 @@ tool:
                 .call(&format!("{id}.__temba_disconnect__"), None)
                 .await
                 .unwrap();
-            let corrected = serde_json::from_value(json!({"id":"jira-temp","endpoint":endpoint,
+            let corrected = serde_json::from_value(json!({"name":"jira-temp","endpoint":endpoint,
                 "oauth":{"allowedOrigins":["https://auth.atlassian.com"]}}))
             .unwrap();
             let registered = local
@@ -2224,13 +2287,13 @@ tool:
             "/v1/catalog",
             get(|| async {
                 Json(json!({"schemaVersion":2,"servers":[
-                    {"id":"gitlab","endpoint":"https://gitlab.example.com/mcp",
+                    {"name":"gitlab","endpoint":"https://gitlab.example.com/mcp",
                      "headers":[{"name":"X-Token","credential":"token","mandatory":true}]},
-                    {"id":"jira","endpoint":"https://jira.example.com/mcp","labels":["support"],
+                    {"name":"jira","endpoint":"https://jira.example.com/mcp","labels":["support"],
                      "headers":[{"name":"X-Token","credential":"token","mandatory":true}]},
-                    {"id":"deepwiki","endpoint":"https://deepwiki.example.com/mcp","labels":["tech"],
+                    {"name":"deepwiki","endpoint":"https://deepwiki.example.com/mcp","labels":["tech"],
                      "headers":[{"name":"X-Token","credential":"token","mandatory":true}]},
-                    {"id":"both","endpoint":"https://both.example.com/mcp","labels":["support","tech"],
+                    {"name":"both","endpoint":"https://both.example.com/mcp","labels":["support","tech"],
                      "headers":[{"name":"X-Token","credential":"token","mandatory":true}]}
                 ]}))
             }),
@@ -2274,7 +2337,7 @@ tool:
     async fn catalog_refresh_is_atomic_and_removes_changed_connections() {
         let (url, _, tm) = mock().await;
         let catalog = Arc::new(RwLock::new(
-            json!({"schemaVersion":2,"servers":[{"id":"one","endpoint":url,"labels":["allowed"]}]}),
+            json!({"schemaVersion":2,"servers":[{"name":"one","endpoint":url,"labels":["allowed"]}]}),
         ));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
@@ -2296,7 +2359,7 @@ tool:
         local.refresh().await.unwrap();
         let old = local.servers.read().await["one"].clone();
         // A malformed response cannot partially replace the last valid definitions.
-        *catalog.write().await = json!({"schemaVersion":2,"servers":[{"id":"two","endpoint":"https://user:pass@bad/mcp"}]});
+        *catalog.write().await = json!({"schemaVersion":2,"servers":[{"name":"two","endpoint":"https://user:pass@bad/mcp"}]});
         assert!(local.refresh().await.is_err());
         assert!(Arc::ptr_eq(&old, &local.servers.read().await["one"]));
         *catalog.write().await = json!({"schemaVersion":2,"servers":[]});

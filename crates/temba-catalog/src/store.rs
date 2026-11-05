@@ -27,15 +27,15 @@ pub fn load(path: &Path, baseline: &Catalog, allow_http: bool) -> Result<BTreeMa
     );
     for server in &catalog.servers {
         ensure!(
-            !baseline.servers.iter().any(|s| s.id == server.id),
-            "Persisted definition conflicts with Helm definition: {}",
-            server.id
+            !baseline.servers.iter().any(|s| s.name == server.name),
+            "Duplicate MCP name '{}' in persisted API definitions and Helm catalog; each name must be unique",
+            server.name
         );
     }
     Ok(catalog
         .servers
         .into_iter()
-        .map(|s| (s.id.clone(), s))
+        .map(|s| (s.name.clone(), s))
         .collect())
 }
 
@@ -107,7 +107,7 @@ mod tests {
         };
         assert!(load(&path, &baseline, false).unwrap().is_empty());
         let server: Server =
-            serde_json::from_value(json!({"id":"added","endpoint":"https://example.com/mcp"}))
+            serde_json::from_value(json!({"name":"added","endpoint":"https://example.com/mcp"}))
                 .unwrap();
         let servers = BTreeMap::from([("added".into(), server.clone())]);
         persist(&path, &servers).await.unwrap();

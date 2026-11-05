@@ -21,7 +21,7 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogSource {
-    pub id: String,
+    pub name: String,
     pub url: String,
     #[serde(default)]
     pub labels: Vec<String>,
@@ -44,7 +44,7 @@ pub struct StaticCatalog {
 fn runtime_address() -> std::net::SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
-fn id(value: &str) -> bool {
+pub(crate) fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && !value.starts_with("__")
@@ -70,20 +70,22 @@ impl Config {
             (1..=64).contains(&self.dynamic_catalog.max_servers),
             "dynamic_catalog.max_servers must be between 1 and 64"
         );
-        let mut ids = std::collections::HashSet::new();
+        let mut names = BTreeMap::new();
         for (index, source) in self.catalogs.iter_mut().enumerate() {
             ensure!(
-                id(&source.id),
-                "catalogs[{index}].id: use 1–64 letters, digits, hyphens or underscores, without a leading __"
+                valid_name(&source.name),
+                "catalogs[{index}].name: use 1–64 letters, digits, hyphens or underscores, without a leading __"
             );
             ensure!(
-                source.id != "local",
-                "catalogs[{index}].id: local is reserved for local_catalog; choose another ID"
+                source.name != "local",
+                "catalogs[{index}].name: local is reserved for local_catalog; choose another name"
             );
-            ensure!(
-                ids.insert(source.id.clone()),
-                "catalogs[{index}].id: duplicate catalog ID; each catalogs[] entry needs a unique ID"
-            );
+            if let Some(first) = names.insert(source.name.clone(), index) {
+                anyhow::bail!(
+                    "catalogs[{index}].name: duplicate catalog name '{}'; already used by catalogs[{first}].name. Each catalog name must be unique",
+                    source.name
+                );
+            }
             let url = temba_core::endpoint(&source.url, self.allow_insecure_http).with_context(|| format!("catalogs[{index}].url: invalid catalog URL; use HTTPS, or explicitly enable allow_insecure_http for HTTP"))?;
             ensure!(url.query().is_none(), "Catalog URL cannot have a query");
             source.url = source.url.trim_end_matches('/').to_owned();
@@ -95,7 +97,7 @@ impl Config {
         }
         for (index, source) in self.catalogs.iter().enumerate() {
             for (server, tool) in &source.tools {
-                ensure!(id(server), "Invalid MCP id in catalog tools");
+                ensure!(valid_name(server), "Invalid MCP name in catalog tools");
                 validate_tool(tool, self.allow_insecure_http).with_context(|| {
                     format!("catalogs[{index}].tools.{}", server.escape_debug())
                 })?;
@@ -103,7 +105,10 @@ impl Config {
         }
         if let Some(local) = &mut self.local_catalog {
             for (server, tool) in &local.tools {
-                ensure!(id(server), "Invalid MCP id in local_catalog.tools");
+                ensure!(
+                    valid_name(server),
+                    "Invalid MCP name in local_catalog.tools"
+                );
                 validate_tool(tool, self.allow_insecure_http)
                     .with_context(|| format!("local_catalog.tools.{}", server.escape_debug()))?;
             }
@@ -121,11 +126,11 @@ impl Config {
                     .map(|s| s.public_definition(local.address))
                     .collect(),
             };
-            catalog.validate(true).context("local_catalog.servers: invalid MCP definitions (IDs must be unique across HTTP and stdio entries)")?;
+            catalog.validate(true).context("local_catalog.servers: invalid MCP definitions (names must be unique across HTTP and stdio entries)")?;
             for server in &local.servers {
                 if let crate::local_server::LocalServer::Stdio(server) = server {
                     ensure!(
-                        !local.tools.contains_key(&server.id),
+                        !local.tools.contains_key(&server.name),
                         "Configure stdio credentials in env/envFromEnv, not local_catalog.tools"
                     );
                 }
@@ -148,7 +153,7 @@ impl Config {
                 .map(|s| s.public_definition(local.address).endpoint)
                 .collect();
             self.catalogs.push(CatalogSource {
-                id: "local".into(),
+                name: "local".into(),
                 url: format!("http://{address}"),
                 labels: Vec::new(),
                 tools: local.tools,
@@ -158,13 +163,13 @@ impl Config {
             .into_iter()
             .map(|source| {
                 let config = SourceConfig {
-                    namespace: source.id.clone(),
+                    namespace: source.name.clone(),
                     catalog_url: source.url,
-                    labels: (source.id != "local").then_some(source.labels),
+                    labels: (source.name != "local").then_some(source.labels),
                     refresh_minutes: self.refresh_minutes,
                     search_limit: self.search_limit,
                     allow_insecure_http: self.allow_insecure_http,
-                    local_stdio_endpoints: if source.id == "local" {
+                    local_stdio_endpoints: if source.name == "local" {
                         local_stdio_endpoints.clone()
                     } else {
                         Default::default()
@@ -172,7 +177,7 @@ impl Config {
                     tool: source.tools,
                     dynamic_catalog: DynamicCatalog::default(),
                 };
-                (source.id, config)
+                (source.name, config)
             })
             .collect()
     }
@@ -477,7 +482,7 @@ mod tests {
         let mut config: Config = serde_yaml_ng::from_str(
             r#"
 catalogs:
-  - id: team
+  - name: team
     url: https://catalog.example.com
     tools:
       service:
@@ -521,7 +526,7 @@ catalogs:
     }
     #[test]
     fn yaml_rejects_duplicate_headers_invalid_env_and_legacy_shapes() {
-        let start = "catalogs:\n  - id: team\n    url: https://catalog.example.com\n    tools:\n      service:\n        expected_endpoint: https://mcp.example.com/mcp\n";
+        let start = "catalogs:\n  - name: team\n    url: https://catalog.example.com\n    tools:\n      service:\n        expected_endpoint: https://mcp.example.com/mcp\n";
         for tail in [
             "        headers: {Authorization: value, authorization: other}\n",
             "        headers:\n          X-Key: first\n          X-Key: second\n",
@@ -541,7 +546,7 @@ catalogs:
         for input in [
             "[[catalogs]]\nid = 'team'\nurl = 'https://catalog.example.com'",
             "catalogs: []\ntool: {}",
-            "catalogs:\n  - id: team\n    url: https://catalog.example.com\n    tools:\n      same: {expected_endpoint: 'https://mcp.example.com'}\n      same: {expected_endpoint: 'https://other.example.com'}",
+            "catalogs:\n  - name: team\n    url: https://catalog.example.com\n    tools:\n      same: {expected_endpoint: 'https://mcp.example.com'}\n      same: {expected_endpoint: 'https://other.example.com'}",
         ] {
             assert!(serde_yaml_ng::from_str::<Config>(input).is_err());
         }
@@ -565,18 +570,18 @@ mod federation_tests {
         let mut config: Config = serde_yaml_ng::from_str(
             r#"
 catalogs:
-  - id: first
+  - name: first
     url: https://first.example.com
     labels: [" Support "]
-  - id: second
+  - name: second
     url: https://second.example.com
     labels: ["DOCUMENTATION"]
-  - id: defaults
+  - name: defaults
     url: https://default.example.com
 local_catalog:
   enabled: true
   servers:
-    - id: service
+    - name: service
       endpoint: https://mcp.example.com/mcp
       labels: [private-category]
       access: {public: true}
@@ -609,12 +614,12 @@ local_catalog:
         let mut config: Config = serde_yaml_ng::from_str(
             r#"
 catalogs:
-  - id: team
+  - name: team
     url: https://catalog.example.com
 local_catalog:
   enabled: true
   servers:
-    - id: service
+    - name: service
       endpoint: https://mcp.example.com/mcp
       access: {public: true}
   tools:
@@ -647,7 +652,7 @@ local_catalog:
             ("enabled: false", None),
             ("enabled: true", Some("http://127.0.0.1:0")),
         ] {
-            let mut config: Config = serde_yaml_ng::from_str(&format!("local_catalog:\n  {options}\n  servers:\n    - id: service\n      endpoint: https://mcp.example.com/mcp\n      access: {{public: true}}\n")).unwrap();
+            let mut config: Config = serde_yaml_ng::from_str(&format!("local_catalog:\n  {options}\n  servers:\n    - name: service\n      endpoint: https://mcp.example.com/mcp\n      access: {{public: true}}\n")).unwrap();
             config.validate().unwrap();
             let sources = config.into_sources();
             assert_eq!(sources.first().map(|s| s.1.catalog_url.as_str()), expected);
@@ -655,9 +660,10 @@ local_catalog:
         let mut empty: Config = serde_yaml_ng::from_str("local_catalog: {enabled: true}").unwrap();
         empty.validate().unwrap();
         assert!(empty.into_sources().is_empty());
-        let mut reserved: Config =
-            serde_yaml_ng::from_str("catalogs: [{id: local, url: 'https://catalog.example.com'}]")
-                .unwrap();
+        let mut reserved: Config = serde_yaml_ng::from_str(
+            "catalogs: [{name: local, url: 'https://catalog.example.com'}]",
+        )
+        .unwrap();
         assert!(reserved.validate().is_err());
     }
     #[test]
@@ -666,12 +672,12 @@ local_catalog:
             "catalog_url: https://old.example\n",
             "local_catalog: {listen: '127.0.0.1:8787'}",
             "local_catalog: {address: '0.0.0.0:8787'}",
-            "catalogs:\n- id: same\n  url: https://a.example\n- id: same\n  url: https://b.example\n",
-            "catalogs:\n- id: has.dot\n  url: https://a.example\n",
-            "catalogs:\n- id: __local\n  url: https://a.example\n",
-            "catalogs:\n- id: a\n  url: https://a.example\ntool:\n  unknown:\n    mcp:\n      expected_endpoint: https://mcp.example\n",
-            "local_catalog:\n  servers:\n  - id: duplicate\n    endpoint: https://a.example\n  - id: duplicate\n    endpoint: https://b.example\n",
-            "local_catalog:\n  servers:\n  - id: protected\n    endpoint: https://a.example\n    access:\n      authenticated: true\n",
+            "catalogs:\n- name: same\n  url: https://a.example\n- name: same\n  url: https://b.example\n",
+            "catalogs:\n- name: has.dot\n  url: https://a.example\n",
+            "catalogs:\n- name: __local\n  url: https://a.example\n",
+            "catalogs:\n- name: a\n  url: https://a.example\ntool:\n  unknown:\n    mcp:\n      expected_endpoint: https://mcp.example\n",
+            "local_catalog:\n  servers:\n  - name: duplicate\n    endpoint: https://a.example\n  - name: duplicate\n    endpoint: https://b.example\n",
+            "local_catalog:\n  servers:\n  - name: protected\n    endpoint: https://a.example\n    access:\n      authenticated: true\n",
         ] {
             let parsed = serde_yaml_ng::from_str::<Config>(input);
             assert!(
@@ -679,7 +685,7 @@ local_catalog:
                 "accepted {input}"
             );
         }
-        let mut config: Config = serde_yaml_ng::from_str("search_limit: 5\ncatalogs:\n- id: team\n  url: https://catalog.example/\n  tools:\n    service:\n      expected_endpoint: https://mcp.example\n      headers:\n        X-Key: literal-value\ndynamic_catalog:\n  enabled: true\nlocal_catalog:\n  servers:\n  - id: service\n    endpoint: https://mcp.example\n").unwrap();
+        let mut config: Config = serde_yaml_ng::from_str("search_limit: 5\ncatalogs:\n- name: team\n  url: https://catalog.example/\n  tools:\n    service:\n      expected_endpoint: https://mcp.example\n      headers:\n        X-Key: literal-value\ndynamic_catalog:\n  enabled: true\nlocal_catalog:\n  servers:\n  - name: service\n    endpoint: https://mcp.example\n").unwrap();
         config.validate().unwrap();
         assert!(config.dynamic_source().tool.is_empty());
         let sources = config.into_sources();

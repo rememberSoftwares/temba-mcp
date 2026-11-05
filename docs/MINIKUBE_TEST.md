@@ -57,7 +57,7 @@ The local `temba.yaml` file contains only token references:
 
 ```yaml
 catalogs:
-  - id: team
+  - name: team
     url: https://catalogue.example.com
     tools:
       jira-token:

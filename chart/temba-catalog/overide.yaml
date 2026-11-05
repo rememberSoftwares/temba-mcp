@@ -8,7 +8,7 @@ catalogueAuth:
   tokenEndpoint: https://auth.m.space-e2bd42e8.hcp.cloudgouv-eu-west-1.numspot.com/realms/master/protocol/openid-connect/token
 catalog:
   servers:
-  - id: gitlab
+  - name: gitlab
     description: GitLab tools for the dev group; project and instance configured on
       the MCP server. Requires a client-provided raw GitLab token.
     endpoint: http://127.0.0.1:18082/mcp
@@ -20,7 +20,7 @@ catalog:
       groupsAnyOf:
       - /dev
 
-  - id: jira-token
+  - name: jira-token
     description: Jira support tools for the dev group; instance URL and email configured
       on the MCP server. Requires a client-provided raw Jira token.
     endpoint: http://127.0.0.1:18081/mcp
@@ -34,7 +34,7 @@ catalog:
       groupsAnyOf:
       - /dev
 
-  - id: jira
+  - name: jira
     description: Atlassian remote Jira MCP for the pm group; sign in using its browser
       OAuth flow.
     endpoint: https://mcp.atlassian.com/v2/mcp?tools=all
@@ -45,7 +45,7 @@ catalog:
       groupsAnyOf:
       - /pm
 
-  - id: deepwiki
+  - name: deepwiki
     description: Public technical documentation tools.
     endpoint: https://mcp.deepwiki.com/mcp
     timeoutSeconds: 45

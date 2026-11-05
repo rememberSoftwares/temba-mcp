@@ -19,7 +19,7 @@ This option configures neither the Ingress nor Keycloak certificates. To reach *
 ```yaml
 allow_insecure_http: true
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
 ```
 

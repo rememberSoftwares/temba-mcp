@@ -46,7 +46,7 @@ impl Gateway {
         })
     }
     fn error(&self, message: &str) -> ErrorData {
-        ErrorData::internal_error(format!("Local MCP {}: {message}", self.spec.id), None)
+        ErrorData::internal_error(format!("Local MCP {}: {message}", self.spec.name), None)
     }
     fn duration(&self) -> Duration {
         Duration::from_secs(self.spec.timeout_seconds)
@@ -104,7 +104,7 @@ impl Gateway {
                     .serve((stdout, stdin))
                     .await
                     .map_err(|_| self.error("stdio initialization failed; check local stderr"))?;
-                eprintln!("MCP {}: stdio process ready", self.spec.id);
+                eprintln!("MCP {}: stdio process ready", self.spec.name);
                 *upstream = Some(Upstream { service, child });
             }
             Ok(upstream.as_ref().unwrap().service.peer().clone())
@@ -114,14 +114,14 @@ impl Gateway {
             result = tokio::time::timeout(self.duration(), connect) => result.unwrap_or_else(|_| Err(self.error("process startup timed out"))),
         };
         if let Err(error) = &result {
-            eprintln!("MCP {}: {}", self.spec.id, error.message);
+            eprintln!("MCP {}: {}", self.spec.name, error.message);
         }
         result
     }
     pub async fn close(&self) {
         if let Some(service) = self.upstream.lock().await.take() {
             service.close().await;
-            eprintln!("MCP {}: stdio process stopped", self.spec.id);
+            eprintln!("MCP {}: stdio process stopped", self.spec.name);
         }
     }
 }
@@ -195,7 +195,7 @@ mod tests {
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stdio_mcp.py");
         serde_json::from_value(
-            json!({"id":"fixture", "command":if cfg!(windows) {"python"} else {"python3"},
+            json!({"name":"fixture", "command":if cfg!(windows) {"python"} else {"python3"},
             "args":[fixture, "; this-is-an-argument-not-a-shell-command"], "timeoutSeconds":timeout,
             "cwd":env!("CARGO_MANIFEST_DIR"), "env":{"FIXTURE_TOKEN":"private-token"},
             "envFromEnv":[{"name":"FIXTURE_REF","valueFrom":{"envVarRef":{"name":"PATH"}}}]}),

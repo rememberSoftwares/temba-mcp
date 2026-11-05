@@ -4,6 +4,6 @@ For a local catalog: kubectl port-forward service/{{ .Release.Name }} 18080:{{ .
 Then configure temba.yaml:
   allow_insecure_http: true
   catalogs:
-    - id: team
+    - name: team
       url: http://127.0.0.1:18080
 Remote MCP URLs must be reachable from the user's workstation (HTTPS by default).

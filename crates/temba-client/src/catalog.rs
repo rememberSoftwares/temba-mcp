@@ -79,7 +79,10 @@ pub async fn load(config: &SourceConfig) -> Result<Catalog> {
 
 pub async fn run(config: super::config::Config, json: bool) -> Result<()> {
     let sources = config.into_sources();
-    ensure!(!sources.is_empty(), "Configure at least one catalogs entry");
+    ensure!(
+        !sources.is_empty(),
+        "No catalogs configured. Run 'temba add catalog' or add MCP definitions to local_catalog.servers"
+    );
     let mut rows = vec![];
     let mut text = String::new();
     let mut healthy = 0;
@@ -89,12 +92,12 @@ pub async fn run(config: super::config::Config, json: bool) -> Result<()> {
                 healthy += 1;
                 let _ = writeln!(text, "Catalog: {id}");
                 text.push_str(&render(&catalog, &id));
-                rows.push(serde_json::json!({"id":id,"url":config.catalog_url,"status":"ready","catalog":catalog}));
+                rows.push(serde_json::json!({"name":id,"url":config.catalog_url,"status":"ready","catalog":catalog}));
             }
             Err(error) => {
                 eprintln!("Catalog {id}: unavailable: {error}");
                 rows.push(
-                    serde_json::json!({"id":id,"url":config.catalog_url,"status":"unavailable"}),
+                    serde_json::json!({"name":id,"url":config.catalog_url,"status":"unavailable"}),
                 );
                 let _ = writeln!(text, "Catalog {id}: unavailable");
             }
@@ -136,7 +139,7 @@ fn render(catalog: &Catalog, namespace: &str) -> String {
         let _ = writeln!(
             output,
             "\n{namespace}.{}\n  Endpoint: {}",
-            server.id,
+            server.name,
             terminal(&server.endpoint)
         );
         if !server.description.is_empty() {
@@ -206,10 +209,10 @@ fn render(catalog: &Catalog, namespace: &str) -> String {
                 if header.credential.is_some() {
                     let _ = writeln!(
                         output,
-                        "    {} <- catalogs[id={}].tools.{}.headers.{} or headersFromEnv ({})",
+                        "    {} <- catalogs[name={}].tools.{}.headers.{} or headersFromEnv ({})",
                         header.name,
                         namespace,
-                        server.id,
+                        server.name,
                         header.name,
                         if header.mandatory {
                             "required"
@@ -244,7 +247,7 @@ mod tests {
 
     fn example() -> Catalog {
         let mut catalog: Catalog = serde_json::from_value(json!({"servers":[{
-            "id":"service", "endpoint":"https://mcp.example/mcp", "labels":["support"],
+            "name":"service", "endpoint":"https://mcp.example/mcp", "labels":["support"],
             "description":"Untrusted\u{1b}[2J\ntext", "oauth":{},
             "headers":[{"name":"X-Key","credential":"api_token","mandatory":true},{"name":"X-Tenant","credential":"tenant"},{"name":"X-Client","value":"temba"}]
         }]})).unwrap();
@@ -259,8 +262,8 @@ mod tests {
             "service",
             "https://mcp.example/mcp",
             "Labels: support",
-            "X-Key <- catalogs[id=team].tools.service.headers.X-Key or headersFromEnv (required)",
-            "X-Tenant <- catalogs[id=team].tools.service.headers.X-Tenant or headersFromEnv (optional)",
+            "X-Key <- catalogs[name=team].tools.service.headers.X-Key or headersFromEnv (required)",
+            "X-Tenant <- catalogs[name=team].tools.service.headers.X-Tenant or headersFromEnv (optional)",
             "X-Client = \"temba\" (public)",
             "OAuth: enabled",
             "automatic public discovery",

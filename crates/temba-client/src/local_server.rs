@@ -18,7 +18,7 @@ pub enum LocalServer {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StdioServer {
-    pub id: String,
+    pub name: String,
     #[serde(default)]
     pub description: String,
     pub command: String,
@@ -70,9 +70,9 @@ impl LocalServer {
         match self {
             Self::Http(server) => server.as_ref().clone(),
             Self::Stdio(server) => Server {
-                id: server.id.clone(),
+                name: server.name.clone(),
                 description: server.description.clone(),
-                endpoint: format!("http://{}/mcp/{}", listen, server.id),
+                endpoint: format!("http://{}/mcp/{}", listen, server.name),
                 labels: Vec::new(),
                 oauth: None,
                 headers: Vec::new(),
@@ -212,9 +212,9 @@ mod tests {
 local_catalog:
   enabled: true
   servers:
-    - id: network
+    - name: network
       endpoint: https://mcp.example.com/mcp
-    - id: disk
+    - name: disk
       command: private-command
       args: [private-argument]
       env: {TOKEN: private-token}
@@ -255,7 +255,7 @@ local_catalog:
         assert!(source.validate_catalog(&mut catalog).is_err());
         assert!(
             serde_json::from_value::<Server>(
-                serde_json::json!({"id":"disk","command":"private-command"})
+                serde_json::json!({"name":"disk","command":"private-command"})
             )
             .is_err()
         );
@@ -263,13 +263,13 @@ local_catalog:
     #[test]
     fn invalid_commands_mixed_transports_and_network_execution_are_rejected() {
         for definition in [
-            "{id: disk, command: program, endpoint: 'https://mcp.example.com'}",
-            "{id: disk, command: ''}",
-            "{id: disk, command: program, cwd: relative/path}",
-            "{id: disk, command: program, timeoutSeconds: 0}",
-            "{id: disk, command: program, env: {TOKEN: first, token: second}}",
-            "{id: disk, command: program, env: {'BAD-NAME': value}}",
-            "{id: disk, command: program, env: {TOKEN: first}, envFromEnv: [{name: TOKEN, valueFrom: {envVarRef: {name: ENV}}}]}",
+            "{name: disk, command: program, endpoint: 'https://mcp.example.com'}",
+            "{name: disk, command: ''}",
+            "{name: disk, command: program, cwd: relative/path}",
+            "{name: disk, command: program, timeoutSeconds: 0}",
+            "{name: disk, command: program, env: {TOKEN: first, token: second}}",
+            "{name: disk, command: program, env: {'BAD-NAME': value}}",
+            "{name: disk, command: program, env: {TOKEN: first}, envFromEnv: [{name: TOKEN, valueFrom: {envVarRef: {name: ENV}}}]}",
         ] {
             let input = format!("local_catalog:\n  enabled: true\n  servers: [{definition}]");
             let parsed = serde_yaml_ng::from_str::<config::Config>(&input);
@@ -278,7 +278,7 @@ local_catalog:
                 "accepted invalid stdio definition"
             );
         }
-        let mut config: config::Config = serde_yaml_ng::from_str("local_catalog: {servers: [{id: same, command: program}, {id: same, endpoint: 'https://mcp.example.com'}]}").unwrap();
+        let mut config: config::Config = serde_yaml_ng::from_str("local_catalog: {servers: [{name: same, command: program}, {name: same, endpoint: 'https://mcp.example.com'}]}").unwrap();
         assert!(config.validate().is_err());
     }
 }

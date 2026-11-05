@@ -120,14 +120,17 @@ async fn add(State(app): State<Shared>, h: HeaderMap, Json(mut s): Json<Server>)
     s.validate(app.allow_http)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let mut a = app.additions.write().await;
-    if app.catalog.servers.iter().any(|v| v.id == s.id) || a.contains_key(&s.id) {
-        return Err(StatusCode::CONFLICT);
+    if app.catalog.servers.iter().any(|v| v.name == s.name) || a.contains_key(&s.name) {
+        return Ok((StatusCode::CONFLICT, Json(json!({
+            "error":"duplicate_name",
+            "message":format!("MCP name '{}' already exists in this catalog. Choose a unique name; neither the existing definition nor the new one was modified", s.name)
+        }))).into_response());
     }
     if a.len() + app.catalog.servers.len() >= 256 {
         return Err(StatusCode::INSUFFICIENT_STORAGE);
     }
     let mut next = a.clone();
-    next.insert(s.id.clone(), s.clone());
+    next.insert(s.name.clone(), s.clone());
     store::persist(
         app.additions_path
             .as_deref()
@@ -140,7 +143,7 @@ async fn add(State(app): State<Shared>, h: HeaderMap, Json(mut s): Json<Server>)
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     *a = next;
-    eprintln!("Catalog: definition added: {}", s.id);
+    eprintln!("Catalog: definition added: {}", s.name);
     Ok((StatusCode::CREATED, Json(s)).into_response())
 }
 async fn remove(State(app): State<Shared>, h: HeaderMap, Path(id): Path<String>) -> ApiResult {
@@ -150,7 +153,7 @@ async fn remove(State(app): State<Shared>, h: HeaderMap, Path(id): Path<String>)
     if app.read_only {
         return Err(StatusCode::FORBIDDEN);
     }
-    if app.catalog.servers.iter().any(|s| s.id == id) {
+    if app.catalog.servers.iter().any(|s| s.name == id) {
         return Err(StatusCode::CONFLICT);
     }
     let mut additions = app.additions.write().await;
@@ -204,7 +207,7 @@ async fn main() -> Result<()> {
         if !auth_enabled && !server.access.public {
             eprintln!(
                 "Catalog: WARNING MCP {} is hidden from all users: protected access requires catalog authentication",
-                server.id
+                server.name
             );
         }
     }
@@ -223,7 +226,7 @@ async fn main() -> Result<()> {
         .route("/v1/bootstrap", get(bootstrap))
         .route("/v1/catalog", get(catalog_handler))
         .route("/v1/admin/servers", get(list).post(add))
-        .route("/v1/admin/servers/{id}", delete(remove))
+        .route("/v1/admin/servers/{name}", delete(remove))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", args.port)).await?;
@@ -254,11 +257,11 @@ mod api_tests {
     async fn group_filtered_catalog_is_isolated_between_users_and_anonymous_requests() {
         use std::time::{SystemTime, UNIX_EPOCH};
         let mut catalog: Catalog = serde_json::from_value(json!({"schemaVersion":2,"servers":[
-            {"id":"everyone","endpoint":"https://example.com/public","access":{"public":true},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-App","value":"temba"}]},
-            {"id":"signed-in","endpoint":"https://example.com/auth","access":{"authenticated":true}},
-            {"id":"only-x","endpoint":"https://example.com/x","access":{"groupsAnyOf":["X"]}},
-            {"id":"only-y","endpoint":"https://example.com/y","access":{"groupsAnyOf":["/Y"]}},
-            {"id":"x-or-y","endpoint":"https://example.com/xy","access":{"groupsAnyOf":["X","/Y"]}}
+            {"name":"everyone","endpoint":"https://example.com/public","access":{"public":true},"headers":[{"name":"X-Api-Key","credential":"api_key","mandatory":true},{"name":"X-App","value":"temba"}]},
+            {"name":"signed-in","endpoint":"https://example.com/auth","access":{"authenticated":true}},
+            {"name":"only-x","endpoint":"https://example.com/x","access":{"groupsAnyOf":["X"]}},
+            {"name":"only-y","endpoint":"https://example.com/y","access":{"groupsAnyOf":["/Y"]}},
+            {"name":"x-or-y","endpoint":"https://example.com/xy","access":{"groupsAnyOf":["X","/Y"]}}
         ]}))
         .unwrap();
         catalog.validate(false).unwrap();
@@ -328,7 +331,7 @@ mod api_tests {
             let declarations = &parsed
                 .servers
                 .iter()
-                .find(|s| s.id == "everyone")
+                .find(|s| s.name == "everyone")
                 .unwrap()
                 .headers;
             assert!(declarations[0].mandatory);
@@ -339,7 +342,7 @@ mod api_tests {
                 parsed
                     .servers
                     .iter()
-                    .map(|s| s.id.as_str())
+                    .map(|s| s.name.as_str())
                     .collect::<Vec<_>>(),
                 expected
             );
@@ -356,7 +359,7 @@ mod api_tests {
     }
     #[tokio::test]
     async fn public_filter_etag_and_admin_collisions() {
-        let mut catalog:Catalog=serde_json::from_value(json!({"schemaVersion":2,"servers":[{"id":"public","endpoint":"https://public.example/mcp"},{"id":"private","endpoint":"https://private.example/mcp","access":{"authenticated":true}}]})).unwrap();
+        let mut catalog:Catalog=serde_json::from_value(json!({"schemaVersion":2,"servers":[{"name":"public","endpoint":"https://public.example/mcp"},{"name":"private","endpoint":"https://private.example/mcp","access":{"authenticated":true}}]})).unwrap();
         catalog.validate(false).unwrap();
         let app = Arc::new(App {
             catalog,
@@ -377,7 +380,7 @@ mod api_tests {
             .unwrap();
         let parsed: Catalog = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.servers.len(), 1);
-        assert_eq!(parsed.servers[0].id, "public");
+        assert_eq!(parsed.servers[0].name, "public");
         let mut h = HeaderMap::new();
         h.insert("if-none-match", etag);
         assert_eq!(
@@ -389,7 +392,7 @@ mod api_tests {
         );
         let definition = || {
             serde_json::from_value::<Server>(
-                json!({"id":"temporary","endpoint":"https://temp.example/mcp"}),
+                json!({"name":"temporary","endpoint":"https://temp.example/mcp"}),
             )
             .unwrap()
         };
@@ -404,13 +407,14 @@ mod api_tests {
             "authorization",
             HeaderValue::from_static("Bearer admin-test-only"),
         );
-        // An API addition cannot reuse an ID owned by the Helm catalog.
+        // An API addition cannot reuse a name owned by the Helm catalog.
         let mut collision = app.catalog.servers[0].clone();
         collision.endpoint = "https://other.example/mcp".into();
         assert_eq!(
             add(State(app.clone()), h.clone(), Json(collision))
                 .await
-                .unwrap_err(),
+                .unwrap()
+                .status(),
             StatusCode::CONFLICT
         );
         assert!(app.additions.read().await.is_empty());
@@ -421,12 +425,18 @@ mod api_tests {
                 .status(),
             StatusCode::CREATED
         );
-        assert_eq!(
-            add(State(app.clone()), h.clone(), Json(definition()))
-                .await
-                .unwrap_err(),
-            StatusCode::CONFLICT
-        );
+        let before = app.additions.read().await.clone();
+        let response = add(State(app.clone()), h.clone(), Json(definition()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "duplicate_name");
+        assert!(body["message"].as_str().unwrap().contains("temporary"));
+        assert_eq!(*app.additions.read().await, before);
         let restored =
             store::load(app.additions_path.as_ref().unwrap(), &app.catalog, false).unwrap();
         assert!(restored.contains_key("temporary"));
@@ -459,9 +469,10 @@ mod api_tests {
             servers: vec![],
         };
         let path = store::test_path();
-        let definition: Server =
-            serde_json::from_value(json!({"id":"persisted","endpoint":"https://example.com/mcp"}))
-                .unwrap();
+        let definition: Server = serde_json::from_value(
+            json!({"name":"persisted","endpoint":"https://example.com/mcp"}),
+        )
+        .unwrap();
         let headers = || {
             let mut h = HeaderMap::new();
             h.insert(
@@ -504,7 +515,7 @@ mod api_tests {
         app.additions
             .write()
             .await
-            .insert(definition.id.clone(), definition);
+            .insert(definition.name.clone(), definition);
         assert_eq!(
             remove(State(app.clone()), headers(), Path("persisted".into()))
                 .await

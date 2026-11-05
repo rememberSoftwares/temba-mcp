@@ -65,7 +65,7 @@ fn application(
     let mut gateways = Vec::new();
     for server in &local.servers {
         if let LocalServer::Stdio(spec) = server {
-            let route = format!("/mcp/{}", spec.id);
+            let route = format!("/mcp/{}", spec.name);
             let gateway = Gateway::new(spec.as_ref().clone(), shutdown.clone());
             let shared = gateway.clone();
             let service = StreamableHttpService::new(
@@ -145,7 +145,7 @@ mod tests {
     #[tokio::test]
     async fn serves_iac_snapshot_with_etag_and_no_management_api() {
         let mut config: Config = serde_yaml_ng::from_str(
-            "local_catalog:\n  servers:\n  - id: service\n    endpoint: https://mcp.example/mcp\n",
+            "local_catalog:\n  servers:\n  - name: service\n    endpoint: https://mcp.example/mcp\n",
         )
         .unwrap();
         config.validate().unwrap();
@@ -178,7 +178,7 @@ mod tests {
         let response = http.get(format!("{base}/v1/catalog")).send().await.unwrap();
         let etag = response.headers()["etag"].clone();
         let data: Catalog = response.json().await.unwrap();
-        assert_eq!(data.servers[0].id, "service");
+        assert_eq!(data.servers[0].name, "service");
         assert_eq!(
             http.get(format!("{base}/v1/catalog"))
                 .header("if-none-match", etag)
@@ -225,8 +225,8 @@ mod gateway_tests {
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stdio_mcp.py");
         let yaml = json!({"local_catalog":{"enabled":true,"servers":[
-            {"id":"program","command":if cfg!(windows) {"python"} else {"python3"},"args":[fixture]},
-            {"id":"remote","endpoint":"https://mcp.example.com/mcp"}
+            {"name":"program","command":if cfg!(windows) {"python"} else {"python3"},"args":[fixture]},
+            {"name":"remote","endpoint":"https://mcp.example.com/mcp"}
         ]}});
         let mut runtimes = Vec::new();
         let mut addresses = Vec::new();
@@ -286,9 +286,9 @@ mod gateway_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mut config: Config = serde_json::from_value(json!({"local_catalog":{"enabled":true,"servers":[
-            {"id":"first","command":if cfg!(windows) {"python"} else {"python3"},"args":[fixture],"env":{"FIXTURE_TOKEN":"private-first"}},
-            {"id":"second","command":if cfg!(windows) {"python"} else {"python3"},"args":[fixture],"env":{"FIXTURE_TOKEN":"private-second"}},
-            {"id":"network","endpoint":"https://mcp.invalid/mcp"}
+            {"name":"first","command":if cfg!(windows) {"python"} else {"python3"},"args":[fixture],"env":{"FIXTURE_TOKEN":"private-first"}},
+            {"name":"second","command":if cfg!(windows) {"python"} else {"python3"},"args":[fixture],"env":{"FIXTURE_TOKEN":"private-second"}},
+            {"name":"network","endpoint":"https://mcp.invalid/mcp"}
         ]}})).unwrap();
         config.validate().unwrap();
         let shutdown = CancellationToken::new();

@@ -52,7 +52,7 @@ catalogueAuth:
 
 catalog:
   servers:
-    - id: documentation
+    - name: documentation
       description: Search and browse the team's documentation
       endpoint: https://docs-mcp.example.com/mcp
       access:
@@ -103,7 +103,7 @@ In the YAML file on the user's machine:
 ```yaml
 allow_insecure_http: true
 catalogs:
-  - id: team
+  - name: team
     url: http://127.0.0.1:18080
 ```
 
@@ -168,15 +168,15 @@ Old keys are rejected. To update an installation from earlier versions:
 | Global client `labels` | `labels` inside each remote `catalogs` entry; no label selection for local/dynamic MCPs |
 | Global `auth` | `catalogueAuth` |
 | Client `temba.toml` | `temba.yaml`; the client now accepts YAML only |
-| `catalog_url` or `[[catalogs]]` in TOML | YAML `catalogs` list with `id` and `url` |
+| `catalog_url` or `[[catalogs]]` in TOML | YAML `catalogs` list with `name` and `url` |
 | `[local_catalog]` with `enabled` / `max_servers` | YAML `dynamic_catalog` |
-| `[tool.<catalog>.<id>]` | `tools.<id>` inside the matching `catalogs` entry |
+| `[tool.<catalog>.<id>]` | `tools.<name>` inside the matching `catalogs` entry |
 | Executable `temba-client` | `temba` (package remains `temba-client`) |
 | `catalogAccess` | An `access` rule |
 | `adminApi.mutable` | `adminApi.readOnly`, with inverted logic |
 | `auth.type` on an MCP server | `oauth` and/or `headers` |
 | `url` on an MCP definition | `endpoint` |
-| Display `name` on an MCP definition | Remove it; keep the existing unique `id` |
+| `id` on catalog aliases or MCP definitions | Rename the key to `name`, keeping its value |
 | `headers[].prefix` | Complete value supplied by the client |
 | Credential alias keys in client headers | Actual HTTP header names in `headers` or `headersFromEnv[].name` |
 | `{ env = "VARIABLE" }` in TOML | `headersFromEnv` list with `name` and `valueFrom.envVarRef.name` |
@@ -184,7 +184,12 @@ Old keys are rejected. To update an installation from earlier versions:
 | `refresh_seconds` in TOML | `refresh_minutes`, default `60`, range `1..1440` |
 | `security.allowLoopbackHttp` in Helm | `security.allowInsecureHttp` |
 
-Before using client 1.4.9, update the catalog to 1.3.2 and remove server-level `name` from Helm values, raw catalog files and persisted API definitions. Keep the existing IDs so client mappings and tool IDs remain stable. Header `name` fields are unchanged.
+Update the client and catalog server together: both now require `name` instead of
+`id`. Rename this key in `catalogs[]`, MCP definitions, Helm values and any
+persisted API definitions. Keep the values unchanged so tool paths and credential
+mappings stay stable. Back up persisted definitions before editing them. Old
+`id` keys are rejected; there is no compatibility alias. Header `name` fields and
+protocol fields such as `tool_id`, `local_id` and OAuth `clientId` are unchanged.
 
 The catalog format is `schemaVersion: 2`. The Python gateway, Redis, token envelopes,
 and old HTTP MCP routes are no longer part of the architecture.
