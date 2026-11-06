@@ -106,7 +106,7 @@ impl Federation {
             result["partial"] = json!(false);
             result["scope"] = json!("dynamic");
             result["hint"] = json!(
-                "Only the supplied secret local_ids were searched. This result does not describe remote catalog authentication or permissions. Use exact returned tool_id values; no catalog login is needed for these registrations."
+                "Only supplied local_ids were inspected; no catalog login is needed. Empty or omitted query lists these MCPs without schemas. Use keywords with the same local_ids for detailed tools; use exact returned tool_id values."
             );
             return result;
         }
@@ -123,9 +123,23 @@ impl Federation {
         let mut servers = Vec::new();
         let mut catalogs = Vec::new();
         let mut partial = false;
+        let inventory = query.trim().is_empty();
+        let mut total_matches = 0u64;
+        let mut loaded_tools = 0u64;
+        let mut truncated = false;
         for (id, response, diagnostic) in responses {
             let mut status = response["catalog"].clone();
             status["name"] = json!(id);
+            if inventory {
+                status["loaded_tools"] = response["loaded_tools"].clone();
+                loaded_tools += response["loaded_tools"].as_u64().unwrap_or(0);
+            } else {
+                for key in ["total_matches", "returned_tools", "truncated", "limit"] {
+                    status[key] = response[key].clone();
+                }
+                total_matches += response["total_matches"].as_u64().unwrap_or(0);
+                truncated |= response["truncated"].as_bool().unwrap_or(false);
+            }
             if let Some(message) = diagnostic {
                 status["error"] = json!(message);
             }
@@ -152,8 +166,16 @@ impl Federation {
                 servers.push(server);
             }
         }
-        json!({"tools":tools,"servers":servers,"catalogs":catalogs,"partial":partial,
-            "hint":"Use returned tool_id values exactly. Each catalog contributes its own ranked results. A partial result means some catalogs are loading, unavailable or awaiting their own login. Catalog login cannot grant group membership. Credentials and sessions are isolated by catalog and MCP. Dynamic registrations are only searched when their local_ids are supplied."})
+        let returned_tools = tools.len();
+        let mut response = json!({"mode":if inventory {"inventory"} else {"search"},"tools":tools,"servers":servers,"catalogs":catalogs,"partial":partial,"truncated":truncated,
+            "hint":if inventory {"Visible MCP server inventory only; no tool descriptions or schemas. tool_count is unknown until a server is ready. Use keyword queries for tools and connection actions. partial reports catalog loading/login/unavailability."} else {"Use exact returned tool_id values. truncated means matching tools exceeded a per-catalog limit; refine the query. total_matches counts currently searchable tools and connection actions. partial reports catalog loading/login/unavailability. Catalog login cannot grant group membership."}});
+        if inventory {
+            response["loaded_tools"] = json!(loaded_tools);
+        } else {
+            response["total_matches"] = json!(total_matches);
+            response["returned_tools"] = json!(returned_tools);
+        }
+        response
     }
 }
 
@@ -167,7 +189,7 @@ impl std::ops::Deref for FederatedHandler {
 }
 impl ServerHandler for FederatedHandler {
     fn get_info(&self) -> ServerConfig {
-        Handler(self.dynamic.clone()).get_info().with_instructions("Use tool_search, then call_tool with an exact returned tool_id. Remote IDs include catalog, MCP and tool; never construct or shorten them. Each catalog has independent permissions, login and credentials. Inspect catalogs and partial for incomplete results; use a catalog's connect_tool only to retry its failed login. A catalog login is not a remote MCP login and cannot grant group access. Continue the original request after a connection returns ready. Missing mandatory headers must be configured locally; never request secrets in chat. Dynamic additions return secret local_ids: retain them only in the originating conversation and pass them to tool_search.local_ids; this scoped search does not trigger catalog login. Dynamic entries remain available until disconnected or the process exits.")
+        Handler(self.dynamic.clone()).get_info().with_instructions("Use tool_search with an empty or omitted query to list MCP servers without tool schemas. Use keyword queries for tool details, then call_tool with an exact returned tool_id. Remote IDs include catalog, MCP and tool; never construct or shorten them. Each catalog has independent permissions, login and credentials. Inspect catalogs and partial for incomplete results; use a catalog's connect_tool only to retry its failed login. A catalog login is not a remote MCP login and cannot grant group access. Continue the original request after a connection returns ready. Missing mandatory headers must be configured locally; never request secrets in chat. Dynamic additions return secret local_ids: retain them only in the originating conversation and pass them to tool_search.local_ids; this scoped search does not trigger catalog login. Dynamic entries remain available until disconnected or the process exits.")
     }
     async fn list_tools(
         &self,
@@ -176,9 +198,7 @@ impl ServerHandler for FederatedHandler {
     ) -> Result<ListToolsResult, ErrorData> {
         let mut result = Handler(self.dynamic.clone()).list_tools(p, c).await?;
         for tool in &mut result.tools {
-            if tool.name == "tool_search" {
-                tool.description = Some("Search all catalogs and merge up to search_limit ranked tools per catalog. catalogs reports independent authentication and availability; partial signals incomplete results. With local_ids, search only those secret dynamic registrations without catalog login.".into());
-            } else if tool.name == "call_tool" {
+            if tool.name == "call_tool" {
                 tool.description = Some("Call an exact tool_id returned by tool_search or add_mcp. Remote IDs are catalog.MCP.tool; each catalog and remote MCP has its own connection flow. Do not invent, shorten or exchange IDs across catalogs.".into());
             }
         }
@@ -198,10 +218,15 @@ impl ServerHandler for FederatedHandler {
                 },
                 None => vec![],
             };
-            let query = args
-                .and_then(|a| a.get("query"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let query = match args.and_then(|a| a.get("query")) {
+                None => "",
+                Some(Value::String(query)) => query,
+                _ => {
+                    return Ok(failure(
+                        "query must be a string; use an empty string or omit it to list MCP servers",
+                    ));
+                }
+            };
             return Ok(result(self.search(query, &ids).await));
         }
         if p.name == "call_tool" {
@@ -467,6 +492,23 @@ local_catalog:
         }
         let result = federation.search("operation", &[]).await;
         assert_eq!(result["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(result["total_matches"], 14);
+        assert_eq!(result["returned_tools"], 10);
+        assert_eq!(result["truncated"], true);
+        let first = result["catalogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "first")
+            .unwrap();
+        assert_eq!(first["total_matches"], 7);
+        assert_eq!(first["truncated"], true);
+        let inventory = federation.search("", &[]).await;
+        assert_eq!(inventory["mode"], "inventory");
+        assert_eq!(inventory["loaded_tools"], 14);
+        assert_eq!(inventory["servers"].as_array().unwrap().len(), 2);
+        assert!(inventory["tools"].as_array().unwrap().is_empty());
+        assert_eq!(inventory["truncated"], false);
         for id in ["first", "second"] {
             assert_eq!(
                 result["tools"]
@@ -490,6 +532,32 @@ local_catalog:
         });
         let client = ().serve(tokio::io::split(front)).await.unwrap();
         let server = server.await.unwrap();
+        let advertised = client.peer().list_all_tools().await.unwrap();
+        let search = advertised.iter().find(|t| t.name == "tool_search").unwrap();
+        assert_eq!(search.description, search::tool().description);
+        assert!(
+            search
+                .description
+                .as_ref()
+                .unwrap()
+                .starts_with("List MCPs with query=\"\"")
+        );
+        assert!(search.input_schema.get("required").is_none());
+        assert!(
+            search.input_schema["properties"]["query"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("without tool descriptions")
+        );
+        let omitted = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("tool_search"))
+            .await
+            .unwrap();
+        let omitted: Value =
+            serde_json::from_str(&omitted.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(omitted["mode"], "inventory");
+        assert!(omitted["tools"].as_array().unwrap().is_empty());
         for namespace in ["first", "second"] {
             let response = client
                 .peer()
@@ -581,7 +649,9 @@ local_catalog:
         assert_eq!(result["scope"], "dynamic");
         assert!(result.get("catalog").is_none());
         assert!(result["catalogs"].as_array().unwrap().is_empty());
-        assert_eq!(result["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(result["mode"], "inventory");
+        assert!(result["tools"].as_array().unwrap().is_empty());
+        assert_eq!(result["servers"].as_array().unwrap().len(), 1);
         federation.dynamic.close().await;
     }
 

@@ -6,6 +6,10 @@ the programs automatically. No additional command is needed.
 
 ## Configure the programs
 
+Run `temba add mcp`, select `local`, and leave the MCP endpoint empty to configure
+a stdio program. Enter the executable and each argument separately; the assistant
+also supports working directories and environment variables. Or edit the YAML:
+
 ```yaml
 local_catalog:
   enabled: true

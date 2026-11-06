@@ -28,6 +28,7 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 process-wrap = { version = "10.0", features = ["tokio1"] }
+rpassword = "7"
 
 
 sha2 = "0.10"

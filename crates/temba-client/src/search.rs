@@ -1,5 +1,26 @@
 //! Small local BM25 index; no embedding service or remote search requests.
 use std::collections::HashMap;
+
+pub fn tool() -> rmcp::model::Tool {
+    rmcp::model::Tool::new(
+        "tool_search",
+        "List MCPs with query=\"\" (no tool schemas). Use keywords for detailed tool search. Empty or omitted query returns a compact server inventory. Keyword results are capped per catalog; check total_matches and truncated. Pass local_ids only for private dynamic registrations.",
+        serde_json::json!({
+            "type":"object",
+            "properties":{
+                "query":{
+                    "type":"string", "default":"",
+                    "description":"Empty or omitted: list visible MCP servers and states, without tool descriptions or input schemas. Keywords: find detailed tools, capped by search_limit per catalog; inspect total_matches and truncated."
+                },
+                "local_ids":{
+                    "type":"array", "items":{"type":"string"}, "maxItems":64,
+                    "description":"Secret IDs of dynamic registrations to inspect/search exclusively. Omit to use configured catalogs."
+                }
+            },
+            "additionalProperties":false
+        }).as_object().unwrap().clone()
+    )
+}
 pub fn words(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())

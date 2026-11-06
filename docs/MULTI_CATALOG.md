@@ -23,9 +23,13 @@ catalogs:
 Each remote catalog selects its own `labels` (default `[]`); the global `labels`
 key is no longer accepted. Local and dynamically added MCPs have no label filter.
 
-Each catalog contributes up to five ranked results. Two catalogs can therefore
+Keyword queries contribute up to five ranked results per catalog. Two catalogs can therefore
 return up to ten tools. A source with fewer matches contributes fewer results.
 Search scores are evaluated within each catalog; raw scores are not compared across sources.
+An empty or omitted query instead lists visible MCP servers and loaded tool counts,
+without tool descriptions or schemas. Keyword searches expose `total_matches`,
+`returned_tools` and `truncated` globally and per catalog; `partial` describes
+catalog availability, independently of the result cap.
 An unavailable catalog is reported in `catalogs` with `partial: true`; others remain usable.
 An unavailable source retries in the background at most once per minute; healthy
 sources use `refresh_minutes`. Failed login retries remain explicit tool actions.

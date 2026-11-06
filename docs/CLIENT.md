@@ -8,15 +8,15 @@ It is read when the process starts.
 
 ```sh
 temba add catalog
+temba add mcp
 temba set search_limit 10
 temba set refresh_minutes 120
 temba set dynamic_catalog true
 ```
 
 `add catalog` asks for a URL, unique name and optional comma-separated labels.
-An empty URL enables the local catalog; add its MCPs under `local_catalog.servers`
-in the generated file. Adding an HTTP URL asks permission to enable unencrypted
-HTTP. These commands configure Temba without connecting to a catalog or starting MCPs.
+An empty URL enables the local catalog; use `temba add mcp` to add its MCPs.
+Adding an HTTP URL asks permission to enable unencrypted HTTP. These commands configure Temba without connecting to a catalog or starting MCPs.
 
 The default file is **`~/.temba/temba.yaml`** on Linux/macOS, and
 **`%USERPROFILE%\.temba\temba.yaml`** on Windows. Both refer to the current user's
@@ -35,6 +35,34 @@ See `temba set --help` for boolean values and integer ranges.
 Changes are validated before saving; existing settings and credentials are retained.
 The commands rewrite YAML formatting and remove comments. New files use private
 permissions on Unix. Restart your AI host's Temba process to apply changes.
+
+## Add an MCP interactively
+
+```sh
+temba add mcp
+```
+
+Choose a catalog by number or name. The menu always offers `local`, including
+when it has not been enabled yet:
+
+- **Local catalog:** add an HTTP endpoint or leave it empty to configure a stdio
+  program. The assistant asks for a unique name, optional description and timeout.
+  HTTP entries support OAuth plus extra headers. Advanced OAuth options are optional.
+  For stdio, enter each argument separately, an optional absolute working directory,
+  and any environment variables the program needs. The local catalog is enabled on save.
+- **Remote catalog:** configure local headers for an MCP already published there.
+  Copy its exact name and endpoint from `temba catalog`. Definitions, OAuth and
+  access rules remain managed by the shared catalog; this command only writes
+  `catalogs[].tools` on your computer.
+
+Headers can read an environment variable or hold a private literal value.
+Private values are hidden when typed in a terminal. For local HTTP definitions,
+headers can also hold public values, and private headers can be marked mandatory.
+Variables referenced from the environment must be available when your AI host starts.
+
+The assistant does not execute commands, connect to MCPs or modify a shared catalog.
+Duplicate names or headers cannot overwrite existing settings. An abandoned or
+invalid setup leaves the configuration file unchanged.
 
 ## Basic settings
 
@@ -148,6 +176,37 @@ catalog where you want to keep the same selection.
 
 Group rules are checked separately by the central catalog.
 A label cannot bypass a Keycloak rule.
+
+## Inventory and tool search
+
+Use `tool_search` to answer which MCPs are available. Its `query` is optional:
+
+```json
+{"query": ""}
+```
+
+An empty, whitespace-only or omitted query returns `mode: inventory`: visible MCP
+names, connection states, per-server `tool_count` and aggregate `loaded_tools`.
+`tools` is empty; tool descriptions, parameter schemas and missing-header details
+are not included. A server's `tool_count` is `null` until its tools have loaded.
+The inventory is not capped by `search_limit` and does not wait for MCP discovery
+to finish. Catalog login still starts automatically when required.
+
+For detailed tools and connection actions, supply keywords:
+
+```json
+{"query": "search documents"}
+```
+
+This returns `mode: search`, with full descriptions and `inputSchema` for at most
+`search_limit` matches per catalog. `total_matches`, `returned_tools`, `limit` and
+`truncated` explain each catalog's cap; aggregate counts are also returned.
+Matches include connection actions for MCPs that are not ready. `partial`
+separately signals a catalog awaiting login, loading or unavailable. Neither count
+is a token budget: descriptions and schemas can be large even for one tool.
+
+For private dynamic registrations, pass their `local_ids` in either mode. Other
+registrations are not enumerated.
 
 ## Providing tokens and private headers
 
@@ -273,7 +332,7 @@ by the search. The technical actions are `<name>.__temba_connect__`, called thro
 Temba waits up to 10 seconds for the result of an authorization it has started. If your
 browser session allows quick SSO, the request can continue immediately.
 Otherwise, the assistant indicates that browser approval is still pending.
-Search may also wait briefly for ongoing tool discovery.
+Keyword searches may also wait briefly for ongoing tool discovery.
 
 Periodic refresh does not reopen the browser. Renewal using a
 refresh token is silent; if new authorization is required,
@@ -285,7 +344,7 @@ A new connection may therefore be needed after the process stops.
 
 ### Reading catalog states
 
-`tool_search` returns `catalog.status`, among other fields:
+`tool_search` reports each source's status in `catalogs[].status`:
 
 | State | Meaning |
 | --- | --- |
@@ -297,9 +356,9 @@ A new connection may therefore be needed after the process stops.
 | `auth_failed` | The connection failed or expired before approval |
 | `catalog_unavailable` | Authentication succeeded, but loading failed |
 
-The response also contains `catalog.authentication_enabled`, `catalog.authenticated`,
-and `catalog.automatic_login`. `catalog_connect_tool` offers a retry only
-after authentication fails, not while a connection is in progress or already established.
+Detailed searches also include authentication flags per catalog. The compact
+inventory keeps the status and relevant hint. `catalogs[].connect_tool` offers a
+retry only after authentication fails, not during a connection or after success.
 
 The `<name>.__temba_disconnect__` action closes the MCP connection and removes its OAuth session.
 `__catalog__.__temba_disconnect__` ends the catalog session and closes connections,

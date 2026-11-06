@@ -61,7 +61,7 @@ where
     name = "temba",
     version,
     about = "Local MCP client and catalog CLI; OAuth credentials stay in memory",
-    after_help = "Configuration examples:\n  temba add catalog                   Add a remote catalog or enable the local catalog\n  temba set dynamic_catalog true      Enable the optional dynamic registration tool\n  temba set search_limit 10           Set results per catalog\n  temba set refresh_minutes 120       Set catalog refresh interval\n\nConfiguration file:\n  Default: ~/.temba/temba.yaml\n  Windows: %USERPROFILE%\\.temba\\temba.yaml\n  Override with --config <FILE> or TEMBA_CONFIG.\n\nMCP mode (no subcommand):\n  Your AI client launches Temba, which waits for MCP requests on stdin.\n  stdout is reserved for the protocol. For terminal use, run 'temba catalog'."
+    after_help = "Configuration examples:\n  temba add catalog                   Add a remote catalog or enable the local catalog\n  temba add mcp                       Add a local MCP or configure remote MCP headers\n  temba set dynamic_catalog true      Enable the optional dynamic registration tool\n  temba set search_limit 10           Set results per catalog\n  temba set refresh_minutes 120       Set catalog refresh interval\n\nConfiguration file:\n  Default: ~/.temba/temba.yaml\n  Windows: %USERPROFILE%\\.temba\\temba.yaml\n  Override with --config <FILE> or TEMBA_CONFIG.\n\nMCP mode (no subcommand):\n  Your AI client launches Temba, which waits for MCP requests on stdin.\n  stdout is reserved for the protocol. For terminal use, run 'temba catalog'."
 )]
 struct Args {
     /// Configuration file; defaults to ~/.temba/temba.yaml in your home directory.
@@ -93,6 +93,8 @@ enum Command {
 enum AddCommand {
     /// Add a remote catalog; leave the URL empty to enable the local catalog.
     Catalog,
+    /// Add an HTTP/stdio MCP locally, or configure local headers for a remote MCP.
+    Mcp,
 }
 
 struct Entry {
@@ -866,31 +868,34 @@ impl Local {
         }
     }
     async fn search(self: &Arc<Self>, query: &str, local_ids: &[String]) -> Value {
+        let inventory = query.trim().is_empty();
         let started = Instant::now();
         if local_ids.is_empty() {
             self.ensure_catalog_login().await;
         } else {
             self.validate_catalog_session().await;
         }
-        let _ = wait_for_connection(
-            || async {
-                let entries = self
-                    .servers
-                    .read()
-                    .await
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for entry in entries {
-                    if entry.state.read().await.status == "connecting" {
-                        return "connecting";
+        if !inventory {
+            let _ = wait_for_connection(
+                || async {
+                    let entries = self
+                        .servers
+                        .read()
+                        .await
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for entry in entries {
+                        if entry.state.read().await.status == "connecting" {
+                            return "connecting";
+                        }
                     }
-                }
-                "ready"
-            },
-            AUTH_COMPLETION_WAIT.saturating_sub(started.elapsed()),
-        )
-        .await;
+                    "ready"
+                },
+                AUTH_COMPLETION_WAIT.saturating_sub(started.elapsed()),
+            )
+            .await;
+        }
         let mut entries = self.servers.read().await.clone();
         for id in local_ids.iter().take(64) {
             if let Some(entry) = self.personal_entry(id).await {
@@ -902,14 +907,18 @@ impl Local {
         let mut states = vec![];
         for e in entries.values() {
             let s = e.state.read().await;
-            let mut state = json!({"server":e.definition.name,"label":e.label(),"status":s.status});
-            if s.status == "credentials_required"
+            let mut state = json!({"server":e.definition.name,"label":e.label(),"status":s.status,"tool_count":if s.status=="ready" {Some(s.tools.len())}else{None}});
+            if !inventory
+                && s.status == "credentials_required"
                 && let Err(error) = self.credential_headers(e)
                 && let Some(missing) = error.downcast_ref::<MissingHeaders>()
             {
                 state["missing_headers"] = json!(missing.0);
             }
             states.push(state);
+            if inventory {
+                continue;
+            }
             if s.status == "ready" {
                 for t in &s.tools {
                     docs.push(format!(
@@ -934,16 +943,17 @@ impl Local {
         let scores = search::scores(query, &docs);
         let mut indexes: Vec<_> = (0..rows.len()).collect();
         indexes.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]).then_with(|| a.cmp(b)));
-        let tools: Vec<_> = indexes
+        let matches: Vec<_> = indexes.into_iter().filter(|i| scores[*i] > 0.).collect();
+        let total_matches = matches.len();
+        let tools: Vec<_> = matches
             .into_iter()
-            .filter(|i| query.trim().is_empty() || scores[*i] > 0.)
             .take(self.config.search_limit)
             .map(|i| rows[i].clone())
             .collect();
         let catalog_auth_enabled = self.catalog_auth.read().await.is_some();
         let catalog_status = *self.catalog_status.read().await;
         let retry_login = catalog_auth_enabled && catalog_status == "auth_failed";
-        json!({
+        let mut response = json!({
             "tools":tools,
             "servers":states,
             "catalog_connect_tool":if retry_login{Some("__catalog__.__temba_connect__")}else{None},
@@ -966,7 +976,38 @@ impl Local {
                 }
             },
             "hint":"Only listed servers are currently visible. A missing MCP may be unavailable or filtered by catalog permissions or local labels; do not infer the reason or invent its tool_id. Catalog login is separate from remote MCP login. Local registrations require their secret local_ids; unknown or disconnected IDs expose no tools and must be registered again."
-        })
+        });
+        response["mode"] = json!(if inventory { "inventory" } else { "search" });
+        response["truncated"] =
+            json!(!inventory && total_matches > response["tools"].as_array().unwrap().len());
+        if inventory {
+            let loaded_tools: usize = states
+                .iter()
+                .filter_map(|s| s["tool_count"].as_u64())
+                .map(|n| n as usize)
+                .sum();
+            response["loaded_tools"] = json!(loaded_tools);
+            let catalog = &mut response["catalog"];
+            for key in [
+                "authentication_enabled",
+                "authenticated",
+                "automatic_login",
+                "connect_description",
+            ] {
+                catalog.as_object_mut().unwrap().remove(key);
+            }
+            if catalog_status != "auth_in_progress" {
+                catalog.as_object_mut().unwrap().remove("authorization_url");
+            }
+            response["hint"] = json!(
+                "MCP server inventory only; no tool definitions or schemas are included. tool_count is unknown until a server is ready. Use a keyword query to find detailed tools and connection actions."
+            );
+        } else {
+            response["total_matches"] = json!(total_matches);
+            response["returned_tools"] = json!(response["tools"].as_array().unwrap().len());
+            response["limit"] = json!(self.config.search_limit);
+        }
+        response
     }
     async fn call(
         self: &Arc<Self>,
@@ -1131,7 +1172,7 @@ fn bail_catalog() {
 }
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search to find visible tools, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to a remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. When a connection result is authenticated or ready, continue the original request immediately without asking the user to retry. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
+        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("Use tool_search with an empty or omitted query to list MCP servers without tool schemas. Use keywords to find tool details, then call_tool with a returned tool_id. Catalog authentication starts automatically on a tool request when enabled; background polling never opens a browser. Read catalog.status and catalog.hint: never ask the user whether to call a technical connection action. While catalog login is pending, ask only to finish authorization in the browser. An authenticated catalog needs no further login; a missing MCP does not imply a disconnected catalog. __catalog__.__temba_connect__ signs in only to the Temba catalog and reloads definitions allowed for that identity; it never starts authentication to a remote MCP and cannot grant access permissions. A remote MCP connection uses its own <server>.__temba_connect__ action returned by tool_search. When a connection result is authenticated or ready, continue the original request immediately without asking the user to retry. Report the exact connection target from the result. auth_in_progress means authorization is pending; search again and require status ready before reporting a remote MCP as connected. credentials_required means mandatory central-catalog headers must be configured locally; inspect missing_headers. Headers already configured are not exposed and need no user action. Missing servers may be filtered by permissions or labels; do not invent tool IDs or treat catalog login as a remote login.");
         if self.0.config.dynamic_catalog.enabled {
             let instructions = info.instructions.clone().unwrap_or_default();
             info.with_instructions(format!("{} Ephemeral local registration is available through add_mcp. Retain the secret local_id only in the originating conversation. Include it in tool_search.local_ids; call tools using the returned tool_id. Other local entries are deliberately undiscoverable. Private values supplied to add_mcp.headers stay only in RAM. Local registration, scoped search and connection do not require catalog authentication. OAuth providers are discovered automatically over public destinations when definition.oauth.allowedOrigins is absent or empty. A nonempty list restricts provider origins for that MCP. A registration can be disconnected and recreated with a corrected definition.", instructions))
@@ -1144,7 +1185,7 @@ impl ServerHandler for Handler {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let mut tools=vec![Tool::new("tool_search","Search central tools and remote MCP connection states. To include ephemeral local MCPs, supply their secret IDs in local_ids. Local MCPs are never enumerated without their IDs. Catalog authentication is automatic; catalog.status reports public, auth_in_progress, loading, authenticated or failure. catalog_connect_tool is returned only to retry a failed catalog login.",json!({"type":"object","properties":{"query":{"type":"string"},"local_ids":{"type":"array","items":{"type":"string"},"maxItems":64}},"required":["query"],"additionalProperties":false}).as_object().unwrap().clone()),Tool::new("call_tool","Call a tool_id returned by tool_search. __catalog__.__temba_connect__ authenticates only to the Temba catalog; <server>.__temba_connect__ connects only to that visible remote MCP. Report the returned target and status accurately.",json!({"type":"object","properties":{"tool_id":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_id"],"additionalProperties":false}).as_object().unwrap().clone())];
+        let mut tools=vec![search::tool(),Tool::new("call_tool","Call a tool_id returned by tool_search. __catalog__.__temba_connect__ authenticates only to the Temba catalog; <server>.__temba_connect__ connects only to that visible remote MCP. Report the returned target and status accurately.",json!({"type":"object","properties":{"tool_id":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_id"],"additionalProperties":false}).as_object().unwrap().clone())];
         if self.0.config.dynamic_catalog.enabled {
             tools.push(Tool::new("add_mcp",
                 "Register an ephemeral MCP in local RAM and return a secret local_id. Supply a definition using endpoint, oauth and header declarations, and optional private header values keyed by credential reference. No central modification or file persistence. Only callers presenting local_id can discover/use this registration. OAuth authorization is independent of catalog authentication. Omit definition.oauth.allowedOrigins or use an empty list for automatic public discovery; provide a nonempty list to restrict trusted provider origins. OAuth authorization is a separate browser action. Never publish another conversation's local_id.",
@@ -1202,9 +1243,16 @@ impl ServerHandler for Handler {
                     },
                     None => vec![],
                 };
-                Ok(result(
-                    self.0.search(string("query").unwrap_or(""), &ids).await,
-                ))
+                let query = match args.get("query") {
+                    None => "",
+                    Some(Value::String(query)) => query,
+                    _ => {
+                        return Ok(failure(
+                            "query must be a string; use an empty string or omit it to list MCP servers",
+                        ));
+                    }
+                };
+                Ok(result(self.0.search(query, &ids).await))
             }
             "add_mcp" if self.0.config.dynamic_catalog.enabled => {
                 let definition = match args
@@ -1270,14 +1318,15 @@ async fn run() -> Result<()> {
     let args = Args::parse();
     let path = config_cli::path(args.config.as_deref())?;
     match &args.command {
-        Some(Command::Add {
-            command: AddCommand::Catalog,
-        }) => {
-            config_cli::add_catalog(
-                &path,
-                &mut std::io::stdin().lock(),
-                &mut std::io::stderr().lock(),
-            )?;
+        Some(Command::Add { command }) => {
+            use std::io::IsTerminal;
+            let terminal = std::io::stdin().is_terminal();
+            let mut input = std::io::stdin().lock();
+            let mut output = std::io::stderr().lock();
+            match command {
+                AddCommand::Catalog => config_cli::add_catalog(&path, &mut input, &mut output)?,
+                AddCommand::Mcp => config_cli::add_mcp(&path, &mut input, &mut output, terminal)?,
+            }
             println!("Saved configuration to {}", path.display());
             return Ok(());
         }
@@ -1359,6 +1408,14 @@ mod integration_tests {
     }
     #[test]
     fn configuration_commands_parse_without_loading_a_file() {
+        assert!(matches!(
+            Args::try_parse_from(["temba", "add", "mcp"])
+                .unwrap()
+                .command,
+            Some(Command::Add {
+                command: AddCommand::Mcp
+            })
+        ));
         assert!(matches!(
             Args::try_parse_from(["temba", "add", "catalog"])
                 .unwrap()
@@ -1461,6 +1518,59 @@ mod integration_tests {
             catalog_login_gate: Arc::new(Mutex::new(())),
             catalog_login_url: RwLock::new(None),
         })
+    }
+    #[tokio::test]
+    async fn empty_inventory_excludes_tool_payloads_and_keyword_search_reports_limits() {
+        let config =
+            serde_yaml_ng::from_str("catalog_url: https://catalog.example\nsearch_limit: 5\n")
+                .unwrap();
+        let local = local(config);
+        let definition =
+            serde_json::from_value(json!({"name":"service","endpoint":"https://mcp.example/mcp"}))
+                .unwrap();
+        let entry = Arc::new(Entry::new(definition));
+        {
+            let mut state = entry.state.write().await;
+            state.status = "ready";
+            state.tools=(0..8).map(|i| Tool::new(format!("operation_{i}"),"HEAVY_DESCRIPTION",json!({"type":"object","properties":{"value":{"type":"string","description":"SCHEMA_DETAIL".repeat(2000)}}}).as_object().unwrap().clone())).collect();
+        }
+        local.servers.write().await.insert("service".into(), entry);
+        let inventory = local.search("  ", &[]).await;
+        assert_eq!(inventory["mode"], "inventory");
+        assert!(inventory["tools"].as_array().unwrap().is_empty());
+        assert_eq!(inventory["loaded_tools"], 8);
+        assert_eq!(inventory["servers"][0]["tool_count"], 8);
+        assert!(!inventory.to_string().contains("HEAVY_DESCRIPTION"));
+        assert!(!inventory.to_string().contains("SCHEMA_DETAIL"));
+        assert!(inventory.get("total_matches").is_none());
+        assert_eq!(inventory["truncated"], false);
+        let detailed = local.search("operation", &[]).await;
+        assert_eq!(detailed["mode"], "search");
+        assert_eq!(detailed["total_matches"], 8);
+        assert_eq!(detailed["returned_tools"], 5);
+        assert_eq!(detailed["truncated"], true);
+        assert!(detailed["tools"][0].get("inputSchema").is_some());
+        let missing = local.search("no_matching_word", &[]).await;
+        assert_eq!(missing["total_matches"], 0);
+        assert_eq!(missing["truncated"], false);
+        let waiting = Arc::new(Entry::new(
+            serde_json::from_value(
+                json!({"name":"waiting","endpoint":"https://waiting.example/mcp"}),
+            )
+            .unwrap(),
+        ));
+        waiting.state.write().await.status = "connecting";
+        local
+            .servers
+            .write()
+            .await
+            .insert("waiting".into(), waiting);
+        let current = tokio::time::timeout(Duration::from_secs(1), local.search("", &[]))
+            .await
+            .unwrap();
+        assert_eq!(current["servers"][1]["status"], "connecting");
+        assert!(current["servers"][1]["tool_count"].is_null());
+        local.close().await;
     }
     #[tokio::test]
     async fn tokens_are_isolated_and_endpoint_changes_drop_sessions() {
@@ -1736,7 +1846,7 @@ tool:
         assert!(!global.contains(&id_a) && !global.contains(&id_b));
         assert!(!global.contains("private-A") && !global.contains("private-B"));
         let scoped = local
-            .search("", std::slice::from_ref(&id_a))
+            .search("echo", std::slice::from_ref(&id_a))
             .await
             .to_string();
         assert!(scoped.contains(&format!("{id_a}.echo")) && !scoped.contains(&id_b));

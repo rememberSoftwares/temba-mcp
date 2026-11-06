@@ -1,5 +1,7 @@
 //! Configuration setup, independent of the MCP runtime and network connections.
+mod mcp;
 use anyhow::{Context, Result, bail, ensure};
+pub use mcp::add_mcp;
 use serde_yaml_ng::Value;
 use std::{
     fs,
@@ -224,7 +226,7 @@ pub fn add_catalog(path: &Path, input: &mut impl BufRead, output: &mut impl Writ
         editor.save()?;
         writeln!(
             output,
-            "\nLocal catalog enabled. Add your MCP definitions under local_catalog.servers in '{}'.",
+            "\nLocal catalog enabled. Run 'temba add mcp' to add MCPs, or edit local_catalog.servers in '{}'.",
             path.display()
         )?;
         return Ok(());
