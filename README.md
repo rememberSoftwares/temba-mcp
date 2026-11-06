@@ -1,4 +1,4 @@
-# 🐯 Temba
+# Temba
 
 Stop waisting tokens in every chats by using MCP servers that you don't use!  
 Temba is a **catalog** of MCP servers that let LLMs discover and use tools only when needed.  
@@ -155,8 +155,20 @@ Installing the catalog on k8s allows to:
 
 The catalog must be installed on Kubernetes using the helm chart in `./chart/temba-catalog`.
 
+CI builds the catalog image for Linux amd64 on branches and pull requests. Pushing
+a release tag such as `2.3.0` also publishes
+`ghcr.io/remembersoftwares/temba-catalog:2.3.0` using the workflow's `GITHUB_TOKEN`;
+no additional registry secret is needed. The chart uses this versioned image by
+default. The GitHub Release waits for the image publication to succeed.
+The image tag follows the repository's client release version; the catalog's
+own version remains recorded in the chart's `appVersion`.
+
+After the first publication, an organization owner must set the `temba-catalog`
+package visibility to **Public** under **Package settings → Change visibility**
+so Kubernetes can pull it without credentials. If public packages are disabled
+for the organization, enable them under **Organization settings → Packages**.
+
 ```bash
-cd ./chart/temba-catalog
 helm upgrade --install temba chart/temba-catalog
 ```
 

@@ -84,12 +84,6 @@ catalogs:
 | `search_limit` | Maximum results per catalog per search, between 1 and 50 | `5` |
 | `allow_insecure_http` | Allows unencrypted HTTP for local and remote destinations; HTTPS certificate checks remain enabled | `false` |
 
-When migrating an old TOML configuration, replace `allow_loopback_http` or `allow_localhost_http`
-with `allow_insecure_http`. This now permits remote HTTP too. OAuth destination
-approval remains separate: it does not authorize automatically discovered private destinations.
-Replace `refresh_seconds` with `refresh_minutes`, dividing the old value by 60.
-For example, `refresh_seconds = 3600` becomes `refresh_minutes = 60`.
-
 For a catalog accessed through port forwarding:
 
 ```yaml
