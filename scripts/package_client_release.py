@@ -32,7 +32,11 @@ def client_version(root=ROOT):
         raise ValueError("Client versions must match in pyproject.toml, Cargo.toml and Cargo.lock (stable X.Y.Z)")
     tag = os.environ.get("RELEASE_TAG", "")
     if tag and tag != project:
-        raise ValueError(f"Release tag must be {project}")
+        raise ValueError(
+            f"Release tag {tag!r} does not match declared client version {project!r}. "
+            "Update pyproject.toml, crates/temba-client/Cargo.toml, Cargo.lock, "
+            "chart version and image tag before committing and creating the release tag."
+        )
     return project
 
 

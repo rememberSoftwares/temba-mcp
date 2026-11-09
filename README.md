@@ -158,15 +158,15 @@ Install the catalog on Kubernetes from the public Helm repository:
 ```bash
 helm repo add temba https://remembersoftwares.github.io/temba-mcp
 helm repo update
-helm upgrade --install temba temba/temba-catalog --version 2.3.0
+helm upgrade --install temba temba/temba-catalog --version 2.4.1
 ```
 
 Use `-f values.yaml` to apply your configuration. Run
 `helm search repo temba/temba-catalog --versions` to list available versions.
 
 CI builds the catalog image for Linux amd64 on branches and pull requests. Pushing
-a release tag such as `2.3.0` also publishes
-`ghcr.io/remembersoftwares/temba-catalog:2.3.0` using the workflow's `GITHUB_TOKEN`;
+a release tag such as `2.4.1` also publishes
+`ghcr.io/remembersoftwares/temba-catalog:2.4.1` using the workflow's `GITHUB_TOKEN`;
 no additional registry secret is needed. The chart uses this versioned image by
 default. The GitHub Release waits for the image publication to succeed.
 The chart version and image tag follow the repository's client release version; the catalog's
