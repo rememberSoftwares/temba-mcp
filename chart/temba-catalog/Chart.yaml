@@ -2,5 +2,5 @@ apiVersion: v2
 name: temba-catalog
 description: Non-secret remote MCP catalog for the local Rust Temba client
 type: application
-version: 1.3.3
+version: 2.3.0
 appVersion: "1.3.3"

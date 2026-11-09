@@ -1,0 +1,5 @@
+# Local development overrides must not be distributed in the chart.
+overide.yaml
+override.yaml
+*.local.yaml
+.git/

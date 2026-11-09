@@ -153,20 +153,40 @@ Installing the catalog on k8s allows to:
 * serve tools based on keycloak groups
 * update the tools list by admins using IAC or API
 
-The catalog must be installed on Kubernetes using the helm chart in `./chart/temba-catalog`.
+Install the catalog on Kubernetes from the public Helm repository:
+
+```bash
+helm repo add temba https://remembersoftwares.github.io/temba-mcp
+helm repo update
+helm upgrade --install temba temba/temba-catalog --version 2.3.0
+```
+
+Use `-f values.yaml` to apply your configuration. Run
+`helm search repo temba/temba-catalog --versions` to list available versions.
 
 CI builds the catalog image for Linux amd64 on branches and pull requests. Pushing
 a release tag such as `2.3.0` also publishes
 `ghcr.io/remembersoftwares/temba-catalog:2.3.0` using the workflow's `GITHUB_TOKEN`;
 no additional registry secret is needed. The chart uses this versioned image by
 default. The GitHub Release waits for the image publication to succeed.
-The image tag follows the repository's client release version; the catalog's
+The chart version and image tag follow the repository's client release version; the catalog's
 own version remains recorded in the chart's `appVersion`.
+
+After the GitHub Release succeeds, CI attaches the chart archive to the release
+and deploys its Helm repository to GitHub Pages. Previous released chart versions
+remain available. Re-running a release preserves any existing chart archive.
+
+One-time repository setup: under **Settings → Pages → Build and deployment**,
+select **GitHub Actions** as the source. If the `github-pages` environment has
+deployment restrictions, allow release tags (for example `*`) as well as branches.
+No additional token or hosting service is required.
 
 After the first publication, an organization owner must set the `temba-catalog`
 package visibility to **Public** under **Package settings → Change visibility**
 so Kubernetes can pull it without credentials. If public packages are disabled
 for the organization, enable them under **Organization settings → Packages**.
+
+For local development, install directly from the checkout:
 
 ```bash
 helm upgrade --install temba chart/temba-catalog

@@ -34,6 +34,9 @@ jobs:
       - uses: azure/setup-helm@v5
       - run: helm lint chart/temba-catalog
       - run: python3 scripts/check_chart.py
+      - name: Verify chart packaging
+        run: helm package chart/temba-catalog --destination "${RUNNER_TEMP}/chart-package"
+      - run: python -m unittest discover -s scripts -p 'test_chart_repository.py'
   wheels:
     needs: rust
     strategy:
@@ -115,12 +118,14 @@ jobs:
           chart = Path('chart/temba-catalog/Chart.yaml').read_text()
           values = Path('chart/temba-catalog/values.yaml').read_text()
           for name, text, pattern in [
-              ('chart version', chart, r'^version: (.+)$'),
               ('chart appVersion', chart, r'^appVersion: "([^"]+)"$'),
           ]:
               match = re.search(pattern, text, re.MULTILINE)
               if not match or match[1] != version:
                   raise SystemExit(f'{name} must match catalog version {version}')
+          chart_version = re.search(r'^version: (.+)$', chart, re.MULTILINE)
+          if not chart_version or chart_version[1] != release_version:
+              raise SystemExit(f'Chart version must match release version {release_version}')
           image_tag = re.search(r'^  tag: "([^"]+)"$', values, re.MULTILINE)
           if not image_tag or image_tag[1] != release_version:
               raise SystemExit(f'Chart image tag must match release version {release_version}')
@@ -191,3 +196,55 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" release-assets/* --clobber
           gh release edit "$RELEASE_TAG" --draft=false
+  chart-repository:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    concurrency:
+      group: helm-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-helm@v5
+      - name: Package and attach chart to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir chart-assets
+          cp LICENSE chart/temba-catalog/LICENSE
+          helm package chart/temba-catalog --destination chart-assets
+          archive="temba-catalog-${RELEASE_TAG}.tgz"
+          test -f "chart-assets/$archive"
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > existing-assets.txt
+          if ! grep -Fxq "$archive" existing-assets.txt; then
+            gh release upload "$RELEASE_TAG" "chart-assets/$archive"
+          fi
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build Helm repository with all released charts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PAGES_URL: ${{ steps.pages.outputs.base_url }}
+        run: python scripts/build_chart_repository.py --url "$PAGES_URL" --output helm-repository
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: helm-repository
+      - name: Deploy Helm repository
+        id: deployment
+        uses: actions/deploy-pages@v4
