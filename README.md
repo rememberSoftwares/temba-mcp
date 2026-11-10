@@ -1,5 +1,7 @@
 # Temba
 
+<img src="docs/assets/temba-logo-v4.png" alt="Temba — a searchable catalog with a shared flame" width="440">
+
 Stop waisting tokens in every chats by using MCP servers that you don't use!  
 Temba is a **catalog** of MCP servers that let LLMs discover and use tools only when needed.  
 
@@ -474,6 +476,7 @@ To test, ask the LLM to register the official Jira MCP. It will look for it on t
 | Understand local HTTP, NetworkPolicies, and storage | [Catalog options](docs/CONFIGURATION.md) |
 | Understand local session protection | [Client security](SECURITY_CLIENT.md) |
 | Understand Kubernetes and container hardening | [Container security](SECURITY_CONTAINER.md) |
+| Inspect dependency licenses and release notices | [Third-party licenses](docs/LICENSES.md) |
 | Build Temba or contribute code | [Development](docs/DEVELOPMENT.md) |
 
 The [Minikube scenario](docs/MINIKUBE_TEST.md) describes a specific test environment.

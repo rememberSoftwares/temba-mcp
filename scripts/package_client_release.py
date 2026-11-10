@@ -24,6 +24,14 @@ TARGETS = {
 }
 
 
+def license_assets(root=ROOT):
+    assets = {name: (root / name).read_bytes() for name in ("LICENSE", "THIRD_PARTY_LICENSES")}
+    fingerprint = hashlib.sha256((root / "Cargo.lock").read_bytes()).hexdigest()
+    if f"Cargo.lock SHA256: {fingerprint}\n".encode() not in assets["THIRD_PARTY_LICENSES"]:
+        raise ValueError("THIRD_PARTY_LICENSES does not match Cargo.lock; regenerate it before packaging")
+    return assets
+
+
 def client_version(root=ROOT):
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     crate = tomllib.loads((root / "crates/temba-client/Cargo.toml").read_text())["package"]["version"]
@@ -55,6 +63,10 @@ def executable(wheel, version, name):
         metadata = BytesParser().parsebytes(archive.read(f"temba_client-{version}.dist-info/METADATA"))
         if metadata["Name"] != "temba-client" or metadata["Version"] != version:
             raise ValueError("Wheel metadata does not match the client version")
+        prefix = f"temba_client-{version}.dist-info/licenses/"
+        for filename, content in license_assets().items():
+            if archive.namelist().count(prefix + filename) != 1 or archive.read(prefix + filename) != content:
+                raise ValueError(f"Wheel is missing or has incorrect {filename}")
         return archive.read(f"temba_client-{version}.data/scripts/{name}")
 
 
@@ -62,6 +74,7 @@ def package(directory, output, target, version):
     wheel = select_wheel(directory, target, version)
     name, extension, _, _ = TARGETS[target]
     binary = executable(wheel, version, name)
+    assets = {name: binary, **license_assets()}
     # Exercise the exact binary that will be distributed, on its native CI runner.
     with tempfile.TemporaryDirectory() as temporary:
         path = Path(temporary) / name
@@ -75,13 +88,15 @@ def package(directory, output, target, version):
     destination = output / f"temba-{version}-{target}{extension}"
     if extension == ".zip":
         with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(name, binary)
+            for filename, content in assets.items():
+                archive.writestr(filename, content)
     else:
         with tarfile.open(destination, "w:gz") as archive:
-            member = tarfile.TarInfo(name)
-            member.size = len(binary)
-            member.mode = 0o755
-            archive.addfile(member, io.BytesIO(binary))
+            for filename, content in assets.items():
+                member = tarfile.TarInfo(filename)
+                member.size = len(content)
+                member.mode = 0o755 if filename == name else 0o644
+                archive.addfile(member, io.BytesIO(content))
     print(f"Packaged {wheel.name} and {destination.name}")
 
 
@@ -90,17 +105,20 @@ def checksums(directory, version):
     for target, (name, extension, _, _) in TARGETS.items():
         wheel = select_wheel(directory, target, version)
         binary = executable(wheel, version, name)
+        assets = {name: binary, **license_assets()}
         native = directory / f"temba-{version}-{target}{extension}"
         if extension == ".zip":
             with zipfile.ZipFile(native) as archive:
-                if archive.namelist() != [name] or archive.read(name) != binary:
+                if (sorted(archive.namelist()) != sorted(assets)
+                        or any(archive.read(filename) != content for filename, content in assets.items())):
                     raise ValueError("Native archive differs from its wheel")
         else:
             with tarfile.open(native, "r:gz") as archive:
                 members = archive.getmembers()
-                if len(members) != 1 or members[0].name != name or not members[0].isfile() or members[0].mode != 0o755:
+                if (sorted(m.name for m in members) != sorted(assets)
+                        or any(not m.isfile() or m.mode != (0o755 if m.name == name else 0o644) for m in members)):
                     raise ValueError("Invalid native archive contents or executable permissions")
-                if archive.extractfile(members[0]).read() != binary:
+                if any(archive.extractfile(filename).read() != content for filename, content in assets.items()):
                     raise ValueError("Native archive differs from its wheel")
         expected.update((wheel.name, native.name))
     actual = {p.name for p in directory.iterdir() if p.name != "SHA256SUMS"}

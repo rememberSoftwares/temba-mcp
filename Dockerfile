@@ -7,6 +7,7 @@ RUN cargo build --locked --release -p temba-catalog
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build /build/target/release/temba-catalog /temba-catalog
 COPY catalog.yaml /etc/temba/catalog.yaml
+COPY LICENSE THIRD_PARTY_LICENSES /usr/share/licenses/temba/
 USER 10001:10001
 ENV CATALOG_PATH=/etc/temba/catalog.yaml
 EXPOSE 8080

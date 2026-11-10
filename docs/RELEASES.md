@@ -16,7 +16,9 @@ Replace `X.Y.Z` below with the downloaded version.
 | macOS Intel | `temba-X.Y.Z-x86_64-apple-darwin.tar.gz` |
 | Windows x86_64 | `temba-X.Y.Z-x86_64-pc-windows-msvc.zip` |
 
-Each archive contains one executable: `temba` or `temba.exe`. No Python, uv,
+Each archive contains one executable (`temba` or `temba.exe`), `LICENSE` and
+`THIRD_PARTY_LICENSES`. Keep the legal documents when redistributing the binary;
+see [third-party licenses](LICENSES.md). No Python, uv,
 Rust compiler or package manager is needed on the user's machine.
 Other architectures, including Linux ARM64 and Windows ARM64, are not built yet.
 
@@ -111,7 +113,9 @@ four optional wheels and `SHA256SUMS`.
 ## Publish a version
 
 1. Keep the client version identical in `crates/temba-client/Cargo.toml`,
-   `pyproject.toml`, and the `temba-client` entry in `Cargo.lock`.
+   `pyproject.toml`, and the `temba-client` entry in `Cargo.lock`. After any
+   lockfile change, run `cargo fetch --locked` followed by
+   `python3 scripts/third_party_licenses.py` and commit `THIRD_PARTY_LICENSES`.
 2. Commit and push the source code, including `.github/workflows/ci.yaml`
    and the release packaging scripts. Tag the commit you want to release.
 3. Push a tag matching **`X.Y.Z`**. For the current client version:

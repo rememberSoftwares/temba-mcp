@@ -8,7 +8,8 @@ version = "2.4.1"
 description = "Local Rust MCP client with RAM-only OAuth sessions"
 requires-python = ">=3.9"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES"]
 
 [tool.maturin]
 manifest-path = "crates/temba-client/Cargo.toml"
